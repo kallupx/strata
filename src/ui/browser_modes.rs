@@ -16,7 +16,6 @@ use gtk::{gio, glib, prelude::*};
 use crate::{
     app::{Browser, BrowserColumnSnapshot, BrowserEvent},
     model::{FileEntry, Location, MetadataValue, SortDirection, SortKey},
-    services::validate_basename,
 };
 
 const EXPLORER_COLUMN_WIDTHS: [i32; 4] = [600, 90, 120, 150];
@@ -319,6 +318,9 @@ impl ModeViews {
         field.add_css_class("inline-rename");
         field.set_width_chars(12);
         field.set_text(&entry.display_name);
+        field.connect_changed(|field| {
+            super::browser::update_basename_validation(field);
+        });
         label.set_visible(false);
         parent.append(&field);
         let browser = Rc::downgrade(&self.browser);
@@ -767,9 +769,7 @@ fn submit_mode_new_folder(
         return;
     }
     let name = field.text().to_string();
-    if let Err(message) = validate_basename(&name) {
-        field.add_css_class("error");
-        field.set_tooltip_text(Some(message));
+    if !super::browser::update_basename_validation(field) {
         field.grab_focus();
         return;
     }
@@ -784,6 +784,8 @@ fn submit_mode_new_folder(
 
 fn finish_mode_new_folder(active: &ActiveModeNewFolder) {
     active.field.set_text("");
+    active.field.remove_css_class("error");
+    active.field.set_tooltip_text(None);
     active.view.remove_css_class("creating-folder");
     if let Some(placeholder) = active.placeholder.as_ref() {
         placeholder.splice(0, placeholder.n_items(), &[]);
@@ -1000,6 +1002,9 @@ fn build_grid_pane(
         field.add_css_class("inline-rename");
         field.set_width_chars(12);
         field.set_visible(false);
+        field.connect_changed(|field| {
+            super::browser::update_basename_validation(field);
+        });
         let active_for_submit = active_for_setup.clone();
         let browser_for_submit = browser_for_setup.clone();
         let location_for_submit = folder_location.clone();
@@ -1550,6 +1555,9 @@ fn build_explorer_pane(
         field.add_css_class("inline-rename");
         field.set_hexpand(true);
         field.set_visible(false);
+        field.connect_changed(|field| {
+            super::browser::update_basename_validation(field);
+        });
         let active_for_submit = active_for_setup.clone();
         let browser_for_submit = browser_for_setup.clone();
         let location_for_submit = folder_location.clone();

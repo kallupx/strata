@@ -1691,6 +1691,18 @@ menubutton.column-header-action > button:focus-visible image {
   outline: none;
 }
 
+.inline-rename.error {
+  border-color: @theme_danger;
+  caret-color: @theme_danger;
+}
+
+.inline-rename.error:focus,
+.inline-rename.error:focus-visible,
+.inline-rename.error:focus-within {
+  border-color: @theme_danger;
+  box-shadow: 0 0 0 1px alpha(@theme_danger, 0.45);
+}
+
 .inline-rename selection {
   background: @theme_accent;
   color: @theme_bg;

@@ -713,9 +713,7 @@ impl ViewState {
             return;
         }
         let name = field.text().to_string();
-        if let Err(message) = validate_basename(&name) {
-            field.add_css_class("error");
-            field.set_tooltip_text(Some(message));
+        if !update_basename_validation(field) {
             field.grab_focus();
             return;
         }
@@ -2712,6 +2710,9 @@ impl ViewState {
             rename.add_css_class("inline-rename");
             rename.set_hexpand(true);
             rename.set_visible(false);
+            rename.connect_changed(|field| {
+                update_basename_validation(field);
+            });
             let weak_state_for_rename = weak_state.clone();
             rename.connect_activate(move |field| {
                 if let Some(state) = weak_state_for_rename.upgrade() {
@@ -3191,6 +3192,9 @@ impl ViewState {
         let new_folder_entry = gtk::Entry::new();
         new_folder_entry.add_css_class("inline-rename");
         new_folder_entry.set_hexpand(true);
+        new_folder_entry.connect_changed(|field| {
+            update_basename_validation(field);
+        });
         new_folder_row.append(&new_folder_icon);
         new_folder_row.append(&new_folder_entry);
         let weak_state = Rc::downgrade(self);
@@ -4873,6 +4877,21 @@ fn set_cut_path_style(row: &gtk::Box, cut: bool) {
         row.add_css_class("cut");
     } else {
         row.remove_css_class("cut");
+    }
+}
+
+pub(super) fn update_basename_validation(field: &gtk::Entry) -> bool {
+    match validate_basename(field.text().as_str()) {
+        Ok(()) => {
+            field.remove_css_class("error");
+            field.set_tooltip_text(None);
+            true
+        }
+        Err(message) => {
+            field.add_css_class("error");
+            field.set_tooltip_text(Some(message));
+            false
+        }
     }
 }
 
