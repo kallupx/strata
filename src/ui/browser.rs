@@ -5276,7 +5276,16 @@ pub(super) fn open_location(location: &Location, parent: &impl IsA<gtk::Widget>)
     let file = gio_file_for_location(location);
     let uri = file.uri();
     if let Err(error) = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>) {
-        tracing::warn!(location = %location.display_path(), error = %error, "unable to open file");
+        tracing::warn!(
+            backend = %location.backend_name(),
+            error_domain = ?error.domain(),
+            error_code = error.code(),
+            "unable to open file"
+        );
+        tracing::debug!(
+            location = %location.diagnostic_path(),
+            "file open location"
+        );
         show_error_dialog(parent, "Unable to open file", &error.to_string());
     }
 }

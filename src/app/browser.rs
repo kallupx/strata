@@ -1118,7 +1118,7 @@ impl Browser {
                 if let Some((depth, insertions)) = application {
                     tracing::debug!(
                         request_id = request_id.0,
-                        location = %state.columns[depth].location.display_path(),
+                        location = %state.columns[depth].location.diagnostic_path(),
                         entries = entries.len(),
                         "directory batch accepted"
                     );
