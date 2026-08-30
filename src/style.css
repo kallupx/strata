@@ -1684,7 +1684,8 @@ menubutton.column-header-action > button:focus-visible image {
 }
 
 .inline-rename:focus,
-.inline-rename:focus-visible {
+.inline-rename:focus-visible,
+.inline-rename:focus-within {
   border-color: @theme_accent;
   box-shadow: 0 0 0 1px alpha(@theme_accent, 0.45);
   outline: none;
@@ -2298,14 +2299,6 @@ menubutton.grid-thumbnail-menu > button:focus-visible {
 
 .explorer-list row:focus-visible {
   outline: none;
-}
-
-.explorer-list row:focus-visible .explorer-name-cell {
-  box-shadow: inset 2px 0 @theme_accent;
-}
-
-.explorer-list.creating-folder row:focus-visible .explorer-name-cell {
-  box-shadow: none;
 }
 
 .explorer-row {
