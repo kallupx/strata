@@ -1,10 +1,27 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#[cfg(test)]
+mod tests;
+
 use std::rc::Rc;
 
 use crate::model::{FileEntry, Location};
 
 use super::LoadHandle;
+
+pub fn validate_basename(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        Err("Enter a name")
+    } else if name.contains('/') {
+        Err("Names cannot contain /")
+    } else if matches!(name, "." | "..") {
+        Err("That name is reserved")
+    } else if name.contains('\0') {
+        Err("Names cannot contain NUL characters")
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct OperationRequestId(pub u64);

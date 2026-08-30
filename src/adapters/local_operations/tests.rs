@@ -4,7 +4,10 @@ use std::{error::Error, fs, time::SystemTime};
 
 use gtk::{gio, glib, prelude::*};
 
-use super::{copy_recursively, deletion_error_summary, operation_error_summary, transfer_is_noop};
+use super::{
+    copy_recursively, deletion_error_summary, operation_error_summary, transfer_is_noop,
+    validated_child,
+};
 
 #[test]
 fn deletion_error_summaries_are_bounded_and_report_the_failure_count() {
@@ -23,6 +26,25 @@ fn deletion_error_summaries_are_bounded_and_report_the_failure_count() {
         operation_error_summary(&errors[..1], "restored")
             .starts_with("1 item could not be restored")
     );
+}
+
+#[test]
+fn validated_children_are_confined_to_native_and_uri_parents() {
+    let native = gio::File::for_path("/fixture/parent");
+    let remote = gio::File::for_uri("sftp://host.example/home/user/");
+
+    assert!(
+        validated_child(&native, "folder")
+            .is_ok_and(|child| child.equal(&gio::File::for_path("/fixture/parent/folder")))
+    );
+    assert!(validated_child(&remote, "folder").is_ok_and(|child| {
+        child.equal(&gio::File::for_uri("sftp://host.example/home/user/folder"))
+    }));
+
+    for name in ["../escaped", "nested/child", "/tmp/absolute", ".", ".."] {
+        assert!(validated_child(&native, name).is_err());
+        assert!(validated_child(&remote, name).is_err());
+    }
 }
 
 #[test]

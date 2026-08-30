@@ -16,6 +16,7 @@ use crate::{
     model::{EntryKind, FileEntry, Location, SortDirection, SortKey},
     services::{
         FileSource, OperationProvider, PreviewContent, content_family, has_plain_text_extension,
+        validate_basename,
     },
 };
 
@@ -703,19 +704,27 @@ impl ViewState {
     }
 
     fn submit_new_folder(self: &Rc<Self>, field: &gtk::Entry) {
-        let Some(active) = self
+        if !self
             .active_new_folder
-            .take()
-            .filter(|active| active.field == *field)
-        else {
+            .borrow()
+            .as_ref()
+            .is_some_and(|active| active.field == *field)
+        {
+            return;
+        }
+        let name = field.text().to_string();
+        if let Err(message) = validate_basename(&name) {
+            field.add_css_class("error");
+            field.set_tooltip_text(Some(message));
+            field.grab_focus();
+            return;
+        }
+        let Some(active) = self.active_new_folder.take() else {
             return;
         };
         active.row.set_visible(false);
-        let name = field.text().to_string();
         field.set_text("");
-        if !name.is_empty() {
-            self.browser.create_directory(active.location, name);
-        }
+        self.browser.create_directory(active.location, name);
     }
 
     fn cancel_new_folder(&self) -> bool {

@@ -26,12 +26,20 @@ fn deleted_trash_entries_refresh_the_trash_root() {
 }
 
 #[test]
-fn rename_validation_rejects_empty_reserved_and_nested_names() {
-    assert!(validate_rename("").is_err());
-    assert!(validate_rename(".").is_err());
-    assert!(validate_rename("..").is_err());
-    assert!(validate_rename("nested/name").is_err());
-    assert!(validate_rename("report.txt").is_ok());
+fn invalid_new_folder_names_are_rejected_before_an_operation_starts() {
+    let browser = Browser::new(Rc::new(FakeFileSource));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = events.clone();
+    browser.observe(move |event| observed.borrow_mut().push(event));
+
+    browser.create_directory(Location::local("/fixture"), "../escaped".to_owned());
+
+    assert_eq!(browser.current_operation.get(), None);
+    assert!(browser.operation_load.borrow().is_none());
+    assert!(matches!(
+        events.borrow().as_slice(),
+        [BrowserEvent::OperationFailed { message }] if message == "Names cannot contain /"
+    ));
 }
 
 struct FakeFileSource;

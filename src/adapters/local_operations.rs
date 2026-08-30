@@ -11,7 +11,7 @@ use crate::{
     model::Location,
     services::{
         CreateDirectoryRequest, DeleteRequest, LoadHandle, OperationEvent, OperationProvider,
-        PasteRequest, RenameRequest, RestoreRequest,
+        PasteRequest, RenameRequest, RestoreRequest, validate_basename,
     },
 };
 
@@ -20,6 +20,11 @@ fn gio_file(location: &Location) -> gio::File {
         .native_path()
         .map(gio::File::for_path)
         .unwrap_or_else(|| gio::File::for_uri(location.uri_value().unwrap_or_default()))
+}
+
+fn validated_child(parent: &gio::File, name: &str) -> Result<gio::File, &'static str> {
+    validate_basename(name)?;
+    Ok(parent.child(name))
 }
 
 fn transfer_is_noop(source: &gio::File, destination: &gio::File, target: &gio::File) -> bool {
@@ -145,6 +150,13 @@ pub struct LocalOperationProvider;
 impl OperationProvider for LocalOperationProvider {
     fn rename(&self, request: RenameRequest, emit: Rc<dyn Fn(OperationEvent)>) -> LoadHandle {
         let task = glib::MainContext::default().spawn_local(async move {
+            if let Err(message) = validate_basename(&request.new_name) {
+                emit(OperationEvent::Failed {
+                    request_id: request.id,
+                    message: message.to_owned(),
+                });
+                return;
+            }
             let file = request
                 .entry
                 .location
@@ -175,7 +187,17 @@ impl OperationProvider for LocalOperationProvider {
         emit: Rc<dyn Fn(OperationEvent)>,
     ) -> LoadHandle {
         let task = glib::MainContext::default().spawn_local(async move {
-            let folder = gio_file(&request.parent).child(&request.name);
+            let parent = gio_file(&request.parent);
+            let folder = match validated_child(&parent, &request.name) {
+                Ok(folder) => folder,
+                Err(message) => {
+                    emit(OperationEvent::Failed {
+                        request_id: request.id,
+                        message: message.to_owned(),
+                    });
+                    return;
+                }
+            };
             match folder.make_directory_future(glib::Priority::DEFAULT).await {
                 Ok(()) => emit(OperationEvent::Created {
                     request_id: request.id,

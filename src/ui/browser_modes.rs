@@ -16,6 +16,7 @@ use gtk::{gio, glib, prelude::*};
 use crate::{
     app::{Browser, BrowserColumnSnapshot, BrowserEvent},
     model::{FileEntry, Location, MetadataValue, SortDirection, SortKey},
+    services::validate_basename,
 };
 
 const EXPLORER_COLUMN_WIDTHS: [i32; 4] = [600, 90, 120, 150];
@@ -758,14 +759,25 @@ fn submit_mode_new_folder(
     location: &Option<Location>,
     field: &gtk::Entry,
 ) {
-    let Some(active) = active.take().filter(|active| active.field == *field) else {
+    if !active
+        .borrow()
+        .as_ref()
+        .is_some_and(|active| active.field == *field)
+    {
+        return;
+    }
+    let name = field.text().to_string();
+    if let Err(message) = validate_basename(&name) {
+        field.add_css_class("error");
+        field.set_tooltip_text(Some(message));
+        field.grab_focus();
+        return;
+    }
+    let Some(active) = active.take() else {
         return;
     };
-    let name = field.text().to_string();
     finish_mode_new_folder(&active);
-    if !name.is_empty()
-        && let (Some(browser), Some(location)) = (browser.upgrade(), location.clone())
-    {
+    if let (Some(browser), Some(location)) = (browser.upgrade(), location.clone()) {
         browser.create_directory(location, name);
     }
 }

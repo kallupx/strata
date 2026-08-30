@@ -14,6 +14,7 @@ use crate::{
         CreateDirectoryRequest, DeleteRequest, DirectoryChange, DirectoryEvent, DirectoryRequest,
         FileSource, LoadHandle, LocationValidationError, OperationEvent, OperationProvider,
         OperationRequestId, PasteRequest, RenameRequest, RequestId, RestoreRequest,
+        validate_basename,
     },
 };
 
@@ -580,7 +581,7 @@ impl Browser {
     }
 
     pub fn rename(self: &Rc<Self>, entry: FileEntry, new_name: String) {
-        if let Err(message) = validate_rename(&new_name) {
+        if let Err(message) = validate_basename(&new_name) {
             self.emit(BrowserEvent::RenameFailed {
                 message: message.to_owned(),
             });
@@ -606,6 +607,12 @@ impl Browser {
     }
 
     pub fn create_directory(self: &Rc<Self>, parent: Location, name: String) {
+        if let Err(message) = validate_basename(&name) {
+            self.emit(BrowserEvent::OperationFailed {
+                message: message.to_owned(),
+            });
+            return;
+        }
         let Some(provider) = self.operation_provider.borrow().clone() else {
             self.emit(BrowserEvent::OperationFailed {
                 message: "File operations are unavailable".to_owned(),
@@ -1179,18 +1186,6 @@ fn deletion_parent_location(location: &Location) -> Option<Location> {
         Some(Location::uri("trash:///"))
     } else {
         location.parent()
-    }
-}
-
-fn validate_rename(name: &str) -> Result<(), &'static str> {
-    if name.is_empty() {
-        Err("Enter a file name")
-    } else if name.contains('/') {
-        Err("File names cannot contain /")
-    } else if matches!(name, "." | "..") {
-        Err("That name is reserved")
-    } else {
-        Ok(())
     }
 }
 
