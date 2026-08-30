@@ -15,7 +15,7 @@ use crate::{
     model::{EntryKind, FileEntry, Location, MetadataValue},
     services::{
         DirectoryChange, DirectoryEvent, DirectoryRequest, FileSource, LoadHandle,
-        LocationValidationError,
+        LocationValidationError, RequestId,
     },
 };
 
@@ -112,16 +112,7 @@ impl FileSource for LocalFileSource {
         let request_id = request.id;
         let location = request.location.clone();
         let started = Instant::now();
-        tracing::info!(
-            request_id = request_id.0,
-            backend = %location.backend_name(),
-            "directory load started"
-        );
-        tracing::debug!(
-            request_id = request_id.0,
-            location = %location.diagnostic_path(),
-            "directory load location"
-        );
+        log_directory_load_started(request_id, &location);
 
         let task = glib::MainContext::default().spawn_local(async move {
             let directory = location
@@ -315,6 +306,19 @@ impl FileSource for LocalFileSource {
             let _cancelled = monitor.cancel();
         }))
     }
+}
+
+fn log_directory_load_started(request_id: RequestId, location: &Location) {
+    tracing::info!(
+        request_id = request_id.0,
+        backend = %location.backend_name(),
+        "directory load started"
+    );
+    tracing::debug!(
+        request_id = request_id.0,
+        location = %location.diagnostic_path(),
+        "directory load location"
+    );
 }
 
 fn merge_pending_change(
