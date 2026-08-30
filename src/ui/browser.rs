@@ -589,6 +589,15 @@ impl BrowserView {
         self.state.show_folder_properties(location);
     }
 
+    pub fn show_focused_properties(&self) -> bool {
+        self.state.sync_mode_selection();
+        let Some(entry) = self.state.browser.focused_entry() else {
+            return false;
+        };
+        self.state.show_entry_properties(entry);
+        true
+    }
+
     pub fn confirm_empty_trash(&self) {
         self.state.load_trash_summary();
     }

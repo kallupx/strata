@@ -418,6 +418,14 @@ fn install_keyboard_navigation(
             }
             return glib::Propagation::Proceed;
         }
+        if alt
+            && !control
+            && !shift
+            && matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
+            && view.show_focused_properties()
+        {
+            return glib::Propagation::Stop;
+        }
         if control && shift && matches!(key, gtk::gdk::Key::n | gtk::gdk::Key::N) {
             view.create_new_folder();
             return glib::Propagation::Stop;
