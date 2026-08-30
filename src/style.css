@@ -1676,9 +1676,18 @@ menubutton.column-header-action > button:focus-visible image {
   background: @theme_surface;
   border: 1px solid @theme_accent;
   border-radius: 4px;
+  box-shadow: none;
+  caret-color: @theme_accent;
   color: @theme_text;
   min-height: 22px;
   padding: 0 4px;
+}
+
+.inline-rename:focus,
+.inline-rename:focus-visible {
+  border-color: @theme_accent;
+  box-shadow: 0 0 0 1px alpha(@theme_accent, 0.45);
+  outline: none;
 }
 
 .inline-rename selection {
