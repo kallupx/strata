@@ -13,7 +13,7 @@ use crate::{
     services::{
         CreateDirectoryRequest, DeleteRequest, DirectoryChange, DirectoryEvent, DirectoryRequest,
         FileSource, LoadHandle, LocationValidationError, OperationEvent, OperationProvider,
-        OperationRequestId, PasteRequest, RenameRequest, RequestId, RestoreRequest,
+        OperationRequestId, PasteItem, PasteRequest, RenameRequest, RequestId, RestoreRequest,
         validate_basename,
     },
 };
@@ -634,11 +634,10 @@ impl Browser {
     pub fn transfer(
         self: &Rc<Self>,
         destination: Location,
-        sources: Vec<Location>,
+        items: Vec<PasteItem>,
         move_sources: bool,
-        overwrite_existing: bool,
     ) {
-        if sources.is_empty() {
+        if items.is_empty() {
             return;
         }
         let Some(provider) = self.operation_provider.borrow().clone() else {
@@ -652,9 +651,8 @@ impl Browser {
             PasteRequest {
                 id: request_id,
                 destination,
-                sources,
+                items,
                 move_sources,
-                overwrite_existing,
             },
             self.operation_callback(request_id, false),
         );
