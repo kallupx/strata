@@ -21,6 +21,6 @@ Strata starts its own executable in a bubblewrap sandbox. The sandbox has:
 - read-only access to `/usr`, required runtime libraries and font/ImageMagick configuration, the Strata executable, and exactly one canonicalized input file;
 - writable access only to private mode-0700 output and temporary directories;
 - an empty environment with a nonexistent home directory;
-- 1.25 GB address-space, 10-second CPU, 32 MB file-size, and 12-second wall-clock limits.
+- 1.25 GB address-space, 32 MB file-size, and 12-second wall-clock limits, plus a 10-second CPU limit for image, PDF, and thumbnail rendering.
 
-The parent accepts only a bounded PNG result. Cancellation or timeout kills bubblewrap, which is the sandbox PID-namespace init process, and therefore tears down all helper descendants. A missing bubblewrap installation, renderer crash, malformed result, timeout, or permission failure is fail-closed and produces the normal fallback icon or **Preview unavailable** message.
+The parent accepts only a bounded PNG or WebM result. Cancellation or timeout kills bubblewrap, which is the sandbox PID-namespace init process, and therefore tears down all helper descendants. A missing bubblewrap installation, renderer crash, malformed result, timeout, or permission failure is fail-closed and produces the normal fallback icon or **Preview unavailable** message.

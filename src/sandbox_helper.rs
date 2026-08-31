@@ -210,7 +210,7 @@ fn render_media_preview(path: &Path, output: &Path) -> Result<(), String> {
     status
         .success()
         .then_some(())
-        .ok_or_else(|| format!("Unable to normalize media preview ({status})"))
+        .ok_or_else(|| "Unable to normalize media preview".to_owned())
 }
 
 fn render_media(path: &Path, size: i32) -> Result<Vec<u8>, String> {

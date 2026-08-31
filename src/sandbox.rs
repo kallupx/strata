@@ -90,7 +90,7 @@ pub(crate) fn parse(
     let mut command = sandbox_command(&executable, &input, output.path(), operation, value);
     let mut child = command
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("Unable to start the preview sandbox: {error}"))?;
     let started = Instant::now();
@@ -114,7 +114,7 @@ pub(crate) fn parse(
         }
     };
     if !status.success() {
-        return Err(format!("The sandboxed preview renderer failed ({status})"));
+        return Err("The sandboxed preview renderer failed".to_owned());
     }
 
     let result_path = output.path().join(operation.output_name());
@@ -189,11 +189,11 @@ fn sandbox_command(
     command.arg(executable).arg("/app/strata");
     command.arg("--ro-bind").arg(input).arg("/input");
     command.arg("--bind").arg(output).arg("/output");
+    command.args(["--", "/usr/bin/prlimit", "--as=1342177280"]);
+    if operation != ParseOperation::PreviewMedia {
+        command.arg("--cpu=10");
+    }
     command.args([
-        "--",
-        "/usr/bin/prlimit",
-        "--as=1342177280",
-        "--cpu=30",
         "--fsize=33554432",
         "--",
         "/app/strata",
