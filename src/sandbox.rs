@@ -17,6 +17,7 @@ use rustix::process::{Pid, Signal, kill_process_group};
 const WALL_TIME_LIMIT: Duration = Duration::from_secs(12);
 const MEDIA_WALL_TIME_LIMIT: Duration = Duration::from_secs(30);
 const ADDRESS_SPACE_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const FILE_SIZE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RASTER_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MAX_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -276,8 +277,8 @@ fn sandbox_command(
     if operation != ParseOperation::PreviewMedia {
         command.arg("--cpu=10");
     }
+    command.arg(format!("--fsize={FILE_SIZE_LIMIT_BYTES}"));
     command.args([
-        "--fsize=33554432",
         "--",
         "/app/strata",
         "--preview-helper",
