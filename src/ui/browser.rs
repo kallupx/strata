@@ -1029,7 +1029,6 @@ impl ViewState {
         sources: Vec<Location>,
         move_sources: bool,
     ) {
-        let clear_cut = move_sources && same_locations(&sources, &self.cut_locations.borrow());
         let mut accepted = Vec::new();
         let mut collisions = Vec::new();
         for source in sources {
@@ -1042,13 +1041,7 @@ impl ViewState {
                 });
             }
         }
-        self.resolve_transfer_collisions(
-            destination,
-            collisions,
-            accepted,
-            move_sources,
-            clear_cut,
-        );
+        self.resolve_transfer_collisions(destination, collisions, accepted, move_sources);
     }
 
     fn resolve_transfer_collisions(
@@ -1057,17 +1050,8 @@ impl ViewState {
         mut collisions: Vec<Location>,
         accepted: Vec<PasteItem>,
         move_sources: bool,
-        clear_cut: bool,
     ) {
         if collisions.is_empty() {
-            if clear_cut {
-                self.complete_cut_transfer(
-                    &accepted
-                        .iter()
-                        .map(|item| item.source.clone())
-                        .collect::<Vec<_>>(),
-                );
-            }
             self.browser.transfer(destination, accepted, move_sources);
             return;
         }
@@ -1139,7 +1123,6 @@ impl ViewState {
                 },
                 skipped_accepted.clone(),
                 move_sources,
-                clear_cut,
             );
         });
 
@@ -1169,7 +1152,6 @@ impl ViewState {
                 remaining,
                 accepted,
                 move_sources,
-                clear_cut,
             );
         });
 
@@ -3330,11 +3312,34 @@ impl ViewState {
                     rename.field.grab_focus();
                 }
             }
+            BrowserEvent::TransferStarted { total, moving } => self.show_file_operation_progress(
+                total,
+                if moving {
+                    crate::assets::icons::FOLDER
+                } else {
+                    crate::assets::icons::COPY
+                },
+                if moving {
+                    "Moving items"
+                } else {
+                    "Copying items"
+                },
+                "Cancelling will not undo completed changes",
+            ),
+            BrowserEvent::TransferProgress { completed, total } => {
+                self.update_delete_progress(completed, total);
+            }
+            BrowserEvent::TransferFinished { moved_locations } => {
+                if !moved_locations.is_empty() {
+                    self.complete_cut_transfer(&moved_locations);
+                }
+                self.dismiss_delete_progress();
+            }
             BrowserEvent::DeletionStarted { total } => self.show_file_operation_progress(
                 total,
                 crate::assets::icons::TRASH,
                 "Deleting items",
-                "This may take a moment",
+                "Cancelling will not undo completed changes",
             ),
             BrowserEvent::DeletionProgress { completed, total } => {
                 self.update_delete_progress(completed, total);
@@ -3344,7 +3349,7 @@ impl ViewState {
                 total,
                 crate::assets::icons::FOLDER,
                 "Restoring items",
-                "Items are being returned to their original locations",
+                "Cancelling will not undo completed changes",
             ),
             BrowserEvent::RestorationProgress { completed, total } => {
                 self.update_delete_progress(completed, total);
@@ -3364,6 +3369,19 @@ impl ViewState {
             }
             BrowserEvent::OperationCompletedWithErrors { message } => {
                 show_error_dialog(&self.overlay, "Completed with errors", &message);
+            }
+            BrowserEvent::OperationCancelled {
+                completed,
+                failed,
+                not_attempted,
+            } => {
+                let message = format!(
+                    "{} completed, {} failed, and {} not attempted.\n\nCompleted changes were not reverted.",
+                    item_count_label(completed),
+                    item_count_label(failed),
+                    item_count_label(not_attempted),
+                );
+                show_error_dialog(&self.overlay, "Operation cancelled", &message);
             }
             BrowserEvent::NavigationRejected {
                 parent_depth,

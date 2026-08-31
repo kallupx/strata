@@ -2,6 +2,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashSet,
     path::PathBuf,
     rc::{Rc, Weak},
     time::Duration,
@@ -97,6 +98,17 @@ pub enum BrowserEvent {
     RenameFailed {
         message: String,
     },
+    TransferStarted {
+        total: usize,
+        moving: bool,
+    },
+    TransferProgress {
+        completed: usize,
+        total: usize,
+    },
+    TransferFinished {
+        moved_locations: Vec<Location>,
+    },
     DeletionStarted {
         total: usize,
     },
@@ -118,6 +130,11 @@ pub enum BrowserEvent {
     },
     OperationCompletedWithErrors {
         message: String,
+    },
+    OperationCancelled {
+        completed: usize,
+        failed: usize,
+        not_attempted: usize,
     },
     NavigationRejected {
         parent_depth: usize,
@@ -154,6 +171,7 @@ pub struct Browser {
     operation_provider: RefCell<Option<Rc<dyn OperationProvider>>>,
     operation_load: RefCell<Option<LoadHandle>>,
     current_operation: Cell<Option<OperationRequestId>>,
+    transfer_operation: Cell<Option<bool>>,
     deletion_operation: Cell<bool>,
     restoration_operation: Cell<bool>,
     next_request: Cell<u64>,
@@ -181,6 +199,7 @@ impl Browser {
             operation_provider: RefCell::new(None),
             operation_load: RefCell::new(None),
             current_operation: Cell::new(None),
+            transfer_operation: Cell::new(None),
             deletion_operation: Cell::new(false),
             restoration_operation: Cell::new(false),
             next_request: Cell::new(1),
@@ -792,7 +811,7 @@ impl Browser {
                 parent,
                 name,
             },
-            self.operation_callback(request_id, false, vec![refresh_parent]),
+            self.operation_callback(request_id, false, HashSet::from([refresh_parent])),
         );
         self.operation_load.replace(Some(load));
     }
@@ -818,7 +837,7 @@ impl Browser {
                 parent,
                 name,
             },
-            self.operation_callback(request_id, false, vec![refresh_parent]),
+            self.operation_callback(request_id, false, HashSet::from([refresh_parent])),
         );
         self.operation_load.replace(Some(load));
     }
@@ -839,12 +858,15 @@ impl Browser {
             return;
         };
         let request_id = self.begin_operation();
-        let mut refresh_locations = vec![destination.clone()];
+        self.transfer_operation.set(Some(move_sources));
+        self.emit(BrowserEvent::TransferStarted {
+            total: items.len(),
+            moving: move_sources,
+        });
+        let mut refresh_locations = HashSet::from([destination.clone()]);
         if move_sources {
             for parent in items.iter().filter_map(|item| item.source.parent()) {
-                if !refresh_locations.contains(&parent) {
-                    refresh_locations.push(parent);
-                }
+                refresh_locations.insert(parent);
             }
         }
         let load = provider.paste(
@@ -872,16 +894,14 @@ impl Browser {
         let total = entries.len();
         let request_id = self.begin_operation();
         self.deletion_operation.set(true);
-        if total > 1 {
-            self.emit(BrowserEvent::DeletionStarted { total });
-        }
+        self.emit(BrowserEvent::DeletionStarted { total });
         let load = provider.delete(
             DeleteRequest {
                 id: request_id,
                 entries,
                 permanent,
             },
-            self.operation_callback(request_id, false, Vec::new()),
+            self.operation_callback(request_id, false, HashSet::new()),
         );
         self.operation_load.replace(Some(load));
     }
@@ -899,15 +919,13 @@ impl Browser {
         let total = entries.len();
         let request_id = self.begin_operation();
         self.restoration_operation.set(true);
-        if total > 1 {
-            self.emit(BrowserEvent::RestorationStarted { total });
-        }
+        self.emit(BrowserEvent::RestorationStarted { total });
         let load = provider.restore(
             RestoreRequest {
                 id: request_id,
                 entries,
             },
-            self.operation_callback(request_id, false, Vec::new()),
+            self.operation_callback(request_id, false, HashSet::new()),
         );
         self.operation_load.replace(Some(load));
     }
@@ -939,7 +957,7 @@ impl Browser {
                 format,
                 password,
             },
-            self.operation_callback(request_id, false, Vec::new()),
+            self.operation_callback(request_id, false, HashSet::new()),
         );
         self.operation_load.replace(Some(load));
     }
@@ -964,31 +982,31 @@ impl Browser {
                 destination,
                 password,
             },
-            self.operation_callback(request_id, false, Vec::new()),
+            self.operation_callback(request_id, false, HashSet::new()),
         );
         self.operation_load.replace(Some(load));
     }
 
     pub fn cancel_file_operation(&self) {
-        let deleting = self.deletion_operation.replace(false);
-        let restoring = self.restoration_operation.replace(false);
-        let had_operation = self.current_operation.replace(None).is_some();
+        if self.transfer_operation.get().is_none()
+            && !self.deletion_operation.get()
+            && !self.restoration_operation.get()
+        {
+            let had_operation = self.current_operation.replace(None).is_some();
+            self.operation_load.borrow_mut().take();
+            if had_operation {
+                self.emit(BrowserEvent::ArchiveCompleted {
+                    select_name: String::new(),
+                });
+            }
+            return;
+        }
         self.operation_load.borrow_mut().take();
-        if deleting {
-            self.emit(BrowserEvent::DeletionFinished);
-        }
-        if restoring {
-            self.emit(BrowserEvent::RestorationFinished);
-        }
-        if !deleting && !restoring && had_operation {
-            self.emit(BrowserEvent::ArchiveCompleted {
-                select_name: String::new(),
-            });
-        }
     }
 
     fn begin_operation(&self) -> OperationRequestId {
         self.operation_load.borrow_mut().take();
+        self.transfer_operation.set(None);
         self.deletion_operation.set(false);
         self.restoration_operation.set(false);
         let request_id = OperationRequestId(self.next_request.get());
@@ -1002,7 +1020,7 @@ impl Browser {
         self: &Rc<Self>,
         request_id: OperationRequestId,
         rename: bool,
-        refresh_locations: Vec<Location>,
+        refresh_locations: HashSet<Location>,
     ) -> Rc<dyn Fn(OperationEvent)> {
         let weak = Rc::downgrade(self);
         Rc::new(move |event| {
@@ -1012,7 +1030,9 @@ impl Browser {
             let event_id = match &event {
                 OperationEvent::Renamed { request_id }
                 | OperationEvent::Created { request_id }
-                | OperationEvent::Pasted { request_id }
+                | OperationEvent::Pasted { request_id, .. }
+                | OperationEvent::TransferFailed { request_id, .. }
+                | OperationEvent::TransferProgress { request_id, .. }
                 | OperationEvent::DeleteProgress { request_id, .. }
                 | OperationEvent::RestoreProgress { request_id, .. }
                 | OperationEvent::Deleted { request_id, .. }
@@ -1023,6 +1043,7 @@ impl Browser {
                 | OperationEvent::Compressed { request_id, .. }
                 | OperationEvent::Extracted { request_id, .. }
                 | OperationEvent::ArchiveStarted { request_id, .. }
+                | OperationEvent::Cancelled { request_id, .. }
                 | OperationEvent::ArchiveProgress { request_id, .. } => *request_id,
             };
             if event_id != request_id || browser.current_operation.get() != Some(event_id) {
@@ -1038,12 +1059,20 @@ impl Browser {
                 if let Some(location) = deleted_location {
                     browser.remove_deleted_locations(std::slice::from_ref(location));
                 }
-                if *total > 1 {
-                    browser.emit(BrowserEvent::DeletionProgress {
-                        completed: *completed,
-                        total: *total,
-                    });
-                }
+                browser.emit(BrowserEvent::DeletionProgress {
+                    completed: *completed,
+                    total: *total,
+                });
+                return;
+            }
+            if let OperationEvent::TransferProgress {
+                completed, total, ..
+            } = &event
+            {
+                browser.emit(BrowserEvent::TransferProgress {
+                    completed: *completed,
+                    total: *total,
+                });
                 return;
             }
             if let OperationEvent::RestoreProgress {
@@ -1056,12 +1085,10 @@ impl Browser {
                 if let Some(location) = restored_location {
                     browser.remove_deleted_locations(std::slice::from_ref(location));
                 }
-                if *total > 1 {
-                    browser.emit(BrowserEvent::RestorationProgress {
-                        completed: *completed,
-                        total: *total,
-                    });
-                }
+                browser.emit(BrowserEvent::RestorationProgress {
+                    completed: *completed,
+                    total: *total,
+                });
                 return;
             }
             if let OperationEvent::ArchiveStarted { total, .. } = &event {
@@ -1079,10 +1106,29 @@ impl Browser {
                 return;
             }
             browser.current_operation.set(None);
-            if browser.deletion_operation.replace(false) {
+            let moving = browser.transfer_operation.replace(None);
+            let deleting = browser.deletion_operation.replace(false);
+            let restoring = browser.restoration_operation.replace(false);
+            if moving.is_some() {
+                let moved_locations = match &event {
+                    OperationEvent::Pasted { locations, .. } if moving == Some(true) => {
+                        locations.clone()
+                    }
+                    OperationEvent::Cancelled { result, .. } if moving == Some(true) => {
+                        result.completed.clone()
+                    }
+                    OperationEvent::TransferFailed {
+                        completed_locations,
+                        ..
+                    } if moving == Some(true) => completed_locations.clone(),
+                    _ => Vec::new(),
+                };
+                browser.emit(BrowserEvent::TransferFinished { moved_locations });
+            }
+            if deleting {
                 browser.emit(BrowserEvent::DeletionFinished);
             }
-            if browser.restoration_operation.replace(false) {
+            if restoring {
                 browser.emit(BrowserEvent::RestorationFinished);
             }
             browser.operation_load.borrow_mut().take();
@@ -1091,6 +1137,12 @@ impl Browser {
                     browser.emit(BrowserEvent::RenameFailed { message });
                 }
                 OperationEvent::Failed { message, .. } => {
+                    browser.emit(BrowserEvent::OperationFailed { message });
+                }
+                OperationEvent::TransferFailed { message, .. } => {
+                    for location in &refresh_locations {
+                        browser.refresh_columns_at(location);
+                    }
                     browser.emit(BrowserEvent::OperationFailed { message });
                 }
                 OperationEvent::CompletedWithErrors {
@@ -1112,6 +1164,19 @@ impl Browser {
                 } => {
                     browser.remove_deleted_locations(&restored_locations);
                     browser.emit(BrowserEvent::OperationCompletedWithErrors { message });
+                }
+                OperationEvent::Cancelled { result, .. } => {
+                    if deleting || restoring {
+                        browser.remove_deleted_locations(&result.completed);
+                    }
+                    let mut affected_locations = refresh_locations.clone();
+                    affected_locations.extend(result.affected_locations);
+                    browser.refresh_columns_at_or_below(&affected_locations);
+                    browser.emit(BrowserEvent::OperationCancelled {
+                        completed: result.completed.len(),
+                        failed: result.failed.len(),
+                        not_attempted: result.not_attempted.len(),
+                    });
                 }
                 OperationEvent::Renamed { .. } => {
                     browser.emit(BrowserEvent::RenameCompleted);
@@ -1146,7 +1211,8 @@ impl Browser {
                         }
                     }
                 }
-                OperationEvent::DeleteProgress { .. }
+                OperationEvent::TransferProgress { .. }
+                | OperationEvent::DeleteProgress { .. }
                 | OperationEvent::RestoreProgress { .. }
                 | OperationEvent::ArchiveStarted { .. }
                 | OperationEvent::ArchiveProgress { .. } => {}
@@ -1365,6 +1431,24 @@ impl Browser {
         }
     }
 
+    fn refresh_columns_at_or_below(self: &Rc<Self>, roots: &HashSet<Location>) {
+        let open_locations = {
+            let state = self.state.borrow();
+            let mut locations = Vec::new();
+            let mut depth = 0;
+            while let Some(location) = state.location_at(depth) {
+                locations.push((depth, location));
+                depth += 1;
+            }
+            locations
+        };
+        for (depth, location) in open_locations {
+            if location_or_ancestor_is_affected(&location, roots) {
+                self.refresh_column(depth);
+            }
+        }
+    }
+
     fn remove_deleted_locations(self: &Rc<Self>, locations: &[Location]) {
         for location in locations {
             let Some(parent) = deletion_parent_location(location) else {
@@ -1547,6 +1631,17 @@ impl Browser {
         self.next_request.set(id.saturating_add(1));
         RequestId(id)
     }
+}
+
+fn location_or_ancestor_is_affected(location: &Location, roots: &HashSet<Location>) -> bool {
+    let mut current = Some(location.clone());
+    while let Some(location) = current {
+        if roots.contains(&location) {
+            return true;
+        }
+        current = location.parent();
+    }
+    false
 }
 
 fn deletion_parent_location(location: &Location) -> Option<Location> {
