@@ -23,7 +23,7 @@ Strata starts its own executable in a bubblewrap sandbox. The sandbox has:
 - an empty environment with a nonexistent home directory;
 - a 2 GB address-space limit, allowing modern image loaders to start their isolated worker threads, and a 32 MB file-size limit;
 - a 12-second wall-clock limit for image, PDF, and thumbnail rendering, plus a 10-second CPU limit; and
-- a 30-second wall-clock limit for media previews, which have no cumulative CPU limit because FFmpeg uses multiple threads.
+- a 30-second wall-clock limit for media previews, which have no cumulative CPU limit because FFmpeg uses multiple threads. Hardware attempts are limited to 8 seconds each and 12 seconds collectively so the software fallback retains time to run.
 
 Media previews additionally receive only discovered `/dev/dri/renderD<digits>`, `/dev/nvidia<digits>`, and `/dev/nvidiactl` devices plus read-only `/sys` access for driver discovery. Image, PDF, and thumbnail helpers receive none of these mounts. GPU acceleration expands the media helper's attack surface into the installed userspace and kernel GPU drivers; device access remains media-only and the existing namespaces and resource limits still apply.
 

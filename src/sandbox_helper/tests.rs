@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+    time::{Duration, Instant},
+};
 
-use super::{MediaBackend, media_backends, media_command, run_media_backends};
+use super::{
+    MediaBackend, media_backends, media_command, run_command_with_timeout, run_media_backends,
+};
 
 fn arguments(backend: &MediaBackend) -> String {
     media_command(
@@ -75,6 +81,20 @@ fn final_software_failure_returns_the_normalization_error() {
     assert_eq!(
         run_media_backends(&[MediaBackend::Software], |_| Ok::<_, ()>(false)),
         Err("Unable to normalize media preview".to_owned())
+    );
+}
+
+#[test]
+fn timed_commands_stop_and_report_failure_at_their_deadline() {
+    let started = Instant::now();
+    let result =
+        run_command_with_timeout(Command::new("sleep").arg("5"), Duration::from_millis(50));
+
+    assert!(!result.expect("run timed command"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(
+        run_command_with_timeout(&mut Command::new("true"), Duration::from_secs(1))
+            .expect("run successful command")
     );
 }
 

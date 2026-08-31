@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
+    thread,
+    time::{Duration, Instant},
 };
 
 use gdk_pixbuf::prelude::*;
 use gtk::gio;
 
 use crate::sandbox::{gpu_devices, numbered_name};
+
+const HARDWARE_ATTEMPT_TIME_LIMIT: Duration = Duration::from_secs(8);
+const HARDWARE_TOTAL_TIME_LIMIT: Duration = Duration::from_secs(12);
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum MediaBackend {
@@ -182,10 +188,14 @@ fn render_pdf_surface(
 
 fn render_media_preview(path: &Path, output: &Path) -> Result<(), String> {
     let backends = media_backends(&gpu_devices(Path::new("/dev")));
+    let hardware_started = Instant::now();
     run_media_backends(&backends, |backend| {
-        media_command(backend, path, output)
-            .status()
-            .map(|status| status.success())
+        let mut command = media_command(backend, path, output);
+        if *backend == MediaBackend::Software {
+            return command.status().map(|status| status.success());
+        }
+        let remaining = HARDWARE_TOTAL_TIME_LIMIT.saturating_sub(hardware_started.elapsed());
+        run_command_with_timeout(&mut command, HARDWARE_ATTEMPT_TIME_LIMIT.min(remaining))
     })
 }
 
@@ -319,6 +329,26 @@ fn run_media_backends<E>(
         }
     }
     Err("Unable to normalize media preview".to_owned())
+}
+
+fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<bool> {
+    if timeout.is_zero() {
+        return Ok(false);
+    }
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.success());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(false);
+        }
+        thread::sleep(PROCESS_POLL_INTERVAL.min(remaining));
+    }
 }
 
 fn render_media(path: &Path, size: i32) -> Result<Vec<u8>, String> {
