@@ -235,6 +235,25 @@ pub(super) struct ViewState {
     browser: Rc<Browser>,
 }
 
+fn focus_header_action(actions: &gtk::Box, direction: gtk::DirectionType) -> bool {
+    let mut action = if direction == gtk::DirectionType::Left {
+        actions.last_child()
+    } else {
+        actions.first_child()
+    };
+    while let Some(candidate) = action {
+        action = if direction == gtk::DirectionType::Left {
+            candidate.prev_sibling()
+        } else {
+            candidate.next_sibling()
+        };
+        if candidate.is_visible() && candidate.grab_focus() {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Clone)]
 pub struct BrowserView {
     state: Rc<ViewState>,
@@ -538,17 +557,31 @@ impl BrowserView {
 
     pub fn move_header_focus(&self, direction: gtk::DirectionType) -> bool {
         let focused = self.state.overlay.root().and_then(|root| root.focus());
-        self.state
-            .columns
-            .borrow()
-            .iter()
-            .find(|column| {
-                focused.as_ref().is_some_and(|focused| {
-                    focused == column.header_actions.upcast_ref::<gtk::Widget>()
-                        || focused.is_ancestor(&column.header_actions)
-                })
+        let columns = self.state.columns.borrow();
+        let Some(index) = columns.iter().position(|column| {
+            focused.as_ref().is_some_and(|focused| {
+                focused == column.header_actions.upcast_ref::<gtk::Widget>()
+                    || focused.is_ancestor(&column.header_actions)
             })
-            .is_some_and(|column| column.header_actions.child_focus(direction))
+        }) else {
+            return false;
+        };
+        if columns[index].header_actions.child_focus(direction) {
+            return true;
+        }
+        let adjacent = match direction {
+            gtk::DirectionType::Left => index.checked_sub(1),
+            gtk::DirectionType::Right => (index + 1 < columns.len()).then_some(index + 1),
+            _ => None,
+        };
+        let Some(column) = adjacent.and_then(|index| columns.get(index)) else {
+            return false;
+        };
+        let moved = focus_header_action(&column.header_actions, direction);
+        if moved && let Some(window) = self.state.overlay.root().and_downcast::<gtk::Window>() {
+            window.set_focus_visible(true);
+        }
+        moved
     }
 
     pub fn focus_items_from_header(&self) -> bool {
