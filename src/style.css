@@ -1231,6 +1231,11 @@ paned > separator {
   color: @theme_text;
 }
 
+.directory-column:focus-within .column-header {
+  background: alpha(@theme_highlight, 0.68);
+  box-shadow: inset 0 0 0 1px @theme_accent;
+}
+
 .directory-column scrolledwindow,
 .directory-column viewport,
 .directory-column listview {

@@ -79,7 +79,7 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
     header.set_title_widget(Some(&gtk::Box::new(gtk::Orientation::Horizontal, 0)));
     let sidebar_toggle = gtk::ToggleButton::builder()
         .active(true)
-        .tooltip_text("Toggle sidebar")
+        .tooltip_text("Toggle sidebar (Ctrl+B)")
         .build();
     sidebar_toggle.set_child(Some(&crate::assets::primary_icon(
         crate::assets::icons::PANEL_LEFT,
@@ -308,7 +308,7 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
     window.add_controller(settings_shortcut);
     window.set_child(Some(&window_overlay));
     install_modal_focus_trap(&window);
-    install_keyboard_navigation(&window, &browser, &sidebar_toggle, &preview);
+    install_keyboard_navigation(&window, &browser, &sidebar, &sidebar_toggle, &preview);
     browser.navigate(location.unwrap_or_else(home_directory));
 
     let browser_controller = browser.browser();
@@ -378,15 +378,19 @@ fn animate_sidebar(
 fn install_keyboard_navigation(
     window: &gtk::ApplicationWindow,
     view: &BrowserView,
+    sidebar: &SidebarView,
     sidebar_toggle: &gtk::ToggleButton,
     preview: &PreviewDrawer,
 ) {
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     let view = view.clone();
+    let sidebar_state = sidebar.state.clone();
+    let sidebar_widget = sidebar.widget.clone();
     let sidebar_toggle = sidebar_toggle.clone();
     let preview = preview.clone();
     let dialog_parent = window.clone();
+    let focus_before_sidebar = Rc::new(RefCell::new(None::<gtk::Widget>));
     let weak_browser = Rc::downgrade(&view.browser());
     keys.connect_key_pressed(move |_, key, _, modifiers| {
         let Some(browser) = weak_browser.upgrade() else {
@@ -404,6 +408,10 @@ fn install_keyboard_navigation(
         let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
         let control = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+        let focused = gtk::prelude::RootExt::focus(&dialog_parent);
+        let sidebar_has_focus = focused.as_ref().is_some_and(|focused| {
+            focused == &sidebar_widget || focused.is_ancestor(&sidebar_widget)
+        });
         if control && matches!(key, gtk::gdk::Key::k | gtk::gdk::Key::K) {
             if let Err(error) =
                 gtk::prelude::WidgetExt::activate_action(&dialog_parent, "win.search", None)
@@ -439,7 +447,28 @@ fn install_keyboard_navigation(
             view.begin_location_edit();
             return glib::Propagation::Stop;
         }
-        if control && key == gtk::gdk::Key::b {
+        if is_sidebar_focus_shortcut(key, modifiers) {
+            if sidebar_has_focus {
+                let restored = focus_before_sidebar
+                    .borrow_mut()
+                    .take()
+                    .is_some_and(|widget| widget.grab_focus());
+                if !restored {
+                    browser.focus_active();
+                }
+            } else {
+                focus_before_sidebar.replace(focused.clone());
+                if !sidebar_toggle.is_active() {
+                    sidebar_toggle.set_active(true);
+                }
+                let sidebar = sidebar_state.clone();
+                glib::idle_add_local_once(move || {
+                    sidebar.focus_active_place();
+                });
+            }
+            return glib::Propagation::Stop;
+        }
+        if control && !shift && matches!(key, gtk::gdk::Key::b | gtk::gdk::Key::B) {
             sidebar_toggle.set_active(!sidebar_toggle.is_active());
             return glib::Propagation::Stop;
         }
@@ -496,6 +525,59 @@ fn install_keyboard_navigation(
             browser.toggle_hidden();
             return glib::Propagation::Stop;
         }
+        let column_popover = focused
+            .as_ref()
+            .and_then(|focused| focused.ancestor(gtk::Popover::static_type()))
+            .and_downcast::<gtk::Popover>()
+            .filter(|popover| popover.has_css_class("column-popover"));
+        if let Some(popover) = column_popover
+            && !control
+            && !alt
+            && let Some(direction) = vim_focus_direction(key)
+        {
+            popover.child_focus(direction);
+            return glib::Propagation::Stop;
+        }
+        if view.header_actions_have_focus() && !control && !alt {
+            match key {
+                gtk::gdk::Key::h | gtk::gdk::Key::Left => {
+                    view.move_header_focus(gtk::DirectionType::Left);
+                    return glib::Propagation::Stop;
+                }
+                gtk::gdk::Key::l | gtk::gdk::Key::Right => {
+                    view.move_header_focus(gtk::DirectionType::Right);
+                    return glib::Propagation::Stop;
+                }
+                gtk::gdk::Key::j | gtk::gdk::Key::Down => {
+                    view.focus_items_from_header();
+                    return glib::Propagation::Stop;
+                }
+                _ => {}
+            }
+        }
+        if sidebar_has_focus
+            && !control
+            && !alt
+            && let Some(direction) = vim_focus_direction(key)
+        {
+            if direction == gtk::DirectionType::Right {
+                focus_before_sidebar.borrow_mut().take();
+                browser.focus_active();
+            } else {
+                sidebar_widget.child_focus(direction);
+            }
+            return glib::Propagation::Stop;
+        }
+        if key == gtk::gdk::Key::BackSpace
+            && !control
+            && !alt
+            && view.dismiss_empty_focused_filter()
+        {
+            return glib::Propagation::Stop;
+        }
+        if !control && !alt && !view.item_view_has_focus() {
+            return glib::Propagation::Proceed;
+        }
         if key == gtk::gdk::Key::Delete && !view.filter_has_focus() && view.confirm_delete(shift) {
             return glib::Propagation::Stop;
         }
@@ -506,9 +588,6 @@ fn install_keyboard_navigation(
         if key == gtk::gdk::Key::Escape && preview.is_open() {
             preview.close();
             return glib::Propagation::Stop;
-        }
-        if view.filter_has_focus() && !control && !alt {
-            return glib::Propagation::Proceed;
         }
         if key == gtk::gdk::Key::BackSpace && !control && !alt {
             view.navigate_up();
@@ -522,6 +601,12 @@ fn install_keyboard_navigation(
             browser.extend_selection(1);
             return glib::Propagation::Stop;
         }
+        if !shift
+            && matches!(key, gtk::gdk::Key::k | gtk::gdk::Key::Up)
+            && view.focus_header_from_top_item()
+        {
+            return glib::Propagation::Stop;
+        }
 
         match (key, alt) {
             (gtk::gdk::Key::Left, true) => browser.back(),
@@ -532,6 +617,12 @@ fn install_keyboard_navigation(
             }
             (gtk::gdk::Key::j | gtk::gdk::Key::Down, false) => browser.move_selection(1),
             (gtk::gdk::Key::k | gtk::gdk::Key::Up, false) => browser.move_selection(-1),
+            (gtk::gdk::Key::h | gtk::gdk::Key::Left, false)
+                if !control && view.first_column_has_focus() && sidebar_toggle.is_active() =>
+            {
+                focus_before_sidebar.replace(focused.clone());
+                sidebar_state.focus_active_place();
+            }
             (gtk::gdk::Key::h | gtk::gdk::Key::Left, false) => view.navigate_left(),
             (
                 gtk::gdk::Key::l
@@ -546,6 +637,22 @@ fn install_keyboard_navigation(
         glib::Propagation::Stop
     });
     window.add_controller(keys);
+}
+
+fn is_sidebar_focus_shortcut(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> bool {
+    modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::SHIFT_MASK)
+        && !modifiers.contains(gtk::gdk::ModifierType::ALT_MASK)
+        && matches!(key, gtk::gdk::Key::b | gtk::gdk::Key::B)
+}
+
+fn vim_focus_direction(key: gtk::gdk::Key) -> Option<gtk::DirectionType> {
+    match key {
+        gtk::gdk::Key::h => Some(gtk::DirectionType::Left),
+        gtk::gdk::Key::j => Some(gtk::DirectionType::Down),
+        gtk::gdk::Key::k => Some(gtk::DirectionType::Up),
+        gtk::gdk::Key::l => Some(gtk::DirectionType::Right),
+        _ => None,
+    }
 }
 
 fn visible_modal_layer(window: &gtk::ApplicationWindow) -> Option<gtk::Widget> {
@@ -891,6 +998,14 @@ impl SidebarState {
                 row.remove_css_class("active");
             }
         }
+    }
+
+    fn focus_active_place(&self) -> bool {
+        let rows = self.place_rows.borrow();
+        rows.iter()
+            .find(|(_, row)| row.has_css_class("active"))
+            .or_else(|| rows.first())
+            .is_some_and(|(_, row)| row.grab_focus())
     }
 
     fn append_trash_place(self: &Rc<Self>) {

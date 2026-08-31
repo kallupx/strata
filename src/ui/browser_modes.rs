@@ -360,6 +360,23 @@ impl ModeViews {
             .any(|entry| widget_has_focus(entry, focused.as_ref()))
     }
 
+    pub fn item_view_has_focus(&self) -> bool {
+        let focused = self.stack.root().and_then(|root| root.focus());
+        self.grid_panes
+            .iter()
+            .chain(self.explorer_pane.iter())
+            .any(|pane| widget_has_focus(&pane.view, focused.as_ref()))
+    }
+
+    pub fn empty_filter_has_focus(&self) -> bool {
+        let focused = self.stack.root().and_then(|root| root.focus());
+        self.grid_panes
+            .iter()
+            .chain(self.explorer_pane.iter())
+            .filter_map(|pane| pane.filter_entry.as_ref())
+            .any(|entry| entry.text().is_empty() && widget_has_focus(entry, focused.as_ref()))
+    }
+
     pub fn show_filter(&self) -> bool {
         let pane = match self.mode {
             BrowserMode::Columns => None,
@@ -583,12 +600,17 @@ impl ModeViews {
                 }
             }
             BrowserEvent::SelectionSetChanged {
-                depth, positions, ..
+                depth,
+                positions,
+                take_focus,
+                ..
             } => {
                 for pane in self.panes_at(*depth) {
                     set_selections(pane, positions);
                 }
-                self.focus_visible_pane(*depth);
+                if *take_focus {
+                    self.focus_visible_pane(*depth);
+                }
             }
             BrowserEvent::FocusChanged { depth, position } => {
                 for pane in self.panes_at(*depth) {

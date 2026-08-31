@@ -84,6 +84,7 @@ pub enum BrowserEvent {
         depth: usize,
         positions: Vec<usize>,
         focused: usize,
+        take_focus: bool,
     },
     PreviewRequested {
         entry: FileEntry,
@@ -297,6 +298,15 @@ impl Browser {
     }
 
     pub fn descend(self: &Rc<Self>, parent_depth: usize, location: Location) {
+        self.descend_with_selection(parent_depth, location, false);
+    }
+
+    fn descend_with_selection(
+        self: &Rc<Self>,
+        parent_depth: usize,
+        location: Location,
+        select_first_on_load: bool,
+    ) {
         self.validation_generation
             .set(self.validation_generation.get().saturating_add(1));
         self.validation_load.borrow_mut().take();
@@ -313,7 +323,7 @@ impl Browser {
                 self.focus_active();
                 return;
             }
-            self.descend_validated(parent_depth, location);
+            self.descend_validated(parent_depth, location, select_first_on_load);
             return;
         }
 
@@ -333,7 +343,11 @@ impl Browser {
                 return;
             }
             match result {
-                Ok(()) => browser.descend_validated(parent_depth, pending_location.clone()),
+                Ok(()) => browser.descend_validated(
+                    parent_depth,
+                    pending_location.clone(),
+                    select_first_on_load,
+                ),
                 Err(error) => {
                     browser.emit(BrowserEvent::NavigationRejected {
                         parent_depth,
@@ -347,15 +361,21 @@ impl Browser {
         self.validation_load.replace(Some(load));
     }
 
-    fn descend_validated(self: &Rc<Self>, parent_depth: usize, location: Location) {
+    fn descend_validated(
+        self: &Rc<Self>,
+        parent_depth: usize,
+        location: Location,
+        select_first_on_load: bool,
+    ) {
         let request_id = self.new_request_id();
-        if !self
-            .state
-            .borrow_mut()
-            .descend(parent_depth, location.clone(), request_id)
-        {
+        let mut state = self.state.borrow_mut();
+        if !state.descend(parent_depth, location.clone(), request_id) {
             return;
         }
+        if select_first_on_load {
+            state.select_first_on_load(parent_depth + 1);
+        }
+        drop(state);
 
         let retained = parent_depth + 1;
         self.loads.borrow_mut().truncate(retained);
@@ -551,6 +571,7 @@ impl Browser {
                         depth,
                         positions,
                         focused,
+                        take_focus: false,
                     });
                 }
             }
@@ -676,6 +697,7 @@ impl Browser {
                 depth,
                 positions,
                 focused,
+                take_focus: true,
             });
         }
     }
@@ -1083,12 +1105,20 @@ impl Browser {
                 depth,
                 positions,
                 focused,
+                take_focus: true,
             });
         }
     }
 
     pub fn focus_parent(&self) {
         let focus = self.state.borrow_mut().focus_parent();
+        if let Some((depth, position)) = focus {
+            self.emit(BrowserEvent::FocusChanged { depth, position });
+        }
+    }
+
+    fn focus_child(&self) {
+        let focus = self.state.borrow_mut().focus_child();
         if let Some((depth, position)) = focus {
             self.emit(BrowserEvent::FocusChanged { depth, position });
         }
@@ -1102,7 +1132,11 @@ impl Browser {
         };
 
         if entry.is_directory() {
-            self.descend(depth, entry.location);
+            if self.is_open_child(depth, &entry.location) {
+                self.focus_child();
+            } else {
+                self.descend_with_selection(depth, entry.location, true);
+            }
         } else {
             self.emit(BrowserEvent::OpenRequested {
                 location: entry.location,
@@ -1279,6 +1313,7 @@ impl Browser {
                     depth,
                     positions,
                     focused,
+                    take_focus: false,
                 });
             }
         }
@@ -1308,6 +1343,7 @@ impl Browser {
                             depth,
                             positions,
                             focused,
+                            take_focus: false,
                         });
                     }
                 } else if state.apply_peek_batch(request_id, &entries) {

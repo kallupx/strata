@@ -40,6 +40,7 @@ pub struct ColumnState {
     pub load_state: LoadState,
     preferences: ViewPreferences,
     request_id: RequestId,
+    select_first_on_load: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -164,6 +165,7 @@ impl NavigationState {
                 load_state: LoadState::Loading,
                 preferences,
                 request_id,
+                select_first_on_load: false,
             })
             .collect();
         self.active_column = self.columns.len().checked_sub(1);
@@ -230,7 +232,14 @@ impl NavigationState {
             load_state: LoadState::Loading,
             preferences: self.preferences,
             request_id,
+            select_first_on_load: false,
         });
+    }
+
+    pub fn select_first_on_load(&mut self, depth: usize) {
+        if let Some(column) = self.columns.get_mut(depth) {
+            column.select_first_on_load = true;
+        }
     }
 
     pub fn apply_batch(
@@ -257,6 +266,14 @@ impl NavigationState {
             if column.selected.is_some() {
                 column.selection_target = None;
             }
+        }
+        if column.select_first_on_load && !column.entries.is_empty() {
+            let location = column.entries[0].location.clone();
+            column.selected = Some(0);
+            column.selected_locations.clear();
+            column.selected_locations.insert(location.clone());
+            column.selection_anchor = Some(location);
+            column.select_first_on_load = false;
         }
         Some((depth, insertions))
     }
@@ -431,6 +448,7 @@ impl NavigationState {
 
     pub fn finish(&mut self, request_id: RequestId) -> Option<usize> {
         let (depth, column) = self.column_for_request_mut(request_id)?;
+        column.select_first_on_load = false;
         column.load_state = if column.entries.is_empty() {
             LoadState::Empty
         } else {
@@ -643,6 +661,13 @@ impl NavigationState {
         let parent_depth = depth.checked_sub(1)?;
         self.active_column = Some(parent_depth);
         Some((parent_depth, self.columns[parent_depth].selected))
+    }
+
+    pub fn focus_child(&mut self) -> Option<(usize, Option<usize>)> {
+        let child_depth = self.active_column?.checked_add(1)?;
+        let position = self.columns.get(child_depth)?.selected;
+        self.active_column = Some(child_depth);
+        Some((child_depth, position))
     }
 
     pub fn close_deepest(&mut self) -> Option<(usize, Option<usize>)> {

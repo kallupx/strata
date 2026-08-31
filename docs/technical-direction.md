@@ -242,9 +242,9 @@ Proposed default shortcuts:
 
 | Key | Action |
 |---|---|
-| `j` / `Down` | Select next item |
-| `k` / `Up` | Select previous item |
-| `h` / `Left` | Move to parent column |
+| `j` / `Down` | Select next item, or return from column header controls |
+| `k` / `Up` | Select previous item, then focus column header controls |
+| `h` / `Left` | Move between header controls, parent columns, then sidebar |
 | `l` / `Right` / `Enter` | Open item or descend into directory |
 | `Space` | Toggle or focus preview |
 | `/` or `Ctrl+F` | Search |
@@ -257,6 +257,7 @@ Proposed default shortcuts:
 | `Delete` | Move to trash |
 | `Shift+Delete` | Permanently delete |
 | `Ctrl+B` | Toggle sidebar |
+| `Ctrl+Shift+B` | Move focus between the sidebar and previous control |
 | `Ctrl+1` | List view |
 | `Ctrl+2` | Grid view |
 | `Ctrl++` / `Ctrl+-` | Change density or icon size |

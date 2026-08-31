@@ -487,6 +487,7 @@ fn filesystem_notifications_update_the_affected_column_incrementally() {
     let observed = events.clone();
     browser.observe(move |event| observed.borrow_mut().push(event));
     browser.navigate(Location::local("/fixture"));
+    browser.move_selection(1);
     events.borrow_mut().clear();
 
     let callback = notify
@@ -506,6 +507,14 @@ fn filesystem_notifications_update_the_affected_column_incrementally() {
         event,
         BrowserEvent::EntriesSpliced { depth: 0, splices, .. }
             if splices.len() == 1 && splices[0].removed == 0 && splices[0].entries.len() == 1
+    )));
+    assert!(events.borrow().iter().any(|event| matches!(
+        event,
+        BrowserEvent::SelectionSetChanged {
+            depth: 0,
+            take_focus: false,
+            ..
+        }
     )));
     assert!(
         !events
@@ -1079,6 +1088,22 @@ fn keyboard_selection_and_activation_descend_without_the_ui() {
             .iter()
             .any(|event| matches!(event, BrowserEvent::ColumnAdded { depth: 1, .. }))
     );
+
+    browser.focus_parent();
+    events.borrow_mut().clear();
+    browser.activate_focused();
+
+    assert!(events.borrow().iter().any(|event| matches!(
+        event,
+        BrowserEvent::FocusChanged {
+            depth: 1,
+            position: Some(0)
+        }
+    )));
+    assert!(!events.borrow().iter().any(|event| matches!(
+        event,
+        BrowserEvent::ColumnsTruncated { .. } | BrowserEvent::ColumnAdded { .. }
+    )));
 }
 
 #[test]

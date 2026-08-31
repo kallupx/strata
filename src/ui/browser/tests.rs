@@ -127,6 +127,27 @@ fn delete_confirmation_labels_distinguish_files_and_folders() {
 }
 
 #[test]
+fn delete_confirmation_direction_keys_choose_an_action() {
+    assert_eq!(
+        delete_confirmation_focus_target(gtk::gdk::Key::Left),
+        Some(DeleteConfirmationFocus::Cancel)
+    );
+    assert_eq!(
+        delete_confirmation_focus_target(gtk::gdk::Key::h),
+        Some(DeleteConfirmationFocus::Cancel)
+    );
+    assert_eq!(
+        delete_confirmation_focus_target(gtk::gdk::Key::Right),
+        Some(DeleteConfirmationFocus::Confirm)
+    );
+    assert_eq!(
+        delete_confirmation_focus_target(gtk::gdk::Key::l),
+        Some(DeleteConfirmationFocus::Confirm)
+    );
+    assert_eq!(delete_confirmation_focus_target(gtk::gdk::Key::Tab), None);
+}
+
+#[test]
 fn only_the_trash_root_uses_the_aggregate_properties_size() {
     assert!(is_trash_root(&Location::uri("trash:///")));
     assert!(!is_trash_root(&Location::uri("trash:///photo.png")));

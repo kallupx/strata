@@ -3,9 +3,40 @@
 use std::path::Path;
 
 use super::{
-    is_smb_location, is_standard_place_location, parse_pinned_places, remove_pinned_place,
-    reorder_places, should_show_standard_place,
+    is_sidebar_focus_shortcut, is_smb_location, is_standard_place_location, parse_pinned_places,
+    remove_pinned_place, reorder_places, should_show_standard_place, vim_focus_direction,
 };
+
+#[test]
+fn sidebar_focus_shortcut_requires_control_and_shift() {
+    let control = gtk::gdk::ModifierType::CONTROL_MASK;
+    let shift = gtk::gdk::ModifierType::SHIFT_MASK;
+
+    assert!(is_sidebar_focus_shortcut(gtk::gdk::Key::b, control | shift));
+    assert!(is_sidebar_focus_shortcut(gtk::gdk::Key::B, control | shift));
+    assert!(!is_sidebar_focus_shortcut(gtk::gdk::Key::b, control));
+}
+
+#[test]
+fn vim_focus_keys_map_to_gtk_directions() {
+    assert_eq!(
+        vim_focus_direction(gtk::gdk::Key::h),
+        Some(gtk::DirectionType::Left)
+    );
+    assert_eq!(
+        vim_focus_direction(gtk::gdk::Key::j),
+        Some(gtk::DirectionType::Down)
+    );
+    assert_eq!(
+        vim_focus_direction(gtk::gdk::Key::k),
+        Some(gtk::DirectionType::Up)
+    );
+    assert_eq!(
+        vim_focus_direction(gtk::gdk::Key::l),
+        Some(gtk::DirectionType::Right)
+    );
+    assert_eq!(vim_focus_direction(gtk::gdk::Key::Down), None);
+}
 
 #[test]
 fn places_can_move_before_an_earlier_item() {
