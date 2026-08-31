@@ -7,7 +7,8 @@ use std::{
 };
 
 use super::{
-    MediaBackend, media_backends, media_command, run_command_with_timeout, run_media_backends,
+    MediaBackend, bounded_output, media_backends, media_command, run_command_with_timeout,
+    run_media_backends,
 };
 
 fn arguments(backend: &MediaBackend) -> String {
@@ -96,6 +97,27 @@ fn timed_commands_stop_and_report_failure_at_their_deadline() {
         run_command_with_timeout(&mut Command::new("true"), Duration::from_secs(1))
             .expect("run successful command")
     );
+}
+
+#[test]
+fn provider_output_is_bounded_without_buffering_stderr() {
+    let exact = bounded_output(Command::new("sh").args(["-c", "printf 1234"]), 4)
+        .expect("read output at the limit");
+    assert_eq!(exact.stdout, b"1234");
+
+    let oversized = bounded_output(
+        Command::new("sh").args(["-c", "head -c 1025 /dev/zero"]),
+        1024,
+    );
+    assert!(oversized.is_err());
+
+    let noisy = bounded_output(
+        Command::new("sh").args(["-c", "head -c 1048576 /dev/zero >&2; printf ok"]),
+        2,
+    )
+    .expect("discard provider stderr");
+    assert_eq!(noisy.stdout, b"ok");
+    assert!(noisy.stderr.is_empty());
 }
 
 #[test]

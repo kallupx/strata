@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::{
-    fs, io,
+    fs,
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -11,7 +12,7 @@ use std::{
 use gdk_pixbuf::prelude::*;
 use gtk::gio;
 
-use crate::sandbox::{gpu_devices, numbered_name};
+use crate::sandbox::{MAX_OUTPUT_BYTES, gpu_devices, numbered_name};
 
 const HARDWARE_ATTEMPT_TIME_LIMIT: Duration = Duration::from_secs(8);
 const HARDWARE_TOTAL_TIME_LIMIT: Duration = Duration::from_secs(12);
@@ -73,12 +74,14 @@ fn render_raw(path: &Path, size: i32) -> Result<Vec<u8>, String> {
 
 fn render_imagemagick(path: &Path, size: i32) -> Result<Vec<u8>, String> {
     for executable in ["magick", "convert"] {
-        let output = Command::new(executable)
-            .arg(path)
-            .args(["-auto-orient", "-thumbnail"])
-            .arg(format!("{size}x{size}"))
-            .arg("png:-")
-            .output();
+        let output = bounded_output(
+            Command::new(executable)
+                .arg(path)
+                .args(["-auto-orient", "-thumbnail"])
+                .arg(format!("{size}x{size}"))
+                .arg("png:-"),
+            MAX_OUTPUT_BYTES,
+        );
         if let Ok(output) = output
             && output.status.success()
             && !output.stdout.is_empty()
@@ -91,10 +94,10 @@ fn render_imagemagick(path: &Path, size: i32) -> Result<Vec<u8>, String> {
 
 fn render_dcraw(path: &Path, size: i32) -> Result<Vec<u8>, String> {
     for executable in ["dcraw_emu", "dcraw"] {
-        let output = Command::new(executable)
-            .args(["-e", "-c"])
-            .arg(path)
-            .output();
+        let output = bounded_output(
+            Command::new(executable).args(["-e", "-c"]).arg(path),
+            MAX_OUTPUT_BYTES,
+        );
         let Ok(output) = output else {
             continue;
         };
@@ -352,19 +355,54 @@ fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> io::Res
 }
 
 fn render_media(path: &Path, size: i32) -> Result<Vec<u8>, String> {
-    let output = Command::new("ffmpegthumbnailer")
-        .arg("-i")
-        .arg(path)
-        .args(["-o", "/dev/stdout", "-s"])
-        .arg(size.to_string())
-        .args(["-q", "8"])
-        .output()
-        .map_err(|error| error.to_string())?;
+    let output = bounded_output(
+        Command::new("ffmpegthumbnailer")
+            .arg("-i")
+            .arg(path)
+            .args(["-o", "/dev/stdout", "-s"])
+            .arg(size.to_string())
+            .args(["-q", "8"]),
+        MAX_OUTPUT_BYTES,
+    )
+    .map_err(|error| error.to_string())?;
     if output.status.success() && !output.stdout.is_empty() {
         Ok(output.stdout)
     } else {
         Err("Unable to render media thumbnail".to_owned())
     }
+}
+
+fn bounded_output(command: &mut Command, max_bytes: u64) -> io::Result<Output> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdout = Vec::new();
+    let read = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("Unable to capture provider output"))?
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut stdout);
+    if let Err(error) = read {
+        let _killed = child.kill();
+        let _waited = child.wait();
+        return Err(error);
+    }
+    if stdout.len() as u64 > max_bytes {
+        let _killed = child.kill();
+        let _waited = child.wait();
+        return Err(io::Error::other(
+            "Preview provider output exceeded its limit",
+        ));
+    }
+    let status = child.wait()?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    })
 }
 
 #[cfg(test)]
