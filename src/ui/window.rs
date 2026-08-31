@@ -538,11 +538,14 @@ fn install_keyboard_navigation(
             popover.child_focus(direction);
             return glib::Propagation::Stop;
         }
+        let mut header_left_boundary = false;
         if view.header_actions_have_focus() && !control && !alt {
             match key {
                 gtk::gdk::Key::h | gtk::gdk::Key::Left => {
-                    view.move_header_focus(gtk::DirectionType::Left);
-                    return glib::Propagation::Stop;
+                    if view.move_header_focus(gtk::DirectionType::Left) {
+                        return glib::Propagation::Stop;
+                    }
+                    header_left_boundary = true;
                 }
                 gtk::gdk::Key::l | gtk::gdk::Key::Right => {
                     view.move_header_focus(gtk::DirectionType::Right);
@@ -575,7 +578,7 @@ fn install_keyboard_navigation(
         {
             return glib::Propagation::Stop;
         }
-        if !control && !alt && !view.item_view_has_focus() {
+        if !control && !alt && !view.item_view_has_focus() && !header_left_boundary {
             return glib::Propagation::Proceed;
         }
         if key == gtk::gdk::Key::Delete && !view.filter_has_focus() && view.confirm_delete(shift) {
