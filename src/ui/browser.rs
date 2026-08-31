@@ -499,10 +499,16 @@ impl BrowserView {
         if filtered_position_for_source(column, position) != Some(0) {
             return false;
         }
-        let focused = column
-            .header_actions
-            .first_child()
-            .is_some_and(|control| control.grab_focus());
+        let mut control = column.header_actions.first_child();
+        let focused = loop {
+            let Some(candidate) = control else {
+                break false;
+            };
+            control = candidate.next_sibling();
+            if candidate.is_visible() && candidate.grab_focus() {
+                break true;
+            }
+        };
         if focused && let Some(window) = self.state.overlay.root().and_downcast::<gtk::Window>() {
             window.set_focus_visible(true);
         }
@@ -1706,14 +1712,18 @@ impl ViewState {
         let cancel_layer = layer.clone();
         let cancel_overlay = window_overlay.clone();
         let cancel_root = blurred_root.clone();
+        let cancel_browser = self.browser.clone();
         cancel.connect_clicked(move |_| {
             dismiss_modal_layer(&cancel_layer, &cancel_overlay, cancel_root.as_ref());
+            cancel_browser.focus_active();
         });
         let close_layer = layer.clone();
         let close_overlay = window_overlay.clone();
         let close_root = blurred_root.clone();
+        let close_browser = self.browser.clone();
         close.connect_clicked(move |_| {
             dismiss_modal_layer(&close_layer, &close_overlay, close_root.as_ref());
+            close_browser.focus_active();
         });
         let empty_layer = layer.clone();
         let empty_overlay = window_overlay.clone();
@@ -1722,21 +1732,36 @@ impl ViewState {
         empty.connect_clicked(move |_| {
             dismiss_modal_layer(&empty_layer, &empty_overlay, empty_root.as_ref());
             browser.delete(summary.entries.clone(), true);
+            browser.focus_active();
         });
-        let escape = gtk::EventControllerKey::new();
+        let keys = gtk::EventControllerKey::new();
         let escape_layer = layer.clone();
+        let focused_layer = layer.clone();
         let escape_overlay = window_overlay;
         let escape_root = blurred_root;
-        escape.connect_key_pressed(move |_, key, _, _| {
+        let escape_browser = self.browser.clone();
+        keys.connect_key_pressed(move |_, key, _, modifiers| {
             if key == gtk::gdk::Key::Escape {
                 dismiss_modal_layer(&escape_layer, &escape_overlay, escape_root.as_ref());
+                escape_browser.focus_active();
+                glib::Propagation::Stop
+            } else if !modifiers
+                .intersects(gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::ALT_MASK)
+                && let Some(direction) = vim_focus_direction(key)
+            {
+                focused_layer.child_focus(direction);
                 glib::Propagation::Stop
             } else {
                 glib::Propagation::Proceed
             }
         });
-        layer.add_controller(escape);
-        cancel.grab_focus();
+        layer.add_controller(keys);
+        glib::idle_add_local_once(move || {
+            cancel.grab_focus();
+            if let Some(window) = cancel.root().and_downcast::<gtk::Window>() {
+                window.set_focus_visible(true);
+            }
+        });
     }
 
     fn show_delete_confirmation(self: &Rc<Self>, entries: Vec<FileEntry>, permanent: bool) {
@@ -1871,18 +1896,22 @@ impl ViewState {
         let cancelled_layer = layer.clone();
         let cancelled_overlay = window_overlay.clone();
         let cancelled_root = blurred_root.clone();
+        let cancelled_browser = self.browser.clone();
         cancel.connect_clicked(move |_| {
             dismiss_modal_layer(
                 &cancelled_layer,
                 &cancelled_overlay,
                 cancelled_root.as_ref(),
             );
+            cancelled_browser.focus_active();
         });
         let closed_layer = layer.clone();
         let closed_overlay = window_overlay.clone();
         let closed_root = blurred_root.clone();
+        let closed_browser = self.browser.clone();
         close.connect_clicked(move |_| {
             dismiss_modal_layer(&closed_layer, &closed_overlay, closed_root.as_ref());
+            closed_browser.focus_active();
         });
         let confirmed_layer = layer.clone();
         let confirmed_overlay = window_overlay.clone();
@@ -1895,16 +1924,19 @@ impl ViewState {
                 confirmed_root.as_ref(),
             );
             browser.delete(entries.clone(), permanent);
+            browser.focus_active();
         });
         let keys = gtk::EventControllerKey::new();
         let escaped_layer = layer.clone();
         let escaped_overlay = window_overlay;
         let escaped_root = blurred_root;
+        let escaped_browser = self.browser.clone();
         let focused_cancel = cancel.clone();
         let focused_confirm = confirm.clone();
         keys.connect_key_pressed(move |_, key, _, modifiers| {
             if key == gtk::gdk::Key::Escape {
                 dismiss_modal_layer(&escaped_layer, &escaped_overlay, escaped_root.as_ref());
+                escaped_browser.focus_active();
                 glib::Propagation::Stop
             } else if !modifiers
                 .intersects(gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::ALT_MASK)
@@ -5662,6 +5694,16 @@ fn delete_confirmation_focus_target(key: gtk::gdk::Key) -> Option<DeleteConfirma
     match key {
         gtk::gdk::Key::Left | gtk::gdk::Key::h => Some(DeleteConfirmationFocus::Cancel),
         gtk::gdk::Key::Right | gtk::gdk::Key::l => Some(DeleteConfirmationFocus::Confirm),
+        _ => None,
+    }
+}
+
+fn vim_focus_direction(key: gtk::gdk::Key) -> Option<gtk::DirectionType> {
+    match key {
+        gtk::gdk::Key::h => Some(gtk::DirectionType::Left),
+        gtk::gdk::Key::j => Some(gtk::DirectionType::Down),
+        gtk::gdk::Key::k => Some(gtk::DirectionType::Up),
+        gtk::gdk::Key::l => Some(gtk::DirectionType::Right),
         _ => None,
     }
 }

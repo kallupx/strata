@@ -148,6 +148,27 @@ fn delete_confirmation_direction_keys_choose_an_action() {
 }
 
 #[test]
+fn vim_focus_keys_map_to_dialog_directions() {
+    assert_eq!(
+        vim_focus_direction(gtk::gdk::Key::h),
+        Some(gtk::DirectionType::Left)
+    );
+    assert_eq!(
+        vim_focus_direction(gtk::gdk::Key::j),
+        Some(gtk::DirectionType::Down)
+    );
+    assert_eq!(
+        vim_focus_direction(gtk::gdk::Key::k),
+        Some(gtk::DirectionType::Up)
+    );
+    assert_eq!(
+        vim_focus_direction(gtk::gdk::Key::l),
+        Some(gtk::DirectionType::Right)
+    );
+    assert_eq!(vim_focus_direction(gtk::gdk::Key::Down), None);
+}
+
+#[test]
 fn only_the_trash_root_uses_the_aggregate_properties_size() {
     assert!(is_trash_root(&Location::uri("trash:///")));
     assert!(!is_trash_root(&Location::uri("trash:///photo.png")));
