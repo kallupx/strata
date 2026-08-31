@@ -331,7 +331,10 @@ fn run_media_backends<E>(
     Err("Unable to normalize media preview".to_owned())
 }
 
-fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<bool> {
+pub(crate) fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> io::Result<bool> {
     if timeout.is_zero() {
         return Ok(false);
     }

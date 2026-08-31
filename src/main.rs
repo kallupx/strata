@@ -12,9 +12,13 @@ mod services;
 mod storage;
 mod ui;
 
+use std::{process::Stdio, time::Duration};
+
 use gtk::{gio, prelude::*};
 
 const APPLICATION_ID: &str = "io.github.lgse.Strata";
+const GVFS_PROBE_ARGUMENT: &str = "--gvfs-probe";
+const GVFS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() -> gtk::glib::ExitCode {
     let arguments: Vec<_> = std::env::args().collect();
@@ -28,6 +32,16 @@ fn main() -> gtk::glib::ExitCode {
         }
         return gtk::glib::ExitCode::SUCCESS;
     }
+    if arguments
+        .get(1)
+        .is_some_and(|value| value == GVFS_PROBE_ARGUMENT)
+    {
+        let _vfs = gio::Vfs::default();
+        let _volumes = gio::VolumeMonitor::get();
+        return gtk::glib::ExitCode::SUCCESS;
+    }
+
+    fall_back_if_gvfs_is_unresponsive();
 
     metrics::initialize();
     if let Err(error) = tracing_subscriber::fmt::try_init() {
@@ -49,4 +63,25 @@ fn main() -> gtk::glib::ExitCode {
         ui::present_location(application, location);
     });
     application.run()
+}
+
+fn fall_back_if_gvfs_is_unresponsive() {
+    if std::env::var_os("GIO_USE_VFS").is_some() {
+        return;
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let responsive = sandbox_helper::run_command_with_timeout(
+        std::process::Command::new(executable)
+            .arg(GVFS_PROBE_ARGUMENT)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        GVFS_PROBE_TIMEOUT,
+    )
+    .unwrap_or(true);
+    if !responsive && gtk::glib::setenv("GIO_USE_VFS", "local", false).is_ok() {
+        eprintln!("GVFS is unresponsive; using local filesystem support for this session.");
+    }
 }
