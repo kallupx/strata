@@ -169,11 +169,8 @@ fn render_pdf_surface(
     if page_width <= 0.0 || page_height <= 0.0 {
         return Err("The PDF page has invalid dimensions".to_owned());
     }
-    let scale = (max_width / page_width)
-        .min(max_height / page_height)
-        .min((max_pixels / (page_width * page_height)).sqrt());
-    let width = (page_width * scale).ceil().max(1.0) as i32;
-    let height = (page_height * scale).ceil().max(1.0) as i32;
+    let (width, height, scale) =
+        bounded_surface_dimensions(page_width, page_height, max_width, max_height, max_pixels);
     let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)
         .map_err(|error| error.to_string())?;
     let context = cairo::Context::new(&surface).map_err(|error| error.to_string())?;
@@ -187,6 +184,25 @@ fn render_pdf_surface(
         .write_to_png(&mut png)
         .map_err(|error| error.to_string())?;
     Ok(png)
+}
+
+fn bounded_surface_dimensions(
+    source_width: f64,
+    source_height: f64,
+    max_width: f64,
+    max_height: f64,
+    max_pixels: f64,
+) -> (i32, i32, f64) {
+    let requested_scale = (max_width / source_width)
+        .min(max_height / source_height)
+        .min((max_pixels / (source_width * source_height)).sqrt());
+    // Rounding both dimensions up can push the result beyond max_pixels, causing the parent to
+    // reject an otherwise valid render. Round down and derive the final scale from the integer
+    // surface so the page still fits without clipping.
+    let width = (source_width * requested_scale).floor().max(1.0) as i32;
+    let height = (source_height * requested_scale).floor().max(1.0) as i32;
+    let scale = (f64::from(width) / source_width).min(f64::from(height) / source_height);
+    (width, height, scale)
 }
 
 fn render_media_preview(path: &Path, output: &Path) -> Result<(), String> {

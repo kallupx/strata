@@ -7,8 +7,8 @@ use std::{
 };
 
 use super::{
-    MediaBackend, bounded_output, media_backends, media_command, run_command_with_timeout,
-    run_media_backends,
+    MediaBackend, bounded_output, bounded_surface_dimensions, media_backends, media_command,
+    run_command_with_timeout, run_media_backends,
 };
 
 fn arguments(backend: &MediaBackend) -> String {
@@ -97,6 +97,20 @@ fn timed_commands_stop_and_report_failure_at_their_deadline() {
         run_command_with_timeout(&mut Command::new("true"), Duration::from_secs(1))
             .expect("run successful command")
     );
+}
+
+#[test]
+fn pdf_surface_dimensions_stay_inside_the_parent_pixel_limit() {
+    let source_width = 1_000.0;
+    let source_height = 1_280.0;
+    let (width, height, scale) =
+        bounded_surface_dimensions(source_width, source_height, 1_400.0, 1_800.0, 2_500_000.0);
+
+    assert!(width <= 1_400);
+    assert!(height <= 1_800);
+    assert!(i64::from(width) * i64::from(height) <= 2_500_000);
+    assert!(source_width * scale <= f64::from(width));
+    assert!(source_height * scale <= f64::from(height));
 }
 
 #[test]
