@@ -13,6 +13,13 @@ use std::{
 const RESULT_LIMIT: usize = 100;
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Bounds worst-case index memory on an adversarially large tree. Each retained `SearchItem`
+/// stores full path strings, so cost scales with path length, not just entry count: roughly
+/// 60-140 MB at this cap for typical paths, but up to ~1.5-2 GB for paths near `PATH_MAX`.
+const MAX_INDEX_ENTRIES: usize = 200_000;
+const MAX_INDEX_DEPTH: usize = 64;
+const INDEX_TIME_BUDGET: Duration = Duration::from_secs(10);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchItem {
     pub path: PathBuf,
@@ -27,11 +34,21 @@ pub enum SearchEvent {
         query: String,
         items: Vec<SearchItem>,
         indexing: bool,
+        /// `true` if the index does not cover the full tree; results are the best matches found
+        /// so far, not necessarily complete.
+        truncated: bool,
     },
 }
 
 enum SearchCommand {
     Query(String),
+}
+
+#[derive(Default)]
+struct WalkProgress {
+    query: String,
+    matches: Vec<(i64, SearchItem)>,
+    truncated: bool,
 }
 
 pub struct SearchHandle {
@@ -49,6 +66,7 @@ impl SearchHandle {
 
 impl Drop for SearchHandle {
     fn drop(&mut self) {
+        tracing::debug!("search index cancelled");
         self.cancelled.store(true, Ordering::Relaxed);
     }
 }
@@ -56,6 +74,15 @@ impl Drop for SearchHandle {
 /// Builds and searches the index entirely off the GTK thread. The UI receives only the best
 /// bounded result set, so typing remains responsive even while very large trees are being walked.
 pub fn index_tree(root: PathBuf) -> (SearchHandle, Receiver<SearchEvent>) {
+    index_tree_with_budget(root, MAX_INDEX_ENTRIES, MAX_INDEX_DEPTH, INDEX_TIME_BUDGET)
+}
+
+fn index_tree_with_budget(
+    root: PathBuf,
+    max_entries: usize,
+    max_depth: usize,
+    time_budget: Duration,
+) -> (SearchHandle, Receiver<SearchEvent>) {
     let (command_sender, command_receiver) = mpsc::channel();
     let (event_sender, event_receiver) = mpsc::channel();
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -64,30 +91,46 @@ pub fn index_tree(root: PathBuf) -> (SearchHandle, Receiver<SearchEvent>) {
         .name("strata-search-index".into())
         .spawn(move || {
             let mut index = Vec::new();
-            let mut query = String::new();
-            let mut matches = Vec::<(i64, SearchItem)>::new();
+            let mut progress = WalkProgress::default();
             let mut last_publish = Instant::now();
+            let walk_start = Instant::now();
+            // Walk one level past `max_depth` so a directory at the cap with real children
+            // yields at least one entry beyond it, letting depth truncation be detected below.
             let walker = ignore::WalkBuilder::new(&root)
                 .hidden(true)
                 .follow_links(false)
                 .standard_filters(true)
                 .require_git(false)
+                .max_depth(Some(max_depth + 1))
                 .build();
 
-            for entry in walker
-                .filter_map(Result::ok)
-                .filter(|entry| entry.depth() > 0)
-            {
+            for result in walker {
                 if worker_cancelled.load(Ordering::Relaxed) {
                     return;
+                }
+                let entry = match result {
+                    Ok(entry) if entry.depth() == 0 => continue,
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        // An unreadable directory also omits part of the tree from the index.
+                        progress.truncated = true;
+                        continue;
+                    }
+                };
+                if entry.depth() > max_depth {
+                    progress.truncated = true;
+                    continue;
+                }
+                if index.len() >= max_entries || walk_start.elapsed() >= time_budget {
+                    progress.truncated = true;
+                    break;
                 }
                 apply_pending_queries(
                     &command_receiver,
                     &event_sender,
                     &index,
                     &root,
-                    &mut query,
-                    &mut matches,
+                    &mut progress,
                     true,
                 );
                 let is_directory = entry.file_type().is_some_and(|kind| kind.is_dir());
@@ -109,28 +152,41 @@ pub fn index_tree(root: PathBuf) -> (SearchHandle, Receiver<SearchEvent>) {
                     path,
                     search_path,
                 };
-                if let Some(score) = fuzzy_score(&item, &query, &root) {
-                    insert_match(&mut matches, score, item.clone());
+                if let Some(score) = fuzzy_score(&item, &progress.query, &root) {
+                    insert_match(&mut progress.matches, score, item.clone());
                 }
                 index.push(item);
 
-                if !query.is_empty() && last_publish.elapsed() >= PUBLISH_INTERVAL {
-                    publish(&event_sender, &query, &matches, true);
+                if !progress.query.is_empty() && last_publish.elapsed() >= PUBLISH_INTERVAL {
+                    publish(&event_sender, &progress, true);
                     last_publish = Instant::now();
                 }
             }
 
-            publish(&event_sender, &query, &matches, false);
+            if progress.truncated {
+                tracing::warn!(
+                    entries = index.len(),
+                    elapsed_ms = walk_start.elapsed().as_millis() as u64,
+                    "search index truncated"
+                );
+            } else {
+                tracing::info!(
+                    entries = index.len(),
+                    elapsed_ms = walk_start.elapsed().as_millis() as u64,
+                    "search index built"
+                );
+            }
+            publish(&event_sender, &progress, false);
             while !worker_cancelled.load(Ordering::Relaxed) {
                 match command_receiver.recv_timeout(Duration::from_millis(50)) {
                     Ok(SearchCommand::Query(next)) => {
-                        query = command_receiver
+                        progress.query = command_receiver
                             .try_iter()
                             .map(|SearchCommand::Query(query)| query)
                             .last()
                             .unwrap_or(next);
-                        matches = score_index(&index, &query, &root);
-                        publish(&event_sender, &query, &matches, false);
+                        progress.matches = score_index(&index, &progress.query, &root);
+                        publish(&event_sender, &progress, false);
                     }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return,
@@ -151,8 +207,7 @@ fn apply_pending_queries(
     sender: &Sender<SearchEvent>,
     index: &[SearchItem],
     root: &Path,
-    query: &mut String,
-    matches: &mut Vec<(i64, SearchItem)>,
+    progress: &mut WalkProgress,
     indexing: bool,
 ) {
     let Some(next) = receiver
@@ -162,9 +217,9 @@ fn apply_pending_queries(
     else {
         return;
     };
-    *query = next;
-    *matches = score_index(index, query, root);
-    publish(sender, query, matches, indexing);
+    progress.query = next;
+    progress.matches = score_index(index, &progress.query, root);
+    publish(sender, progress, indexing);
 }
 
 fn score_index(index: &[SearchItem], query: &str, _root: &Path) -> Vec<(i64, SearchItem)> {
@@ -188,19 +243,16 @@ fn insert_match(matches: &mut Vec<(i64, SearchItem)>, score: i64, item: SearchIt
     }
 }
 
-fn publish(
-    sender: &Sender<SearchEvent>,
-    query: &str,
-    matches: &[(i64, SearchItem)],
-    indexing: bool,
-) {
-    if query.is_empty() {
-        return;
-    }
+fn publish(sender: &Sender<SearchEvent>, progress: &WalkProgress, indexing: bool) {
     let _sent = sender.send(SearchEvent::Results {
-        query: query.to_owned(),
-        items: matches.iter().map(|(_, item)| item.clone()).collect(),
+        query: progress.query.clone(),
+        items: progress
+            .matches
+            .iter()
+            .map(|(_, item)| item.clone())
+            .collect(),
         indexing,
+        truncated: progress.truncated,
     });
 }
 

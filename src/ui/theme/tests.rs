@@ -164,13 +164,14 @@ theme = "azure-glow"
     assert!(preferences.folder_peeking);
     assert!(preferences.single_click_previews);
     assert!(!preferences.search_open_files_directly);
+    assert!(!preferences.reduce_motion);
     assert_eq!(preferences.browser_mode, "columns");
     assert_eq!(preferences.browser_density, "compact");
     assert_eq!(sort_preferences(&preferences), ViewPreferences::default());
 }
 
 #[test]
-fn sorting_preferences_round_trip_all_supported_values() {
+fn view_preferences_round_trip_all_supported_sorting_values() {
     for (key, stored_key) in [
         (SortKey::Name, "name"),
         (SortKey::Size, "size"),
@@ -182,6 +183,8 @@ fn sorting_preferences_round_trip_all_supported_values() {
             (SortDirection::Descending, "descending"),
         ] {
             let preferences = Preferences {
+                show_hidden: true,
+                folders_first: false,
                 sort_key: stored_key.to_owned(),
                 sort_direction: stored_direction.to_owned(),
                 ..Preferences::default()
@@ -189,8 +192,15 @@ fn sorting_preferences_round_trip_all_supported_values() {
             let serialized = toml::to_string(&preferences).expect("preferences should serialize");
             let restored: Preferences =
                 toml::from_str(&serialized).expect("preferences should deserialize");
-            assert_eq!(sort_preferences(&restored).sort_key, key);
-            assert_eq!(sort_preferences(&restored).sort_direction, direction);
+            assert_eq!(
+                sort_preferences(&restored),
+                ViewPreferences {
+                    show_hidden: true,
+                    folders_first: false,
+                    sort_key: key,
+                    sort_direction: direction,
+                }
+            );
         }
     }
 }
@@ -199,38 +209,39 @@ fn sorting_preferences_round_trip_all_supported_values() {
 fn invalid_sorting_preferences_fall_back_as_a_pair() {
     for (key, direction) in [("unknown", "descending"), ("size", "sideways")] {
         let preferences = Preferences {
+            show_hidden: true,
+            folders_first: false,
             sort_key: key.to_owned(),
             sort_direction: direction.to_owned(),
             ..Preferences::default()
         };
-        assert_eq!(sort_preferences(&preferences), ViewPreferences::default());
+        assert_eq!(
+            sort_preferences(&preferences),
+            ViewPreferences {
+                show_hidden: true,
+                folders_first: false,
+                ..ViewPreferences::default()
+            }
+        );
     }
 }
 
 #[test]
-fn folder_peeking_can_be_disabled_in_preferences() {
-    let preferences: Preferences = toml::from_str(
-        r#"
-mode = "theme"
-theme = "azure-glow"
-folder_peeking = false
-"#,
-    )
-    .expect("preferences should be valid");
+fn general_preferences_round_trip() {
+    let preferences = Preferences {
+        folder_peeking: false,
+        single_click_previews: false,
+        search_open_files_directly: true,
+        reduce_motion: true,
+        ..Preferences::default()
+    };
 
-    assert!(!preferences.folder_peeking);
-}
+    let serialized = toml::to_string(&preferences).expect("preferences should serialize");
+    let restored: Preferences =
+        toml::from_str(&serialized).expect("preferences should deserialize");
 
-#[test]
-fn single_click_previews_can_be_disabled_in_preferences() {
-    let preferences: Preferences = toml::from_str(
-        r#"
-mode = "theme"
-theme = "azure-glow"
-single_click_previews = false
-"#,
-    )
-    .expect("preferences should be valid");
-
-    assert!(!preferences.single_click_previews);
+    assert!(!restored.folder_peeking);
+    assert!(!restored.single_click_previews);
+    assert!(restored.search_open_files_directly);
+    assert!(restored.reduce_motion);
 }

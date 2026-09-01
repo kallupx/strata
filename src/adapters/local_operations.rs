@@ -11,14 +11,17 @@ use std::{
     io,
     os::{
         fd::{AsFd, OwnedFd},
-        unix::ffi::{OsStrExt, OsStringExt},
+        unix::{
+            ffi::{OsStrExt, OsStringExt},
+            fs::PermissionsExt,
+        },
     },
     path::{Component, Path, PathBuf},
     pin::Pin,
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -306,8 +309,7 @@ async fn replace_local_with(
     copy_to_stage: StageCopy,
 ) -> Result<(), glib::Error> {
     if let Some(locations) = affected_locations {
-        locations.insert(location_for_file(&source));
-        locations.insert(location_for_file(&target));
+        locations.extend([&source, &target].into_iter().filter_map(location_for_file));
     }
     if source.path().is_none() {
         return Err(glib::Error::new(
@@ -520,6 +522,50 @@ fn operation_error_summary(errors: &[String], action: &str) -> String {
     summary
 }
 
+async fn write_staged_archive<F>(
+    destination: &Path,
+    archive_path: &Path,
+    conflict: TransferConflict,
+    write_archive: F,
+) -> Result<(), String>
+where
+    F: FnOnce(std::fs::File) -> Result<(), String> + Send + 'static,
+{
+    let existing_permissions = if conflict == TransferConflict::ReplaceExisting {
+        match std::fs::symlink_metadata(archive_path) {
+            Ok(metadata) if metadata.file_type().is_file() => Some(metadata.permissions()),
+            Ok(_) => None,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.to_string()),
+        }
+    } else {
+        None
+    };
+    let mut builder = tempfile::Builder::new();
+    builder
+        .prefix(".strata-compression-")
+        .permissions(std::fs::Permissions::from_mode(0o666));
+    let staged = builder
+        .tempfile_in(destination)
+        .map_err(|error| error.to_string())?;
+    let file = staged.reopen().map_err(|error| error.to_string())?;
+    gio::spawn_blocking(move || write_archive(file))
+        .await
+        .map_err(|_| "Compression task panicked".to_owned())??;
+    if let Some(permissions) = existing_permissions {
+        staged
+            .as_file()
+            .set_permissions(permissions)
+            .map_err(|error| error.to_string())?;
+    }
+    match conflict {
+        TransferConflict::FailIfExists => staged.persist_noclobber(archive_path),
+        TransferConflict::ReplaceExisting => staged.persist(archive_path),
+    }
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
 fn deletion_error_summary(errors: &[String]) -> String {
     operation_error_summary(errors, "deleted")
 }
@@ -646,7 +692,13 @@ impl OperationProvider for LocalOperationProvider {
                     return;
                 }
             };
-            let item = location_for_file(&folder);
+            let Some(item) = location_for_file(&folder) else {
+                emit(OperationEvent::Failed {
+                    request_id: request.id,
+                    message: "The new folder has an invalid URI".to_owned(),
+                });
+                return;
+            };
             let affected_locations = HashSet::from([request.parent.clone()]);
             if operation_cancellable.is_cancelled() {
                 emit(cancelled_event(
@@ -711,7 +763,13 @@ impl OperationProvider for LocalOperationProvider {
                     return;
                 }
             };
-            let item = location_for_file(&file);
+            let Some(item) = location_for_file(&file) else {
+                emit(OperationEvent::Failed {
+                    request_id: request.id,
+                    message: "The new file has an invalid URI".to_owned(),
+                });
+                return;
+            };
             let affected_locations = HashSet::from([request.parent.clone()]);
             if operation_cancellable.is_cancelled() {
                 emit(cancelled_event(
@@ -802,7 +860,9 @@ impl OperationProvider for LocalOperationProvider {
                     continue;
                 }
                 affected_locations.insert(item.source.clone());
-                affected_locations.insert(location_for_file(&target));
+                if let Some(target) = location_for_file(&target) {
+                    affected_locations.insert(target);
+                }
                 let result = if item.conflict == TransferConflict::ReplaceExisting {
                     replace_local(
                         source,
@@ -1036,7 +1096,9 @@ impl OperationProvider for LocalOperationProvider {
                         Some(original_path) => {
                             let target =
                                 gio::File::for_path(std::path::Path::new(original_path.as_str()));
-                            if let Some(parent) = location_for_file(&target).parent() {
+                            if let Some(parent) =
+                                location_for_file(&target).and_then(|location| location.parent())
+                            {
                                 affected_locations.insert(parent);
                             }
                             await_cancellable(
@@ -1109,14 +1171,23 @@ impl OperationProvider for LocalOperationProvider {
     }
 
     fn compress(&self, request: CompressRequest, emit: Rc<dyn Fn(OperationEvent)>) -> LoadHandle {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task_cancelled = cancelled.clone();
         let task = glib::MainContext::default().spawn_local(async move {
-            let Some(dest_dir) = request.destination.native_path() else {
+            let Some(dest_dir) = request.destination.native_path().map(Path::to_path_buf) else {
                 emit(OperationEvent::Failed {
                     request_id: request.id,
                     message: "Archive destination must be a local path".to_owned(),
                 });
                 return;
             };
+            if let Err(message) = validate_basename(&request.archive_name) {
+                emit(OperationEvent::Failed {
+                    request_id: request.id,
+                    message: message.to_owned(),
+                });
+                return;
+            }
             let archive_name = format!("{}.{}", request.archive_name, request.format.extension());
             let archive_path = dest_dir.join(&archive_name);
             let entries: Vec<std::path::PathBuf> = request
@@ -1137,50 +1208,49 @@ impl OperationProvider for LocalOperationProvider {
                 request_id: request.id,
                 total: 0,
             });
-            let timer_id = archive_progress_timer(request.id, &progress, &total, &emit);
+            let timer_id =
+                archive_progress_timer(request.id, &progress, &total, &task_cancelled, &emit);
             let format = request.format;
             let password = request.password.clone();
             let work_progress = progress.clone();
             let work_total = total.clone();
-            let result = gio::spawn_blocking(move || {
-                let count = count_files(&entries);
-                work_total.store(count, Ordering::Relaxed);
-                match format {
-                    ArchiveFormat::Zip => {
-                        compress_zip(&archive_path, &entries, password.as_deref(), &work_progress)
+            let result =
+                write_staged_archive(&dest_dir, &archive_path, request.conflict, move |file| {
+                    let count = count_files(&entries);
+                    work_total.store(count, Ordering::Relaxed);
+                    match format {
+                        ArchiveFormat::Zip => {
+                            compress_zip(file, &entries, password.as_deref(), &work_progress)
+                        }
+                        ArchiveFormat::SevenZ => {
+                            compress_7z(file, &entries, password.as_deref(), &work_progress)
+                        }
+                        ArchiveFormat::TarGz => compress_tar(file, &entries, true, &work_progress),
+                        ArchiveFormat::Tar => compress_tar(file, &entries, false, &work_progress),
                     }
-                    ArchiveFormat::SevenZ => {
-                        compress_7z(&archive_path, &entries, password.as_deref(), &work_progress)
-                    }
-                    ArchiveFormat::TarGz => {
-                        compress_tar(&archive_path, &entries, true, &work_progress)
-                    }
-                    ArchiveFormat::Tar => {
-                        compress_tar(&archive_path, &entries, false, &work_progress)
-                    }
-                }
-            })
-            .await;
+                })
+                .await;
             timer_id.remove();
             match result {
-                Ok(Ok(())) => emit(OperationEvent::Compressed {
+                Ok(()) => emit(OperationEvent::Compressed {
                     request_id: request.id,
                     archive_name: archive_name.clone(),
                 }),
-                Ok(Err(error)) => emit(OperationEvent::Failed {
+                Err(error) => emit(OperationEvent::Failed {
                     request_id: request.id,
                     message: error,
                 }),
-                Err(_) => emit(OperationEvent::Failed {
-                    request_id: request.id,
-                    message: "Compression task panicked".to_owned(),
-                }),
             }
         });
-        LoadHandle::new(move || task.abort())
+        LoadHandle::new(move || {
+            cancelled.store(true, Ordering::Relaxed);
+            task.abort();
+        })
     }
 
     fn extract(&self, request: ExtractRequest, emit: Rc<dyn Fn(OperationEvent)>) -> LoadHandle {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task_cancelled = cancelled.clone();
         let task = glib::MainContext::default().spawn_local(async move {
             let Some(archive_path) = request.entry.location.native_path().map(Path::to_path_buf)
             else {
@@ -1206,7 +1276,8 @@ impl OperationProvider for LocalOperationProvider {
                 request_id: request.id,
                 total: 0,
             });
-            let timer_id = archive_progress_timer(request.id, &progress, &total, &emit);
+            let timer_id =
+                archive_progress_timer(request.id, &progress, &total, &task_cancelled, &emit);
             let work_progress = progress.clone();
             let work_total = total.clone();
             let result = gio::spawn_blocking(move || match format {
@@ -1254,17 +1325,19 @@ impl OperationProvider for LocalOperationProvider {
                 }),
             }
         });
-        LoadHandle::new(move || task.abort())
+        LoadHandle::new(move || {
+            cancelled.store(true, Ordering::Relaxed);
+            task.abort();
+        })
     }
 }
 
 fn compress_zip(
-    archive_path: &Path,
+    file: std::fs::File,
     entries: &[std::path::PathBuf],
     password: Option<&str>,
     progress: &Arc<AtomicUsize>,
 ) -> Result<(), String> {
-    let file = std::fs::File::create(archive_path).map_err(|e| e.to_string())?;
     let writer = std::io::BufWriter::with_capacity(COPY_BUF, file);
     let mut writer = zip::ZipWriter::new(writer);
     let deflated = zip::write::SimpleFileOptions::default()
@@ -1303,7 +1376,11 @@ fn compress_zip(
             progress.fetch_add(1, Ordering::Relaxed);
         }
     }
-    writer.finish().map_err(|e| e.to_string())?;
+    writer
+        .finish()
+        .map_err(|error| error.to_string())?
+        .into_inner()
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -1340,20 +1417,33 @@ fn add_dir_to_zip<W: std::io::Write + std::io::Seek>(
 }
 
 fn compress_tar(
-    archive_path: &Path,
+    file: std::fs::File,
     entries: &[std::path::PathBuf],
     gzip: bool,
     progress: &Arc<AtomicUsize>,
 ) -> Result<(), String> {
-    let file = std::fs::File::create(archive_path).map_err(|e| e.to_string())?;
-    let writer: Box<dyn std::io::Write> = if gzip {
-        Box::new(std::io::BufWriter::with_capacity(
-            COPY_BUF,
-            flate2::write::GzEncoder::new(file, flate2::Compression::default()),
-        ))
+    let writer = std::io::BufWriter::with_capacity(COPY_BUF, file);
+    if gzip {
+        let mut encoder = flate2::write::GzEncoder::new(writer, flate2::Compression::default());
+        append_tar_entries(&mut encoder, entries, progress)?;
+        encoder
+            .finish()
+            .map_err(|error| error.to_string())?
+            .into_inner()
+            .map_err(|error| error.to_string())?;
     } else {
-        Box::new(std::io::BufWriter::with_capacity(COPY_BUF, file))
-    };
+        let mut writer = writer;
+        append_tar_entries(&mut writer, entries, progress)?;
+        writer.into_inner().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn append_tar_entries(
+    writer: &mut dyn std::io::Write,
+    entries: &[std::path::PathBuf],
+    progress: &Arc<AtomicUsize>,
+) -> Result<(), String> {
     let mut builder = tar::Builder::new(writer);
     for entry in entries {
         let name = entry
@@ -1546,12 +1636,17 @@ fn archive_progress_timer(
     request_id: OperationRequestId,
     progress: &Arc<AtomicUsize>,
     total: &Arc<AtomicUsize>,
+    cancelled: &Arc<AtomicBool>,
     emit: &Rc<dyn Fn(OperationEvent)>,
 ) -> glib::SourceId {
     let timer_progress = progress.clone();
     let timer_total = total.clone();
+    let timer_cancelled = cancelled.clone();
     let timer_emit = emit.clone();
     glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        if timer_cancelled.load(Ordering::Relaxed) {
+            return glib::ControlFlow::Break;
+        }
         timer_emit(OperationEvent::ArchiveProgress {
             request_id,
             completed: timer_progress.load(Ordering::Relaxed),
@@ -1697,14 +1792,13 @@ fn extract_tar(
 }
 
 fn compress_7z(
-    archive_path: &Path,
+    file: std::fs::File,
     entries: &[std::path::PathBuf],
     password: Option<&str>,
     progress: &Arc<AtomicUsize>,
 ) -> Result<(), String> {
     use sevenz_rust2::encoder_options::{AesEncoderOptions, EncoderOptions, Lzma2Options};
-    let mut writer =
-        sevenz_rust2::ArchiveWriter::create(archive_path).map_err(|e| e.to_string())?;
+    let mut writer = sevenz_rust2::ArchiveWriter::new(file).map_err(|e| e.to_string())?;
     let threads = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(1);

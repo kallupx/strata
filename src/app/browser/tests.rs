@@ -563,6 +563,22 @@ fn restored_sorting_applies_to_the_initial_navigation_load() {
 }
 
 #[test]
+fn selecting_entries_by_name_preserves_the_full_matching_selection() {
+    let browser = Browser::new(Rc::new(RestoredSortingSource));
+    browser.navigate(Location::local("/fixture"));
+
+    browser.select_entries_by_name(&["small".to_owned(), "large".to_owned()]);
+
+    let snapshot = browser.column_snapshot(0).expect("initial column");
+    let selected_names: Vec<_> = snapshot
+        .selected_positions
+        .iter()
+        .map(|&position| snapshot.entries[position].display_name.as_str())
+        .collect();
+    assert_eq!(selected_names, ["large", "small"]);
+}
+
+#[test]
 fn navigation_events_are_delivered_to_every_observer() {
     let browser = Browser::new(Rc::new(FakeFileSource));
     let first_reset = Rc::new(Cell::new(false));
@@ -700,11 +716,21 @@ fn hidden_file_preference_is_applied_to_reloaded_requests() {
     let browser = Browser::new(Rc::new(RecordingFileSource {
         include_hidden: include_hidden.clone(),
     }));
+    let observed_preferences = Rc::new(Cell::new(None));
+    let observed = observed_preferences.clone();
+    browser.observe_preferences(move |preferences| observed.set(Some(preferences)));
 
     browser.navigate(Location::local("/fixture"));
     browser.toggle_hidden();
 
     assert_eq!(*include_hidden.borrow(), vec![false, true]);
+    assert_eq!(
+        observed_preferences.get(),
+        Some(ViewPreferences {
+            show_hidden: true,
+            ..ViewPreferences::default()
+        })
+    );
 }
 
 #[test]
@@ -928,6 +954,12 @@ fn location_input_rejects_uris_with_an_embedded_password() {
 
     for uri in [
         "smb://user:secret@host/share",
+        "smb://user%3Asecret@host/share",
+        "smb://user:sec%72et@host/share",
+        "smb://user;password=secret@host/share",
+        "smb://user%3Bpassword=secret@host/share",
+        "smb://user%3Bpassword%3Dsecret@host/share",
+        "smb://user;password=sec%72et@host/share",
         "sftp://user:secret@host:2222/path",
     ] {
         assert_eq!(
@@ -936,6 +968,12 @@ fn location_input_rejects_uris_with_an_embedded_password() {
         );
         assert_eq!(browser.active_location(), Some(Location::local("/fixture")));
     }
+
+    assert_eq!(
+        browser.navigate_input("smb://user%ZZ@host/share"),
+        Err(LocationValidationError::InvalidUri)
+    );
+    assert_eq!(browser.active_location(), Some(Location::local("/fixture")));
 
     assert_eq!(
         browser.navigate_input("smb://user@host/share"),

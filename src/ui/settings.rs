@@ -21,7 +21,6 @@ use super::{
     blur::BlurBin,
     browser::{BrowserView, dismiss_modal_layer, modal_layer},
     controls::{form_entry, modal_layout, segmented_control},
-    motion::set_reduce_motion,
     theme::{Theme, ThemeManager, ThemeTokens},
 };
 
@@ -397,9 +396,11 @@ fn general_page(browser: &BrowserView, manager: Rc<ThemeManager>) -> gtk::Widget
     let (motion_row, reduce_motion) = settings_option(
         "Reduce motion",
         "Disable nonessential interface animations.",
-        false,
+        manager.reduce_motion(),
     );
-    reduce_motion.connect_active_notify(|toggle| set_reduce_motion(toggle.is_active()));
+    reduce_motion.connect_active_notify(move |toggle| {
+        manager.set_reduce_motion(toggle.is_active());
+    });
     preferences.append(&motion_row);
 
     scrollable_page(&preferences, None)

@@ -90,6 +90,7 @@ struct Pane {
     bound_items: Rc<RefCell<Vec<BoundModeItem>>>,
     filter_entry: Option<gtk::Entry>,
     filter_button: Option<gtk::ToggleButton>,
+    empty_trash_button: Option<gtk::Button>,
     new_entry_placeholder: Option<gtk::StringList>,
     new_entry_is_directory: Option<Rc<Cell<bool>>>,
 }
@@ -837,6 +838,7 @@ struct GridControls {
     filter_button: gtk::ToggleButton,
     thumbnail_scale: gtk::Scale,
     thumbnail_value: gtk::Label,
+    empty_trash_button: Option<gtk::Button>,
 }
 
 fn filter_controls(tooltip: &str) -> (gtk::Entry, gtk::Revealer, gtk::ToggleButton) {
@@ -928,9 +930,11 @@ fn grid_controls(browser: &Rc<Browser>, depth: usize, thumbnail_size: i32) -> Gr
         16,
     )));
     let empty_trash = super::browser::empty_trash_button(browser);
-    if let Some(location) = browser.location_at(depth) {
-        empty_trash.set_visible(super::browser::is_trash_root(&location));
-    }
+    let is_trash = browser
+        .location_at(depth)
+        .is_some_and(|location| super::browser::is_trash_root(&location));
+    empty_trash.set_visible(is_trash);
+    empty_trash.set_sensitive(false);
     actions.append(&empty_trash);
     actions.append(&thumbnail_menu);
     actions.append(&super::browser::column_sort_direction_toggle(
@@ -948,6 +952,7 @@ fn grid_controls(browser: &Rc<Browser>, depth: usize, thumbnail_size: i32) -> Gr
         filter_button,
         thumbnail_scale,
         thumbnail_value,
+        empty_trash_button: is_trash.then_some(empty_trash),
     }
 }
 
@@ -1250,6 +1255,7 @@ fn build_grid_pane(
         bound_items,
         filter_entry: Some(controls.filter_entry),
         filter_button: Some(controls.filter_button),
+        empty_trash_button: controls.empty_trash_button,
         new_entry_placeholder: Some(new_entry_placeholder),
         new_entry_is_directory: Some(new_entry_is_directory),
     }
@@ -1548,9 +1554,11 @@ fn build_explorer_pane(
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     actions.add_css_class("grid-header-actions");
     let empty_trash = super::browser::empty_trash_button(&browser);
-    if let Some(location) = browser.location_at(depth) {
-        empty_trash.set_visible(super::browser::is_trash_root(&location));
-    }
+    let is_trash = browser
+        .location_at(depth)
+        .is_some_and(|location| super::browser::is_trash_root(&location));
+    empty_trash.set_visible(is_trash);
+    empty_trash.set_sensitive(false);
     actions.append(&empty_trash);
     let (filter_entry, filter_revealer, filter_button) =
         filter_controls("Filter explorer (Ctrl+F)");
@@ -1834,6 +1842,7 @@ fn build_explorer_pane(
         bound_items,
         filter_entry: Some(filter_entry),
         filter_button: Some(filter_button),
+        empty_trash_button: is_trash.then_some(empty_trash),
         new_entry_placeholder: Some(new_entry_placeholder),
         new_entry_is_directory: Some(new_entry_is_directory),
     }
@@ -2446,12 +2455,16 @@ fn replace_entries(pane: &Pane, entries: &[FileEntry]) {
 }
 
 fn show_count(pane: &Pane) {
-    if pane.model.n_items() == 0 {
+    let count = pane.model.n_items();
+    if count == 0 {
         pane.status.remove_css_class("error");
         pane.status.set_label("This directory is empty");
         pane.stack.set_visible_child_name("status");
     } else {
         pane.stack.set_visible_child_name("content");
+    }
+    if let Some(button) = &pane.empty_trash_button {
+        button.set_sensitive(count > 0);
     }
 }
 

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use super::{
-    PDF_MAX_ZOOM, PDF_MIN_ZOOM, format_file_size, pdf_zoom_after_scroll,
-    preview_width_for_empty_space,
+    MEDIA_PLUGIN_INSTALL_COMMAND, PDF_MAX_ZOOM, PDF_MIN_ZOOM, format_file_size,
+    media_error_feedback, pdf_zoom_after_scroll, preview_width_for_empty_space,
 };
 
 #[test]
@@ -10,6 +10,24 @@ fn formats_preview_file_sizes() {
     assert_eq!(format_file_size(999), "999 B");
     assert_eq!(format_file_size(1_200), "1.2 kB");
     assert_eq!(format_file_size(2_500_000), "2.5 MB");
+}
+
+#[test]
+fn media_errors_explain_missing_runtime_plugins() {
+    let (title, detail, command) =
+        media_error_feedback("Your GStreamer installation is missing a plug-in.");
+    assert_eq!(title, "Additional media support required");
+    assert!(detail.contains("GStreamer plugins"));
+    assert_eq!(command, Some(MEDIA_PLUGIN_INSTALL_COMMAND));
+    assert_eq!(
+        command,
+        Some("sudo pacman -S --needed gst-plugins-good gst-libav")
+    );
+
+    let (title, detail, command) = media_error_feedback("The media data is corrupt");
+    assert_eq!(title, "Preview unavailable");
+    assert!(detail.contains("The media data is corrupt"));
+    assert_eq!(command, None);
 }
 
 #[test]

@@ -4,7 +4,8 @@ use std::{
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -16,6 +17,9 @@ use crate::sandbox::{MAX_OUTPUT_BYTES, gpu_devices, numbered_name};
 
 const HARDWARE_ATTEMPT_TIME_LIMIT: Duration = Duration::from_secs(8);
 const HARDWARE_TOTAL_TIME_LIMIT: Duration = Duration::from_secs(12);
+const MEDIA_TOTAL_TIME_LIMIT: Duration = Duration::from_secs(28);
+const MAX_MEDIA_ALLOCATION_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_MEDIA_DECODE_PIXELS: u64 = 50_000_000;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,10 +49,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), String> {
             let (png, page, pages) = render_pdf_page(input, value)?;
             (png, Some(format!("{page} {pages}")))
         }
-        "preview-media" => {
-            render_media_preview(input, output)?;
-            return Ok(());
-        }
+        "preview-media" => (render_media_preview(input)?, None),
         _ => return Err("Unknown preview helper operation".to_owned()),
     };
     fs::write(output, png).map_err(|error| error.to_string())?;
@@ -205,16 +206,27 @@ fn bounded_surface_dimensions(
     (width, height, scale)
 }
 
-fn render_media_preview(path: &Path, output: &Path) -> Result<(), String> {
+fn render_media_preview(path: &Path) -> Result<Vec<u8>, String> {
     let backends = media_backends(&gpu_devices(Path::new("/dev")));
+    let started = Instant::now();
     let hardware_started = Instant::now();
     run_media_backends(&backends, |backend| {
-        let mut command = media_command(backend, path, output);
-        if *backend == MediaBackend::Software {
-            return command.status().map(|status| status.success());
-        }
-        let remaining = HARDWARE_TOTAL_TIME_LIMIT.saturating_sub(hardware_started.elapsed());
-        run_command_with_timeout(&mut command, HARDWARE_ATTEMPT_TIME_LIMIT.min(remaining))
+        let total_remaining = MEDIA_TOTAL_TIME_LIMIT.saturating_sub(started.elapsed());
+        let timeout = if *backend == MediaBackend::Software {
+            total_remaining
+        } else {
+            let hardware_remaining =
+                HARDWARE_TOTAL_TIME_LIMIT.saturating_sub(hardware_started.elapsed());
+            HARDWARE_ATTEMPT_TIME_LIMIT
+                .min(hardware_remaining)
+                .min(total_remaining)
+        };
+        let mut command = media_command(backend, path);
+        bounded_output_with_timeout(&mut command, MAX_OUTPUT_BYTES, timeout).map(|result| {
+            result.and_then(|output| {
+                (output.status.success() && !output.stdout.is_empty()).then_some(output.stdout)
+            })
+        })
     })
 }
 
@@ -247,9 +259,13 @@ fn media_backends(devices: &[PathBuf]) -> Vec<MediaBackend> {
     backends
 }
 
-fn media_command(backend: &MediaBackend, path: &Path, output: &Path) -> Command {
+fn media_command(backend: &MediaBackend, path: &Path) -> Command {
     let mut command = Command::new("ffmpeg");
-    command.args(["-nostdin", "-v", "error"]);
+    command
+        .args(["-nostdin", "-v", "error", "-max_alloc"])
+        .arg(MAX_MEDIA_ALLOCATION_BYTES.to_string())
+        .arg("-max_pixels")
+        .arg(MAX_MEDIA_DECODE_PIXELS.to_string());
     match backend {
         MediaBackend::VaApi(device) => {
             command
@@ -314,9 +330,11 @@ fn media_command(backend: &MediaBackend, path: &Path, output: &Path) -> Command 
         MediaBackend::Software => {
             command.args([
                 "-vf",
-                "scale=w=1280:h=1280:force_original_aspect_ratio=decrease",
+                "scale=w=1280:h=1280:force_original_aspect_ratio=decrease,format=yuv420p",
                 "-c:v",
                 "libvpx",
+                "-auto-alt-ref",
+                "0",
                 "-threads",
                 "2",
                 "-deadline",
@@ -330,24 +348,119 @@ fn media_command(backend: &MediaBackend, path: &Path, output: &Path) -> Command 
     command.args(["-b:v", "2M", "-maxrate", "3M", "-bufsize", "4M"]);
     match backend {
         MediaBackend::Software => command.args(["-c:a", "libopus", "-b:a", "96k", "-f", "webm"]),
-        MediaBackend::VaApi(_) | MediaBackend::Vulkan(_) => {
-            command.args(["-c:a", "aac", "-b:a", "96k", "-f", "mp4"])
-        }
+        MediaBackend::VaApi(_) | MediaBackend::Vulkan(_) => command.args([
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-movflags",
+            "+frag_keyframe+empty_moov",
+            "-f",
+            "mp4",
+        ]),
     };
-    command.arg("-y").arg(output);
+    command.arg("pipe:1");
     command
 }
 
-fn run_media_backends<E>(
+fn run_media_backends<T, E>(
     backends: &[MediaBackend],
-    mut run: impl FnMut(&MediaBackend) -> Result<bool, E>,
-) -> Result<(), String> {
+    mut run: impl FnMut(&MediaBackend) -> Result<Option<T>, E>,
+) -> Result<T, String> {
     for backend in backends {
-        if run(backend).is_ok_and(|success| success) {
-            return Ok(());
+        if let Ok(Some(output)) = run(backend) {
+            return Ok(output);
         }
     }
     Err("Unable to normalize media preview".to_owned())
+}
+
+fn bounded_output_with_timeout(
+    command: &mut Command,
+    max_bytes: u64,
+    timeout: Duration,
+) -> io::Result<Option<Output>> {
+    if timeout.is_zero() {
+        return Ok(None);
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("Unable to capture provider output"))?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader = thread::spawn(move || {
+        let mut data = Vec::new();
+        let result = stdout
+            .take(max_bytes.saturating_add(1))
+            .read_to_end(&mut data)
+            .map(|_| data);
+        let _sent = sender.send(result);
+    });
+    let deadline = Instant::now() + timeout;
+    let mut status = None;
+    let mut output = None;
+    loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(current) => status = current,
+                Err(error) => {
+                    stop_child(&mut child);
+                    let _joined = reader.join();
+                    return Err(error);
+                }
+            }
+        }
+        if output.is_none() {
+            match receiver.try_recv() {
+                Ok(Ok(data)) if data.len() as u64 > max_bytes => {
+                    stop_child(&mut child);
+                    let _joined = reader.join();
+                    return Err(io::Error::other(
+                        "Preview provider output exceeded its limit",
+                    ));
+                }
+                Ok(Ok(data)) => output = Some(data),
+                Ok(Err(error)) => {
+                    stop_child(&mut child);
+                    let _joined = reader.join();
+                    return Err(error);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    stop_child(&mut child);
+                    let _joined = reader.join();
+                    return Err(io::Error::other("Unable to read provider output"));
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(status) = status
+            && let Some(stdout) = output.take()
+        {
+            let _joined = reader.join();
+            return Ok(Some(Output {
+                status,
+                stdout,
+                stderr: Vec::new(),
+            }));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            stop_child(&mut child);
+            let _joined = reader.join();
+            return Ok(None);
+        }
+        thread::sleep(PROCESS_POLL_INTERVAL.min(remaining));
+    }
+}
+
+fn stop_child(child: &mut Child) {
+    let _killed = child.kill();
+    let _waited = child.wait();
 }
 
 pub(crate) fn run_command_with_timeout(
@@ -365,8 +478,7 @@ pub(crate) fn run_command_with_timeout(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_child(&mut child);
             return Ok(false);
         }
         thread::sleep(PROCESS_POLL_INTERVAL.min(remaining));

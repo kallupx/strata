@@ -4,11 +4,16 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashSet,
     error::Error,
+    ffi::OsString,
     fs,
     io::{Cursor, Write},
+    os::unix::fs::PermissionsExt,
     path::Path,
     rc::Rc,
-    sync::{Arc, Mutex, atomic::AtomicUsize},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -20,13 +25,14 @@ use super::{
     LocalOperationProvider, await_cancellable, copy_new_recursively, copy_recursively,
     deletion_error_message, deletion_error_summary, extract_7z_from_reader, extract_tar,
     extract_zip_from_archive, operation_error_summary, replace_local, replace_local_with,
-    transfer_is_noop, validated_archive_path, validated_child,
+    transfer_is_noop, validated_archive_path, validated_child, write_staged_archive,
 };
 use crate::{
     model::{EntryKind, FileEntry, Location, MetadataValue},
     services::{
-        DeleteRequest, LoadHandle, OperationEvent, OperationProvider, OperationRequestId,
-        PasteItem, PasteRequest, RestoreRequest, TransferConflict,
+        ArchiveFormat, CompressRequest, DeleteRequest, LoadHandle, OperationEvent,
+        OperationProvider, OperationRequestId, PasteItem, PasteRequest, RestoreRequest,
+        TransferConflict,
     },
 };
 
@@ -465,6 +471,270 @@ fn staged_directory_replacement_does_not_merge_old_contents() -> Result<(), Box<
     assert!(!target.join("old").exists());
     assert!(source.exists());
     fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+fn test_file_entry(path: &Path) -> FileEntry {
+    let name = path.file_name().unwrap_or_default().to_os_string();
+    FileEntry {
+        location: Location::local(path),
+        native_name: name.clone(),
+        display_name: name.to_string_lossy().into_owned(),
+        kind: EntryKind::File,
+        size: MetadataValue::Unknown,
+        modified_unix_seconds: MetadataValue::Unknown,
+    }
+}
+
+fn run_compression(request: CompressRequest) -> Vec<OperationEvent> {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let emitted = events.clone();
+    let operation = LocalOperationProvider.compress(
+        request,
+        Rc::new(move |event| emitted.borrow_mut().push(event)),
+    );
+    while !events.borrow().iter().any(|event| {
+        matches!(
+            event,
+            OperationEvent::Compressed { .. } | OperationEvent::Failed { .. }
+        )
+    }) {
+        glib::MainContext::default().iteration(true);
+    }
+    drop(operation);
+    events.borrow().clone()
+}
+
+fn compression_stages(destination: &Path) -> Result<Vec<OsString>, Box<dyn Error>> {
+    Ok(fs::read_dir(destination)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".strata-compression-"))
+        .collect())
+}
+
+#[test]
+fn compression_provider_rejects_escaping_archive_names() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_FILE_TEST.lock().map_err(|error| error.to_string())?;
+    let root = tempfile::tempdir()?;
+    let destination = root.path().join("destination");
+    let source = root.path().join("source.txt");
+    fs::create_dir(&destination)?;
+    fs::write(&source, b"source")?;
+
+    let events = run_compression(CompressRequest {
+        id: OperationRequestId(1),
+        entries: vec![test_file_entry(&source)],
+        destination: Location::local(&destination),
+        archive_name: "../outside".to_owned(),
+        conflict: TransferConflict::ReplaceExisting,
+        format: ArchiveFormat::Zip,
+        password: None,
+    });
+
+    assert!(matches!(events.as_slice(), [OperationEvent::Failed { .. }]));
+    assert!(!root.path().join("outside.zip").exists());
+    assert!(compression_stages(&destination)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn compression_conflict_choices_preserve_or_replace_the_destination() -> Result<(), Box<dyn Error>>
+{
+    let _serial = ASYNC_FILE_TEST.lock().map_err(|error| error.to_string())?;
+    let root = tempfile::tempdir()?;
+    let destination = root.path().join("destination");
+    let source = root.path().join("source.txt");
+    let archive = destination.join("existing.zip");
+    fs::create_dir(&destination)?;
+    fs::write(&source, b"replacement")?;
+    fs::write(&archive, b"original")?;
+    fs::set_permissions(&archive, fs::Permissions::from_mode(0o640))?;
+    let request = |conflict| CompressRequest {
+        id: OperationRequestId(1),
+        entries: vec![test_file_entry(&source)],
+        destination: Location::local(&destination),
+        archive_name: "existing".to_owned(),
+        conflict,
+        format: ArchiveFormat::Zip,
+        password: None,
+    };
+
+    let refused = run_compression(request(TransferConflict::FailIfExists));
+    assert!(
+        refused
+            .iter()
+            .any(|event| matches!(event, OperationEvent::Failed { .. }))
+    );
+    assert_eq!(fs::read(&archive)?, b"original");
+    assert_eq!(fs::metadata(&archive)?.permissions().mode() & 0o777, 0o640);
+
+    let replaced = run_compression(request(TransferConflict::ReplaceExisting));
+    assert!(
+        replaced
+            .iter()
+            .any(|event| matches!(event, OperationEvent::Compressed { .. }))
+    );
+    let extracted = destination.join("extracted");
+    fs::create_dir(&extracted)?;
+    assert_eq!(
+        extract_zip(&archive, &extracted)?,
+        Some("source.txt".to_owned())
+    );
+    assert_eq!(fs::metadata(&archive)?.permissions().mode() & 0o777, 0o640);
+    assert!(compression_stages(&destination)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn compression_failure_preserves_an_existing_archive() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_FILE_TEST.lock().map_err(|error| error.to_string())?;
+    let root = tempfile::tempdir()?;
+    let destination = root.path().join("destination");
+    let missing = root.path().join("missing.txt");
+    let archive = destination.join("existing.zip");
+    fs::create_dir(&destination)?;
+    fs::write(&archive, b"original")?;
+
+    let events = run_compression(CompressRequest {
+        id: OperationRequestId(1),
+        entries: vec![test_file_entry(&missing)],
+        destination: Location::local(&destination),
+        archive_name: "existing".to_owned(),
+        conflict: TransferConflict::ReplaceExisting,
+        format: ArchiveFormat::Zip,
+        password: None,
+    });
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, OperationEvent::Failed { .. }))
+    );
+    assert_eq!(fs::read(&archive)?, b"original");
+    assert!(compression_stages(&destination)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn every_compression_format_commits_a_readable_archive() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_FILE_TEST.lock().map_err(|error| error.to_string())?;
+    let root = tempfile::tempdir()?;
+    let destination = root.path().join("destination");
+    let source = root.path().join("source.txt");
+    let mode_reference = root.path().join("mode-reference");
+    fs::create_dir(&destination)?;
+    fs::write(&source, b"contents")?;
+    fs::File::create(&mode_reference)?;
+    let expected_mode = fs::metadata(&mode_reference)?.permissions().mode() & 0o777;
+
+    for format in [
+        ArchiveFormat::Zip,
+        ArchiveFormat::SevenZ,
+        ArchiveFormat::TarGz,
+        ArchiveFormat::Tar,
+    ] {
+        let base = format!("archive-{}", format.extension().replace('.', "-"));
+        let events = run_compression(CompressRequest {
+            id: OperationRequestId(1),
+            entries: vec![test_file_entry(&source)],
+            destination: Location::local(&destination),
+            archive_name: base.clone(),
+            conflict: TransferConflict::FailIfExists,
+            format,
+            password: None,
+        });
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, OperationEvent::Compressed { .. }))
+        );
+        let archive = destination.join(format!("{base}.{}", format.extension()));
+        let extracted = destination.join(format!("extracted-{base}"));
+        fs::create_dir(&extracted)?;
+        match format {
+            ArchiveFormat::Zip => {
+                extract_zip(&archive, &extracted)?;
+            }
+            ArchiveFormat::SevenZ => {
+                extract_7z_from_reader(
+                    fs::File::open(&archive)?,
+                    &extracted,
+                    sevenz_rust2::Password::empty(),
+                    &Arc::new(AtomicUsize::new(0)),
+                )?;
+            }
+            ArchiveFormat::TarGz => {
+                extract_tar(&archive, &extracted, true, &Arc::new(AtomicUsize::new(0)))?;
+            }
+            ArchiveFormat::Tar => {
+                extract_tar(&archive, &extracted, false, &Arc::new(AtomicUsize::new(0)))?;
+            }
+        }
+        assert_eq!(fs::read(extracted.join("source.txt"))?, b"contents");
+        assert_eq!(
+            fs::metadata(&archive)?.permissions().mode() & 0o777,
+            expected_mode
+        );
+    }
+    assert!(compression_stages(&destination)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn cancelling_staged_compression_unlinks_the_partial_output() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_FILE_TEST.lock().map_err(|error| error.to_string())?;
+    let root = tempfile::tempdir()?;
+    let destination = root.path().to_path_buf();
+    let archive = destination.join("existing.zip");
+    fs::write(&archive, b"original")?;
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let worker_started = started.clone();
+    let worker_release = release.clone();
+    let worker_finished = finished.clone();
+    let worker_destination = destination.clone();
+    let worker_archive = archive.clone();
+    let task = glib::MainContext::default().spawn_local(async move {
+        write_staged_archive(
+            &worker_destination,
+            &worker_archive,
+            TransferConflict::ReplaceExisting,
+            move |mut file| {
+                file.write_all(b"partial")
+                    .map_err(|error| error.to_string())?;
+                worker_started.store(true, Ordering::Release);
+                while !worker_release.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                worker_finished.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .await
+    });
+    let context = glib::MainContext::default();
+    while !started.load(Ordering::Acquire) {
+        context.iteration(false);
+        std::thread::yield_now();
+    }
+    assert_eq!(compression_stages(&destination)?.len(), 1);
+
+    task.abort();
+    drop(task);
+    while context.pending() {
+        context.iteration(false);
+    }
+    let stage_was_removed = compression_stages(&destination)?.is_empty();
+    let destination_was_preserved = fs::read(&archive)? == b"original";
+    release.store(true, Ordering::Release);
+    while !finished.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+
+    assert!(stage_was_removed);
+    assert!(destination_was_preserved);
     Ok(())
 }
 

@@ -314,6 +314,10 @@ headerbar menubutton.header-action > button:focus-visible image {
   color: @theme_dim_text;
 }
 
+.search-indexing-spinner {
+  color: @theme_accent;
+}
+
 .search-status {
   color: @theme_dim_text;
   padding: 28px 24px;
@@ -380,8 +384,14 @@ headerbar menubutton.header-action > button:focus-visible image {
 }
 
 .search-hint {
-  color: @theme_dim_text;
+  color: @theme_text;
   font-size: 0.78em;
+  opacity: 0.72;
+}
+
+.search-hint-warning {
+  color: @theme_accent;
+  opacity: 0.9;
 }
 
 .settings-backdrop {
@@ -1434,6 +1444,10 @@ paned > separator {
   padding: 24px;
 }
 
+.preview-feedback-icon {
+  margin-bottom: 5px;
+}
+
 .preview-feedback-title {
   color: @theme_text;
   font-weight: 700;
@@ -1441,6 +1455,62 @@ paned > separator {
 
 .preview-feedback-detail {
   color: @theme_dim_text;
+}
+
+.preview-command {
+  margin-top: 8px;
+  min-width: 250px;
+}
+
+entry.preview-command-entry {
+  background: alpha(@theme_bg, 0.72);
+  border-color: alpha(@theme_border, 0.54);
+  color: @theme_text;
+  font-family: monospace;
+  padding-right: 38px;
+}
+
+entry.preview-command-entry:hover {
+  border-color: alpha(@theme_accent, 0.68);
+}
+
+entry.preview-command-entry:focus,
+entry.preview-command-entry:focus-visible,
+entry.preview-command-entry:focus-within {
+  border-color: @theme_accent;
+  box-shadow: 0 0 0 1px alpha(@theme_accent, 0.42);
+  outline: 2px solid @theme_accent;
+  outline-offset: -2px;
+}
+
+entry.preview-command-entry selection {
+  background: @theme_accent;
+  color: @theme_bg;
+}
+
+.preview-command-copy {
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  box-shadow: none;
+  margin-right: 4px;
+  min-height: 28px;
+  min-width: 28px;
+  padding: 4px;
+}
+
+.preview-command-copy:hover {
+  background: alpha(@theme_muted, 0.72);
+}
+
+.preview-command-copy:active {
+  background: alpha(@theme_muted, 0.9);
+  transform: scale(0.96);
+}
+
+.preview-command-copy:focus-visible {
+  outline: 2px solid @theme_accent;
+  outline-offset: -2px;
 }
 
 .preview-spinner {
@@ -1479,9 +1549,9 @@ paned > separator {
 
 .peek-popover {
   background: @theme_surface;
-  border: 1px solid alpha(@theme_border, 0.6);
+  border: 1px solid alpha(@theme_border, 0.8);
   border-radius: 9px;
-  box-shadow: 0 0 14px alpha(@theme_accent, 0.24);
+  box-shadow: 0 0 14px alpha(@theme_accent, 0.24), 0 6px 20px alpha(@theme_bg, 0.45);
   color: @theme_text;
   padding: 0;
 }
@@ -1489,13 +1559,15 @@ paned > separator {
 .peek-popover .column-header {
   background: @theme_surface;
   border-bottom: 1px solid alpha(@theme_border, 0.24);
-  border-radius: 6px 6px 0 0;
+  border-radius: 9px 9px 0 0;
+  color: @theme_dim_text;
 }
 
 .peek-popover scrolledwindow,
 .peek-popover viewport,
 .peek-popover listview {
   background: @theme_surface;
+  padding: 6px 0;
 }
 
 .column-header {
@@ -1741,6 +1813,11 @@ menubutton.column-header-action > button:focus-visible image {
   background: alpha(@theme_muted, 0.8);
   color: @theme_accent;
   transform: scale(0.97);
+}
+
+.transfer-suggestion-parent {
+  color: @theme_dim_text;
+  font-size: 0.85em;
 }
 
 .properties-content {
@@ -2120,26 +2197,28 @@ menubutton.column-header-action > button:focus-visible image {
 }
 
 .file-size {
-  background: @theme_bg;
+  background: @theme_surface;
   color: @theme_dim_text;
   font-size: 0.9em;
   opacity: 0;
-  padding-left: 10px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  transition: opacity 120ms ease-out;
 }
 
 .file-list row:hover .file-size {
-  background: alpha(@theme_muted, 0.65);
   opacity: 1;
 }
 
 .file-list row:selected .file-size {
-  background: alpha(@theme_muted, 0.65);
   color: @theme_dim_text;
+  opacity: 1;
 }
 
 .file-list .file-row.active-path .file-size {
   background: @theme_highlight;
   color: @theme_dim_text;
+  opacity: 1;
 }
 
 .file-list row:selected {

@@ -66,10 +66,16 @@ struct Preferences {
     single_click_previews: bool,
     #[serde(default)]
     search_open_files_directly: bool,
+    #[serde(default)]
+    reduce_motion: bool,
     #[serde(default = "default_browser_mode")]
     browser_mode: String,
     #[serde(default = "default_browser_density")]
     browser_density: String,
+    #[serde(default)]
+    show_hidden: bool,
+    #[serde(default = "default_enabled")]
+    folders_first: bool,
     #[serde(default = "default_sort_key")]
     sort_key: String,
     #[serde(default = "default_sort_direction")]
@@ -86,8 +92,11 @@ impl Default for Preferences {
             folder_peeking: true,
             single_click_previews: true,
             search_open_files_directly: false,
+            reduce_motion: false,
             browser_mode: default_browser_mode(),
             browser_density: default_browser_density(),
+            show_hidden: false,
+            folders_first: true,
             sort_key: default_sort_key(),
             sort_direction: default_sort_direction(),
             check_for_updates: true,
@@ -149,6 +158,7 @@ impl ThemeManager {
         } else if !settings_path().is_file() && omarchy_available {
             preferences.mode = "omarchy".to_owned();
         }
+        super::motion::set_reduce_motion(preferences.reduce_motion);
 
         let manager = Rc::new(Self {
             provider: gtk::CssProvider::new(),
@@ -208,6 +218,16 @@ impl ThemeManager {
         self.save_preferences();
     }
 
+    pub fn reduce_motion(&self) -> bool {
+        self.preferences.borrow().reduce_motion
+    }
+
+    pub fn set_reduce_motion(&self, reduced: bool) {
+        self.preferences.borrow_mut().reduce_motion = reduced;
+        super::motion::set_reduce_motion(reduced);
+        self.save_preferences();
+    }
+
     pub fn checks_for_updates(&self) -> bool {
         self.preferences.borrow().check_for_updates
     }
@@ -257,6 +277,8 @@ impl ThemeManager {
 
     pub fn set_sort_preferences(&self, preferences: ViewPreferences) {
         let mut stored = self.preferences.borrow_mut();
+        stored.show_hidden = preferences.show_hidden;
+        stored.folders_first = preferences.folders_first;
         stored.sort_key = match preferences.sort_key {
             SortKey::Name => "name",
             SortKey::Size => "size",
@@ -536,22 +558,26 @@ fn read_preferences() -> Option<Preferences> {
 }
 
 fn sort_preferences(preferences: &Preferences) -> ViewPreferences {
-    let sort_key = match preferences.sort_key.as_str() {
-        "name" => SortKey::Name,
-        "size" => SortKey::Size,
-        "modified" => SortKey::Modified,
-        "type" => SortKey::Type,
-        _ => return ViewPreferences::default(),
-    };
-    let sort_direction = match preferences.sort_direction.as_str() {
-        "ascending" => SortDirection::Ascending,
-        "descending" => SortDirection::Descending,
-        _ => return ViewPreferences::default(),
-    };
+    let sorting = match (
+        preferences.sort_key.as_str(),
+        preferences.sort_direction.as_str(),
+    ) {
+        ("name", "ascending") => Some((SortKey::Name, SortDirection::Ascending)),
+        ("name", "descending") => Some((SortKey::Name, SortDirection::Descending)),
+        ("size", "ascending") => Some((SortKey::Size, SortDirection::Ascending)),
+        ("size", "descending") => Some((SortKey::Size, SortDirection::Descending)),
+        ("modified", "ascending") => Some((SortKey::Modified, SortDirection::Ascending)),
+        ("modified", "descending") => Some((SortKey::Modified, SortDirection::Descending)),
+        ("type", "ascending") => Some((SortKey::Type, SortDirection::Ascending)),
+        ("type", "descending") => Some((SortKey::Type, SortDirection::Descending)),
+        _ => None,
+    }
+    .unwrap_or((SortKey::Name, SortDirection::Ascending));
     ViewPreferences {
-        sort_key,
-        sort_direction,
-        ..ViewPreferences::default()
+        show_hidden: preferences.show_hidden,
+        folders_first: preferences.folders_first,
+        sort_key: sorting.0,
+        sort_direction: sorting.1,
     }
 }
 

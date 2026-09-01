@@ -15,8 +15,8 @@ use crate::{
         ArchiveFormat, CompressRequest, CreateDirectoryRequest, CreateFileRequest, DeleteRequest,
         DirectoryChange, DirectoryEvent, DirectoryRequest, ExtractRequest, FileSource, LoadHandle,
         LocationValidationError, OperationEvent, OperationProvider, OperationRequestId, PasteItem,
-        PasteRequest, RenameRequest, RequestId, RestoreRequest, uri_has_embedded_password,
-        validate_basename,
+        PasteRequest, RenameRequest, RequestId, RestoreRequest, TransferConflict,
+        validate_basename, validate_uri_credentials,
     },
 };
 
@@ -224,6 +224,13 @@ impl Browser {
             .push(Rc::new(observer));
     }
 
+    fn notify_preferences_observers(&self) {
+        let preferences = self.preferences.get();
+        for observer in self.preferences_observers.borrow().iter() {
+            observer(preferences);
+        }
+    }
+
     pub fn set_operation_provider(&self, provider: Rc<dyn OperationProvider>) {
         self.operation_provider.replace(Some(provider));
     }
@@ -237,9 +244,6 @@ impl Browser {
             return Err(LocationValidationError::UnsupportedShorthand(
                 message.to_owned(),
             ));
-        }
-        if uri_has_embedded_password(input) {
-            return Err(LocationValidationError::EmbeddedCredential);
         }
         if let Some(current) = self
             .active_location()
@@ -543,6 +547,7 @@ impl Browser {
         let mut preferences = self.preferences.get();
         preferences.show_hidden = !preferences.show_hidden;
         self.preferences.set(preferences);
+        self.notify_preferences_observers();
 
         let locations = {
             let mut state = self.state.borrow_mut();
@@ -601,10 +606,7 @@ impl Browser {
                 browser.preferences.set(preferences);
                 result
             };
-            let preferences = browser.preferences.get();
-            for observer in browser.preferences_observers.borrow().iter() {
-                observer(preferences);
-            }
+            browser.notify_preferences_observers();
             if let Some((entries, focused, positions)) = result {
                 browser.emit(BrowserEvent::EntriesReplaced { depth, entries });
                 if let Some(focused) = focused {
@@ -935,6 +937,7 @@ impl Browser {
         entries: Vec<FileEntry>,
         destination: Location,
         archive_name: String,
+        conflict: TransferConflict,
         format: ArchiveFormat,
         password: Option<String>,
     ) {
@@ -954,6 +957,7 @@ impl Browser {
                 entries,
                 destination,
                 archive_name,
+                conflict,
                 format,
                 password,
             },
@@ -1413,7 +1417,7 @@ impl Browser {
         )
     }
 
-    fn refresh_columns_at(self: &Rc<Self>, location: &Location) {
+    pub(crate) fn refresh_columns_at(self: &Rc<Self>, location: &Location) {
         let depths = {
             let state = self.state.borrow();
             let mut depths = Vec::new();
@@ -1499,25 +1503,36 @@ impl Browser {
         }
     }
 
-    pub fn select_entry_by_name(self: &Rc<Self>, name: &str) {
+    pub fn select_entries_by_name(self: &Rc<Self>, names: &[String]) {
         let Some(depth) = self.active_depth() else {
             return;
         };
+        let requested: HashSet<&str> = names.iter().map(String::as_str).collect();
         let state = self.state.borrow();
         let Some(column) = state.columns.get(depth) else {
             return;
         };
-        let position = column.entries.iter().position(|e| e.display_name == name);
+        let positions: Vec<usize> = column
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(position, entry)| {
+                requested
+                    .contains(entry.display_name.as_str())
+                    .then_some(position)
+            })
+            .collect();
         drop(state);
-        if let Some(position) = position {
-            self.set_selection(depth, &[position], Some(position));
-            self.emit(BrowserEvent::SelectionSetChanged {
-                depth,
-                positions: vec![position],
-                focused: position,
-                take_focus: true,
-            });
-        }
+        let Some(&focused) = positions.last() else {
+            return;
+        };
+        self.set_selection(depth, &positions, Some(focused));
+        self.emit(BrowserEvent::SelectionSetChanged {
+            depth,
+            positions,
+            focused,
+            take_focus: true,
+        });
     }
 
     fn handle_directory_change(
@@ -1558,6 +1573,10 @@ impl Browser {
                     take_focus: false,
                 });
             }
+            self.emit(BrowserEvent::FocusChanged {
+                depth,
+                position: selected,
+            });
         }
     }
 
@@ -1671,6 +1690,7 @@ fn location_from_input(input: &str) -> Result<Location, LocationValidationError>
              smb://, sftp://, ftp://, ftps://, dav://, or davs://."
         )));
     }
+    validate_uri_credentials(input)?;
     let uri = format!("{normalized}{}", &input[scheme_end..]);
     Ok(Location::uri(uri))
 }
