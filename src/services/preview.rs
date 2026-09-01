@@ -4,7 +4,7 @@ use std::{ffi::OsStr, path::Path, rc::Rc};
 
 use crate::model::FileEntry;
 
-use super::LoadHandle;
+use super::{Document, LoadHandle};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PreviewRequestId(pub u64);
@@ -19,12 +19,30 @@ pub struct PreviewRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PreviewContent {
-    Text { content: String, truncated: bool },
+    Text {
+        content: String,
+        truncated: bool,
+    },
+    Document {
+        source: String,
+        document: Option<Document>,
+        fallback_reason: Option<String>,
+        warnings: Vec<String>,
+        truncated: bool,
+    },
     Image,
     Media,
-    Rasterized { png: Vec<u8> },
-    SandboxedMedia { data: Vec<u8> },
-    Pdf { png: Vec<u8>, page: i32, pages: i32 },
+    Rasterized {
+        png: Vec<u8>,
+    },
+    SandboxedMedia {
+        data: Vec<u8>,
+    },
+    Pdf {
+        png: Vec<u8>,
+        page: i32,
+        pages: i32,
+    },
     Unsupported,
 }
 

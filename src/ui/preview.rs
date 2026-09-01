@@ -11,10 +11,10 @@ use gtk::{gio, glib, prelude::*};
 use sourceview5::prelude::*;
 
 use crate::{
-    model::{FileEntry, MetadataValue},
+    model::{FileEntry, Location, MetadataValue},
     services::{
-        LoadHandle, Preview, PreviewContent, PreviewEvent, PreviewProvider, PreviewRequest,
-        PreviewRequestId,
+        Document, DocumentBlock, LoadHandle, Preview, PreviewContent, PreviewEvent,
+        PreviewProvider, PreviewRequest, PreviewRequestId, has_web_scheme,
     },
 };
 
@@ -27,6 +27,12 @@ const PDF_PAGE_GAP: i32 = 6;
 const PDF_MIN_ZOOM: f64 = 1.0;
 const PDF_MAX_ZOOM: f64 = 4.0;
 const MEDIA_PLUGIN_INSTALL_COMMAND: &str = "sudo pacman -S --needed gst-plugins-good gst-libav";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DocumentView {
+    Rendered,
+    Source,
+}
 
 struct PreviewState {
     provider: Rc<dyn PreviewProvider>,
@@ -353,7 +359,11 @@ impl PreviewState {
     }
 
     fn handle_event(self: &Rc<Self>, expected: PreviewRequestId, event: PreviewEvent) {
-        if self.current_request.get() != Some(expected) {
+        let response = match &event {
+            PreviewEvent::Ready(preview) => preview.request_id,
+            PreviewEvent::Failed { request_id, .. } => *request_id,
+        };
+        if !accepts_preview_event(self.current_request.get(), expected, response) {
             return;
         }
         match event {
@@ -381,43 +391,28 @@ impl PreviewState {
         self.clear_content();
         match preview.content {
             PreviewContent::Text { content, truncated } => {
-                let buffer = sourceview5::Buffer::new(None);
-                let languages = sourceview5::LanguageManager::default();
-                let language = languages.guess_language(
-                    preview.entry.location.native_path(),
-                    Some(&preview.content_type),
+                self.content.append(&source_preview(
+                    &preview.entry,
+                    &preview.content_type,
+                    &content,
+                    truncated,
+                ));
+            }
+            PreviewContent::Document {
+                source,
+                document,
+                fallback_reason,
+                warnings,
+                truncated,
+            } => {
+                let source =
+                    source_preview(&preview.entry, &preview.content_type, &source, truncated);
+                self.render_document_preview(
+                    &source,
+                    document.as_ref(),
+                    fallback_reason.as_deref(),
+                    &warnings,
                 );
-                buffer.set_language(language.as_ref());
-                super::theme::register_source_buffer(&buffer);
-                buffer.set_highlight_syntax(true);
-                buffer.set_text(&content);
-                let view = sourceview5::View::builder()
-                    .buffer(&buffer)
-                    .cursor_visible(false)
-                    .editable(false)
-                    .highlight_current_line(false)
-                    .left_margin(14)
-                    .right_margin(14)
-                    .top_margin(12)
-                    .bottom_margin(12)
-                    .monospace(true)
-                    .show_line_numbers(true)
-                    .wrap_mode(gtk::WrapMode::None)
-                    .build();
-                view.add_css_class("preview-text");
-                let scroll = gtk::ScrolledWindow::builder()
-                    .child(&view)
-                    .hscrollbar_policy(gtk::PolicyType::Automatic)
-                    .vscrollbar_policy(gtk::PolicyType::Automatic)
-                    .hexpand(true)
-                    .vexpand(true)
-                    .build();
-                self.content.append(&scroll);
-                if truncated {
-                    let notice = gtk::Label::new(Some("Preview limited to the first 1 MB"));
-                    notice.add_css_class("preview-note");
-                    self.content.append(&notice);
-                }
             }
             PreviewContent::Rasterized { png } => {
                 let bytes = glib::Bytes::from_owned(png);
@@ -486,6 +481,62 @@ impl PreviewState {
                 );
             }
         }
+    }
+
+    fn render_document_preview(
+        &self,
+        source: &gtk::Box,
+        document: Option<&Document>,
+        fallback_reason: Option<&str>,
+        warnings: &[String],
+    ) {
+        let initial = initial_document_view(
+            super::theme::ThemeManager::shared().render_documents_by_default(),
+            document.is_some(),
+        );
+        let selected = usize::from(initial == DocumentView::Source);
+        let (control, buttons) =
+            super::controls::segmented_control(&["Rendered", "Source"], selected);
+        control.add_css_class("preview-document-switcher");
+        buttons[0].set_sensitive(document.is_some());
+        self.content.append(&control);
+
+        if let Some(reason) = fallback_reason {
+            let notice = gtk::Label::new(Some(reason));
+            notice.add_css_class("preview-document-fallback");
+            notice.set_wrap(true);
+            notice.set_xalign(0.0);
+            self.content.append(&notice);
+        }
+
+        let stack = gtk::Stack::builder()
+            .transition_type(gtk::StackTransitionType::Crossfade)
+            .transition_duration(100)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+        if let Some(document) = document {
+            stack.add_named(&rendered_document(document, warnings), Some("rendered"));
+        }
+        stack.add_named(source, Some("source"));
+        stack.set_visible_child_name(match initial {
+            DocumentView::Rendered => "rendered",
+            DocumentView::Source => "source",
+        });
+
+        let rendered_stack = stack.clone();
+        buttons[0].connect_toggled(move |button| {
+            if button.is_active() {
+                rendered_stack.set_visible_child_name("rendered");
+            }
+        });
+        let source_stack = stack.clone();
+        buttons[1].connect_toggled(move |button| {
+            if button.is_active() {
+                source_stack.set_visible_child_name("source");
+            }
+        });
+        self.content.append(&stack);
     }
 
     fn render_pdf_viewer(
@@ -821,6 +872,198 @@ impl PreviewState {
         }
         self.content.append(&box_);
     }
+}
+
+fn accepts_preview_event(
+    current: Option<PreviewRequestId>,
+    expected: PreviewRequestId,
+    response: PreviewRequestId,
+) -> bool {
+    current == Some(expected) && response == expected
+}
+
+fn initial_document_view(prefer_rendered: bool, rendered_available: bool) -> DocumentView {
+    if prefer_rendered && rendered_available {
+        DocumentView::Rendered
+    } else {
+        DocumentView::Source
+    }
+}
+
+fn source_preview(
+    entry: &FileEntry,
+    content_type: &str,
+    content: &str,
+    truncated: bool,
+) -> gtk::Box {
+    let buffer = sourceview5::Buffer::new(None);
+    let languages = sourceview5::LanguageManager::default();
+    let language = languages.guess_language(entry.location.native_path(), Some(content_type));
+    buffer.set_language(language.as_ref());
+    super::theme::register_source_buffer(&buffer);
+    buffer.set_highlight_syntax(true);
+    buffer.set_text(content);
+    let view = sourceview5::View::builder()
+        .buffer(&buffer)
+        .cursor_visible(false)
+        .editable(false)
+        .highlight_current_line(false)
+        .left_margin(14)
+        .right_margin(14)
+        .top_margin(12)
+        .bottom_margin(12)
+        .monospace(true)
+        .show_line_numbers(true)
+        .wrap_mode(gtk::WrapMode::None)
+        .build();
+    view.add_css_class("preview-text");
+    let scroll = gtk::ScrolledWindow::builder()
+        .child(&view)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    container.set_vexpand(true);
+    container.append(&scroll);
+    if truncated {
+        let notice = gtk::Label::new(Some("Preview limited to the first 1 MB"));
+        notice.add_css_class("preview-note");
+        container.append(&notice);
+    }
+    container
+}
+
+fn rendered_document(document: &Document, warnings: &[String]) -> gtk::ScrolledWindow {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    content.add_css_class("preview-document");
+    content.set_accessible_role(gtk::AccessibleRole::Document);
+
+    for warning in warnings {
+        let label = gtk::Label::new(Some(warning));
+        label.add_css_class("preview-document-warning");
+        label.set_wrap(true);
+        label.set_xalign(0.0);
+        content.append(&label);
+    }
+
+    let mut index = 0;
+    while index < document.blocks.len() {
+        match &document.blocks[index] {
+            DocumentBlock::ListItem { .. } => {
+                let list = gtk::Box::new(gtk::Orientation::Vertical, 5);
+                list.add_css_class("preview-document-list");
+                list.set_accessible_role(gtk::AccessibleRole::List);
+                while let Some(DocumentBlock::ListItem {
+                    marker,
+                    depth,
+                    markup,
+                }) = document.blocks.get(index)
+                {
+                    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                    row.add_css_class("preview-document-list-item");
+                    row.set_accessible_role(gtk::AccessibleRole::ListItem);
+                    row.set_margin_start(
+                        i32::try_from(depth.saturating_mul(18)).unwrap_or(i32::MAX),
+                    );
+                    let bullet = gtk::Label::new(Some(marker));
+                    bullet.add_css_class("preview-document-list-marker");
+                    bullet.set_valign(gtk::Align::Start);
+                    let label = document_label(markup, "preview-document-copy");
+                    row.append(&bullet);
+                    row.append(&label);
+                    list.append(&row);
+                    index += 1;
+                }
+                content.append(&list);
+            }
+            DocumentBlock::TableRow { .. } => {
+                let table = gtk::Grid::builder()
+                    .column_homogeneous(true)
+                    .column_spacing(1)
+                    .row_spacing(1)
+                    .build();
+                table.add_css_class("preview-document-table");
+                table.set_accessible_role(gtk::AccessibleRole::Table);
+                let mut row = 0;
+                while let Some(DocumentBlock::TableRow { header, cells }) =
+                    document.blocks.get(index)
+                {
+                    for (column, markup) in cells.iter().enumerate() {
+                        let label = document_label(markup, "preview-document-table-cell");
+                        if *header {
+                            label.add_css_class("header");
+                            label.set_accessible_role(gtk::AccessibleRole::ColumnHeader);
+                        } else {
+                            label.set_accessible_role(gtk::AccessibleRole::Cell);
+                        }
+                        table.attach(&label, i32::try_from(column).unwrap_or(i32::MAX), row, 1, 1);
+                    }
+                    row += 1;
+                    index += 1;
+                }
+                content.append(&table);
+            }
+            DocumentBlock::Heading { level, markup } => {
+                let label = document_label(markup, "preview-document-heading");
+                label.add_css_class(&format!("level-{level}"));
+                label.set_accessible_role(gtk::AccessibleRole::Heading);
+                label.update_property(&[gtk::accessible::Property::Level(i32::from(*level))]);
+                content.append(&label);
+                index += 1;
+            }
+            DocumentBlock::Paragraph(markup) => {
+                content.append(&document_label(markup, "preview-document-copy"));
+                index += 1;
+            }
+            DocumentBlock::Quote(markup) => {
+                content.append(&document_label(markup, "preview-document-quote"));
+                index += 1;
+            }
+            DocumentBlock::Code(markup) => {
+                content.append(&document_label(
+                    &format!("<tt>{markup}</tt>"),
+                    "preview-document-code",
+                ));
+                index += 1;
+            }
+            DocumentBlock::Rule => {
+                let rule = gtk::Separator::new(gtk::Orientation::Horizontal);
+                rule.add_css_class("preview-document-rule");
+                content.append(&rule);
+                index += 1;
+            }
+        }
+    }
+
+    gtk::ScrolledWindow::builder()
+        .child(&content)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .hexpand(true)
+        .vexpand(true)
+        .build()
+}
+
+fn document_label(markup: &str, class: &str) -> gtk::Label {
+    let label = gtk::Label::new(None);
+    label.add_css_class(class);
+    label.set_use_markup(true);
+    label.set_markup(markup);
+    label.set_selectable(true);
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    label.set_xalign(0.0);
+    label.set_yalign(0.0);
+    label.set_hexpand(true);
+    label.connect_activate_link(|label, uri| {
+        if has_web_scheme(uri) {
+            super::browser::open_location(&Location::uri(uri), label);
+        }
+        glib::Propagation::Stop
+    });
+    label
 }
 
 fn copyable_command(command: &str) -> gtk::Overlay {

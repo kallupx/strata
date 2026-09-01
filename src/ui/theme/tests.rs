@@ -166,11 +166,30 @@ theme = "azure-glow"
 
     assert!(preferences.folder_peeking);
     assert!(preferences.single_click_previews);
+    assert!(preferences.render_documents_by_default);
     assert!(!preferences.search_open_files_directly);
     assert!(!preferences.reduce_motion);
     assert_eq!(preferences.browser_mode, "columns");
     assert_eq!(preferences.browser_density, "compact");
     assert_eq!(sort_preferences(&preferences), ViewPreferences::default());
+}
+
+#[test]
+fn rendered_document_preference_can_be_disabled_and_round_trips() {
+    let preferences: Preferences = toml::from_str(
+        r#"
+mode = "theme"
+theme = "azure-glow"
+render_documents_by_default = false
+"#,
+    )
+    .expect("preferences should be valid");
+    assert!(!preferences.render_documents_by_default);
+
+    let serialized = toml::to_string(&preferences).expect("preferences should serialize");
+    let restored: Preferences =
+        toml::from_str(&serialized).expect("preferences should deserialize");
+    assert!(!restored.render_documents_by_default);
 }
 
 #[test]

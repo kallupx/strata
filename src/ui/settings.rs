@@ -410,6 +410,18 @@ fn general_page(browser: &BrowserView, manager: Rc<ThemeManager>) -> gtk::Widget
     });
     preferences.append(&preview_row);
 
+    let render_documents = manager.render_documents_by_default();
+    let (render_documents_row, render_documents_toggle) = settings_option(
+        "Render documents by default",
+        "Open Markdown and HTML previews in the rendered view instead of source.",
+        render_documents,
+    );
+    let manager_for_documents = manager.clone();
+    render_documents_toggle.connect_active_notify(move |toggle| {
+        manager_for_documents.set_render_documents_by_default(toggle.is_active());
+    });
+    preferences.append(&render_documents_row);
+
     let direct_open_enabled = manager.search_open_files_directly();
     let (search_open_row, search_open_files) = settings_option(
         "Open search results directly",

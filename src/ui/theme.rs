@@ -67,6 +67,8 @@ struct Preferences {
     folder_peeking: bool,
     #[serde(default = "default_enabled")]
     single_click_previews: bool,
+    #[serde(default = "default_enabled")]
+    render_documents_by_default: bool,
     #[serde(default)]
     search_open_files_directly: bool,
     #[serde(default)]
@@ -96,6 +98,7 @@ impl Default for Preferences {
             theme: "azure-glow".to_owned(),
             folder_peeking: true,
             single_click_previews: true,
+            render_documents_by_default: true,
             search_open_files_directly: false,
             reduce_motion: false,
             browser_mode: default_browser_mode(),
@@ -216,6 +219,15 @@ impl ThemeManager {
 
     pub fn set_single_click_previews(&self, enabled: bool) {
         self.preferences.borrow_mut().single_click_previews = enabled;
+        self.save_preferences();
+    }
+
+    pub fn render_documents_by_default(&self) -> bool {
+        self.preferences.borrow().render_documents_by_default
+    }
+
+    pub fn set_render_documents_by_default(&self, enabled: bool) {
+        self.preferences.borrow_mut().render_documents_by_default = enabled;
         self.save_preferences();
     }
 

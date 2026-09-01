@@ -9,7 +9,9 @@ mod search;
 mod update_check;
 mod update_install;
 
-pub(crate) use document::{DocumentBlock, parse_markdown};
+pub(crate) use document::{
+    Document, DocumentBlock, document_kind, has_web_scheme, parse_document, parse_markdown,
+};
 pub use file_source::{
     DirectoryChange, DirectoryEvent, DirectoryRequest, FileSource, LoadHandle,
     LocationValidationError, RequestId, UriCredentials, backend_unavailable_message,

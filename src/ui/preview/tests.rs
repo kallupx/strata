@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use super::{
-    MEDIA_PLUGIN_INSTALL_COMMAND, PDF_MAX_ZOOM, PDF_MIN_ZOOM, format_file_size,
-    media_error_feedback, pdf_zoom_after_scroll, preview_width_for_empty_space,
+    DocumentView, MEDIA_PLUGIN_INSTALL_COMMAND, PDF_MAX_ZOOM, PDF_MIN_ZOOM, accepts_preview_event,
+    format_file_size, initial_document_view, media_error_feedback, pdf_zoom_after_scroll,
+    preview_width_for_empty_space,
 };
+use crate::services::PreviewRequestId;
 
 #[test]
 fn formats_preview_file_sizes() {
@@ -42,4 +44,28 @@ fn pdf_scroll_zoom_stays_within_its_supported_range() {
     assert!(pdf_zoom_after_scroll(2.0, 1.0) < 2.0);
     assert_eq!(pdf_zoom_after_scroll(PDF_MIN_ZOOM, 100.0), PDF_MIN_ZOOM);
     assert_eq!(pdf_zoom_after_scroll(PDF_MAX_ZOOM, -100.0), PDF_MAX_ZOOM);
+}
+
+#[test]
+fn each_document_uses_the_current_default_and_unavailable_rendering_forces_source() {
+    assert_eq!(initial_document_view(true, true), DocumentView::Rendered);
+    assert_eq!(initial_document_view(false, true), DocumentView::Source);
+    assert_eq!(initial_document_view(true, false), DocumentView::Source);
+}
+
+#[test]
+fn stale_preview_responses_are_rejected() {
+    let current = PreviewRequestId(2);
+    assert!(accepts_preview_event(Some(current), current, current));
+    assert!(!accepts_preview_event(
+        Some(current),
+        PreviewRequestId(1),
+        PreviewRequestId(1)
+    ));
+    assert!(!accepts_preview_event(
+        Some(current),
+        current,
+        PreviewRequestId(1)
+    ));
+    assert!(!accepts_preview_event(None, current, current));
 }

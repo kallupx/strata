@@ -1483,6 +1483,122 @@ paned > separator {
   color: @theme_bg;
 }
 
+.preview-document-switcher {
+  margin: 10px 12px 8px;
+}
+
+.preview-document-fallback,
+.preview-document-warning {
+  background: alpha(@theme_accent, 0.1);
+  border: 1px solid alpha(@theme_accent, 0.42);
+  border-radius: 5px;
+  color: @theme_text;
+  font-size: 0.82em;
+  margin: 0 12px 8px;
+  padding: 7px 9px;
+}
+
+.preview-document {
+  background: @theme_surface;
+  color: @theme_text;
+  padding: 12px 16px 20px;
+}
+
+.preview-document .preview-document-warning {
+  margin: 0 0 4px;
+}
+
+.preview-document-heading,
+.preview-document-copy,
+.preview-document-list-item,
+.preview-document-quote,
+.preview-document-code,
+.preview-document-table-cell {
+  color: @theme_text;
+}
+
+.preview-document-heading {
+  color: @theme_accent;
+  font-weight: 700;
+  margin-top: 4px;
+}
+
+.preview-document-heading.level-1 { font-size: 1.6em; }
+.preview-document-heading.level-2 { font-size: 1.35em; }
+.preview-document-heading.level-3 { font-size: 1.18em; }
+.preview-document-heading.level-4,
+.preview-document-heading.level-5,
+.preview-document-heading.level-6 { font-size: 1.04em; }
+
+.preview-document-list-marker {
+  color: @theme_accent;
+}
+
+.preview-document-quote {
+  background: alpha(@theme_highlight, 0.36);
+  border-left: 3px solid @theme_accent;
+  color: @theme_dim_text;
+  padding: 8px 10px;
+}
+
+.preview-document-code {
+  background: alpha(@theme_bg, 0.72);
+  border: 1px solid alpha(@theme_border, 0.5);
+  border-radius: 5px;
+  color: @theme_text;
+  padding: 9px 10px;
+}
+
+.preview-document-rule {
+  background: alpha(@theme_border, 0.56);
+  margin: 3px 0;
+}
+
+.preview-document-table {
+  background: alpha(@theme_border, 0.5);
+  border: 1px solid alpha(@theme_border, 0.5);
+  border-radius: 5px;
+}
+
+.preview-document-table-cell {
+  background: @theme_surface;
+  padding: 6px 8px;
+}
+
+.preview-document-table-cell.header {
+  background: alpha(@theme_highlight, 0.64);
+  color: @theme_accent;
+  font-weight: 700;
+}
+
+.preview-document-heading selection,
+.preview-document-copy selection,
+.preview-document-quote selection,
+.preview-document-code selection,
+.preview-document-table-cell selection {
+  background: @theme_accent;
+  color: @theme_bg;
+}
+
+.preview-document link {
+  color: @theme_accent;
+}
+
+.preview-document link:hover {
+  background: alpha(@theme_highlight, 0.5);
+  color: @theme_text;
+}
+
+.preview-document link:active {
+  background: alpha(@theme_muted, 0.72);
+  color: @theme_accent;
+}
+
+.preview-document link:focus-visible {
+  outline: 2px solid @theme_accent;
+  outline-offset: 1px;
+}
+
 .preview-image,
 .preview-media {
   background: alpha(@theme_bg, 0.55);
