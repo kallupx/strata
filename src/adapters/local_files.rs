@@ -15,7 +15,7 @@ use crate::{
     model::{EntryKind, FileEntry, Location, MetadataValue},
     services::{
         DirectoryChange, DirectoryEvent, DirectoryRequest, FileSource, LoadHandle,
-        LocationValidationError, RequestId, backend_unavailable_message, validate_uri_credentials,
+        LocationValidationError, RequestId, backend_unavailable_message, sanitize_uri_credentials,
     },
 };
 
@@ -45,7 +45,7 @@ fn map_validation_error(error: std::io::Error) -> LocationValidationError {
 /// SFTP, ...) can still return a `.path()` via its FUSE mirror even though the
 /// file isn't native; using that path would leak the mirror's opaque
 /// `/run/user/$UID/gvfs/...` location instead of the clean URI (lgse/strata#5).
-/// Returns `None` when GIO preserves embedded credentials in that URI.
+/// Returns `None` when GIO provides a malformed URI.
 pub(crate) fn location_for_file(file: &gio::File) -> Option<Location> {
     if file.is_native()
         && let Some(path) = file.path()
@@ -53,8 +53,8 @@ pub(crate) fn location_for_file(file: &gio::File) -> Option<Location> {
         return Some(Location::local(path));
     }
     let uri = file.uri();
-    validate_uri_credentials(&uri).ok()?;
-    Some(Location::uri(uri))
+    let (sanitized, _) = sanitize_uri_credentials(&uri).ok()?;
+    Some(Location::uri(sanitized))
 }
 
 fn uri_validation_result(

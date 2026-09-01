@@ -88,17 +88,74 @@ pub fn backend_unavailable_message(uri: &str) -> String {
     }
 }
 
-/// Rejects URI password and authentication-parameter fields, including encoded delimiters.
-pub fn validate_uri_credentials(uri: &str) -> Result<(), LocationValidationError> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UriCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+/// Removes URI user-info secrets while preserving the username separately.
+pub fn sanitize_uri_credentials(
+    input: &str,
+) -> Result<(String, Option<UriCredentials>), LocationValidationError> {
     let uri = glib::Uri::parse(
-        uri,
+        input,
         glib::UriFlags::HAS_PASSWORD | glib::UriFlags::HAS_AUTH_PARAMS,
     )
     .map_err(|_| LocationValidationError::InvalidUri)?;
-    if uri_contains_credentials(&uri) {
-        Err(LocationValidationError::EmbeddedCredential)
-    } else {
-        Ok(())
+    if !uri_contains_credentials(&uri) {
+        return Ok((uri.to_str().to_string(), None));
+    }
+
+    let mut username = uri.user().map(|user| user.to_string()).unwrap_or_default();
+    let mut password = uri.password().map(|password| password.to_string());
+    let mut auth_params = uri.auth_params().map(|params| params.to_string());
+
+    if password.is_none()
+        && let Some((user, embedded_password)) = username.split_once(':')
+    {
+        password = Some(embedded_password.to_owned());
+        username = user.to_owned();
+    }
+    if auth_params.is_none()
+        && let Some((user, embedded_params)) = username.split_once(';')
+    {
+        auth_params = Some(embedded_params.to_owned());
+        username = user.to_owned();
+    }
+    if password.is_none() {
+        password = auth_params
+            .as_deref()
+            .and_then(|params| params.strip_prefix("password="))
+            .map(str::to_owned);
+    }
+
+    let sanitized = glib::Uri::build_with_user(
+        glib::UriFlags::empty(),
+        &uri.scheme(),
+        (!username.is_empty()).then_some(username.as_str()),
+        None,
+        None,
+        uri.host().as_deref(),
+        uri.port(),
+        &uri.path(),
+        uri.query().as_deref(),
+        uri.fragment().as_deref(),
+    )
+    .to_str()
+    .to_string();
+    let credentials = UriCredentials {
+        username,
+        password: password.unwrap_or_default(),
+    };
+    Ok((sanitized, Some(credentials)))
+}
+
+/// Rejects URI password and authentication-parameter fields, including encoded delimiters.
+pub fn validate_uri_credentials(uri: &str) -> Result<(), LocationValidationError> {
+    match sanitize_uri_credentials(uri)? {
+        (_, Some(_)) => Err(LocationValidationError::EmbeddedCredential),
+        (_, None) => Ok(()),
     }
 }
 

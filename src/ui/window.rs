@@ -14,7 +14,7 @@ use crate::{
     adapters::{LocalFileSource, LocalOperationProvider, LocalPreviewProvider, location_for_file},
     app::{Browser, BrowserEvent},
     model::{EntryKind, FileEntry, Location, MetadataValue},
-    services::validate_uri_credentials,
+    services::sanitize_uri_credentials,
 };
 
 use super::{
@@ -1653,7 +1653,7 @@ fn parse_pinned_places(contents: &str) -> Vec<(Location, String)> {
         let (uri, label) = line
             .split_once(' ')
             .map_or((line, None), |(uri, label)| (uri, Some(label)));
-        if uri.is_empty() || validate_uri_credentials(uri).is_err() {
+        if uri.is_empty() {
             continue;
         }
         let file = gio::File::for_uri(uri);
@@ -1695,7 +1695,8 @@ fn serialize_pinned_places(places: &[(Location, String)]) -> String {
             .map(gio::File::for_path)
             .map(|file| file.uri().to_string())
             .or_else(|| location.uri_value().map(str::to_owned));
-        let Some(uri) = uri.filter(|uri| validate_uri_credentials(uri).is_ok()) else {
+        let Some(uri) = uri.and_then(|uri| sanitize_uri_credentials(&uri).ok().map(|(uri, _)| uri))
+        else {
             continue;
         };
         let label = name.replace(['\n', '\r'], " ");

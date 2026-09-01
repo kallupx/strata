@@ -17,8 +17,9 @@ use crate::{
     model::{EntryKind, FileEntry, Location, SortDirection, SortKey},
     services::{
         ArchiveFormat, FileSource, LoadHandle, LocationValidationError, OperationProvider,
-        PasteItem, PreviewContent, SearchEvent, TransferConflict, backend_unavailable_message,
-        content_family, has_plain_text_extension, index_tree, validate_basename,
+        PasteItem, PreviewContent, SearchEvent, TransferConflict, UriCredentials,
+        backend_unavailable_message, content_family, has_plain_text_extension, index_tree,
+        sanitize_uri_credentials, validate_basename,
     },
 };
 
@@ -283,6 +284,7 @@ pub(super) struct ViewState {
     pending_select: RefCell<Vec<String>>,
     pending_extract_retry: RefCell<Option<(FileEntry, Location)>>,
     pending_navigate: RefCell<Option<Location>>,
+    pending_location_credentials: RefCell<Option<MountCredentials>>,
     pending_trash_summary: RefCell<Option<LoadHandle>>,
     pending_empty_trash: RefCell<Option<LoadHandle>>,
     trash_loading: RefCell<Option<TrashLoadingView>>,
@@ -428,6 +430,7 @@ impl BrowserView {
             pending_select: RefCell::new(Vec::new()),
             pending_extract_retry: RefCell::new(None),
             pending_navigate: RefCell::new(None),
+            pending_location_credentials: RefCell::new(None),
             pending_trash_summary: RefCell::new(None),
             pending_empty_trash: RefCell::new(None),
             trash_loading: RefCell::new(None),
@@ -2898,18 +2901,42 @@ impl ViewState {
 
     fn submit_location(self: &Rc<Self>) {
         let input = self.location_entry.text();
-        match self.browser.navigate_input(input.as_str()) {
+        let (input, credentials) = match credentials_from_location_input(input.as_str()) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.restore_location_text();
+                self.location_stack.set_visible_child_name("breadcrumbs");
+                show_error_dialog(&self.overlay, "Unable to open location", &error.to_string());
+                return;
+            }
+        };
+        if credentials.is_some() {
+            self.location_entry.set_text(&input);
+        }
+        self.pending_location_credentials.replace(credentials);
+        match self.browser.navigate_input(&input) {
             Ok(()) => {
                 self.location_stack.set_visible_child_name("breadcrumbs");
                 self.browser.focus_active();
             }
             Err(LocationValidationError::NotMounted(location)) => {
-                self.mount_then_navigate(location, MountStrategy::EnclosingVolume);
+                let credentials = self.pending_location_credentials.take();
+                self.mount_then_navigate_with_credentials(
+                    location,
+                    MountStrategy::EnclosingVolume,
+                    credentials,
+                );
             }
             Err(LocationValidationError::Mountable(location)) => {
-                self.mount_then_navigate(location, MountStrategy::Mountable);
+                let credentials = self.pending_location_credentials.take();
+                self.mount_then_navigate_with_credentials(
+                    location,
+                    MountStrategy::Mountable,
+                    credentials,
+                );
             }
             Err(error) => {
+                self.pending_location_credentials.take();
                 self.restore_location_text();
                 self.location_stack.set_visible_child_name("breadcrumbs");
                 show_error_dialog(&self.overlay, "Unable to open location", &error.to_string());
@@ -2937,10 +2964,6 @@ impl ViewState {
                 );
             }
         }
-    }
-
-    fn mount_then_navigate(self: &Rc<Self>, location: Location, strategy: MountStrategy) {
-        self.mount_then_navigate_with_credentials(location, strategy, None);
     }
 
     fn mount_then_navigate_with_credentials(
@@ -3313,6 +3336,7 @@ impl ViewState {
         self.mode_views.borrow_mut().handle(&event);
         match event {
             BrowserEvent::Reset => {
+                self.pending_location_credentials.take();
                 self.truncate(0);
             }
             BrowserEvent::ColumnsTruncated { len } => {
@@ -3596,17 +3620,30 @@ impl ViewState {
             BrowserEvent::EmptyTrashRequested => {
                 self.load_trash_summary();
             }
-            BrowserEvent::LocationNavigationRejected { error } => match error {
-                LocationValidationError::NotMounted(location) => {
-                    self.mount_then_navigate(location, MountStrategy::EnclosingVolume);
+            BrowserEvent::LocationNavigationRejected { error } => {
+                let credentials = self.pending_location_credentials.take();
+                match error {
+                    LocationValidationError::NotMounted(location) => {
+                        self.mount_then_navigate_with_credentials(
+                            location,
+                            MountStrategy::EnclosingVolume,
+                            credentials,
+                        );
+                    }
+                    LocationValidationError::Mountable(location) => {
+                        self.mount_then_navigate_with_credentials(
+                            location,
+                            MountStrategy::Mountable,
+                            credentials,
+                        );
+                    }
+                    error => show_error_dialog(
+                        &self.overlay,
+                        "Unable to open location",
+                        &error.to_string(),
+                    ),
                 }
-                LocationValidationError::Mountable(location) => {
-                    self.mount_then_navigate(location, MountStrategy::Mountable);
-                }
-                error => {
-                    show_error_dialog(&self.overlay, "Unable to open location", &error.to_string())
-                }
-            },
+            }
             BrowserEvent::ArchiveStarted { total } => {
                 let browser = self.browser.clone();
                 self.show_file_operation_progress(
@@ -7134,6 +7171,23 @@ fn password_save_for_selection(selected: u32) -> gio::PasswordSave {
     }
 }
 
+fn credentials_from_location_input(
+    input: &str,
+) -> Result<(String, Option<MountCredentials>), LocationValidationError> {
+    if !input.contains("://") {
+        return Ok((input.to_owned(), None));
+    }
+    let (sanitized, credentials) = sanitize_uri_credentials(input)?;
+    let credentials = credentials.map(|credentials: UriCredentials| MountCredentials {
+        anonymous: false,
+        username: credentials.username,
+        domain: String::new(),
+        password: credentials.password,
+        save: gio::PasswordSave::Never,
+    });
+    Ok((sanitized, credentials))
+}
+
 #[derive(Clone)]
 struct MountCredentials {
     anonymous: bool,
@@ -7161,7 +7215,9 @@ fn apply_mount_credentials(operation: &gio::MountOperation, credentials: &MountC
         return;
     }
     operation.set_username(Some(&credentials.username));
-    operation.set_domain(Some(&credentials.domain));
+    if !credentials.domain.is_empty() {
+        operation.set_domain(Some(&credentials.domain));
+    }
     operation.set_password(Some(&credentials.password));
     operation.set_password_save(credentials.save);
 }

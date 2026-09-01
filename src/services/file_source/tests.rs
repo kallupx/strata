@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use super::{LocationValidationError, backend_unavailable_message, validate_uri_credentials};
+use super::{
+    LocationValidationError, UriCredentials, backend_unavailable_message, sanitize_uri_credentials,
+    validate_uri_credentials,
+};
 
 #[test]
 fn embedded_uri_credentials_are_rejected() {
@@ -21,6 +24,28 @@ fn embedded_uri_credentials_are_rejected() {
             validate_uri_credentials(uri),
             Err(LocationValidationError::EmbeddedCredential),
             "{uri:?} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn embedded_uri_credentials_are_separated_from_the_sanitized_uri() {
+    for uri in [
+        "smb://user:secret@host/share",
+        "smb://user%3Asecret@host/share",
+        "smb://user;password=secret@host/share",
+        "smb://user%3Bpassword=secret@host/share",
+    ] {
+        assert_eq!(
+            sanitize_uri_credentials(uri),
+            Ok((
+                "smb://user@host/share".to_owned(),
+                Some(UriCredentials {
+                    username: "user".to_owned(),
+                    password: "secret".to_owned(),
+                }),
+            )),
+            "did not separate {uri:?}"
         );
     }
 }
