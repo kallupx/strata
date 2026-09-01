@@ -271,6 +271,11 @@ fn quick_preview_is_offered_only_for_supported_files() {
             "{name} should reach the preview provider"
         );
     }
+    let remote_document = FileEntry {
+        location: Location::uri("smb://server/share/notes.mdown"),
+        ..entry("notes.mdown", crate::model::EntryKind::File)
+    };
+    assert!(!entry_supports_quick_preview(&remote_document));
     assert!(!entry_supports_quick_preview(&entry(
         "archive.zip",
         crate::model::EntryKind::File,

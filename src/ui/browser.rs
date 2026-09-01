@@ -5668,7 +5668,12 @@ pub(super) fn entry_supports_quick_preview(entry: &FileEntry) -> bool {
     !matches!(content_family(&content_type), PreviewContent::Unsupported)
         || gio::content_type_is_a(&content_type, "text/plain")
         || has_plain_text_extension(&entry.native_name)
-        || document_kind(&content_type, &entry.native_name, true).is_some()
+        || document_kind(
+            &content_type,
+            &entry.native_name,
+            entry.location.native_path().is_some(),
+        )
+        .is_some()
 }
 
 struct TrashSummary {

@@ -469,6 +469,8 @@ struct HtmlState {
     blocks: Vec<DocumentBlock>,
     active: Option<ActiveBlock>,
     lists: Vec<Option<u64>>,
+    list_parents: Vec<Option<(ActiveBlock, usize)>>,
+    active_insert_at: Option<usize>,
     links: Vec<Option<String>>,
     stack: Vec<String>,
     skipped_depth: usize,
@@ -489,6 +491,8 @@ impl HtmlState {
             blocks: Vec::new(),
             active: None,
             lists: Vec::new(),
+            list_parents: Vec::new(),
+            active_insert_at: None,
             links: Vec::new(),
             stack: Vec::new(),
             skipped_depth: 0,
@@ -556,13 +560,25 @@ impl HtmlState {
                 self.start_active(ActiveBlock::Quote(String::new()));
             }
             "ul" | "ol" => {
-                self.finish_active();
+                let parent = if matches!(self.active, Some(ActiveBlock::ListItem { .. })) {
+                    self.append_link_closings();
+                    self.active.take().map(|active| {
+                        (
+                            active,
+                            self.active_insert_at.take().unwrap_or(self.blocks.len()),
+                        )
+                    })
+                } else {
+                    self.finish_active();
+                    None
+                };
                 if self.lists.is_empty()
                     && matches!(self.blocks.last(), Some(DocumentBlock::ListItem { .. }))
                 {
                     self.blocks.push(DocumentBlock::ContainerBoundary);
                 }
                 self.lists.push((name == "ol").then_some(1));
+                self.list_parents.push(parent);
             }
             "li" => {
                 self.finish_active();
@@ -661,6 +677,11 @@ impl HtmlState {
                     self.finish_active();
                 }
                 self.lists.pop();
+                if let Some(Some((active, insert_at))) = self.list_parents.pop() {
+                    self.active = Some(active);
+                    self.active_insert_at = Some(insert_at);
+                    self.append_link_openings();
+                }
             }
             "em" | "i" => self.append_markup("</i>"),
             "strong" | "b" => self.append_markup("</b>"),
@@ -726,7 +747,15 @@ impl HtmlState {
     fn finish_active(&mut self) {
         if self.active.is_some() {
             self.append_link_closings();
-            finish_block(&mut self.active, &mut self.blocks);
+            if let Some(block) = take_block(&mut self.active) {
+                if let Some(index) = self.active_insert_at.take() {
+                    self.blocks.insert(index, block);
+                } else {
+                    self.blocks.push(block);
+                }
+            } else {
+                self.active_insert_at = None;
+            }
         }
     }
 
@@ -1008,13 +1037,17 @@ fn next_list_marker(lists: &mut [Option<u64>]) -> String {
 }
 
 fn finish_block(active: &mut Option<ActiveBlock>, blocks: &mut Vec<DocumentBlock>) {
-    let Some(active) = active.take() else {
-        return;
-    };
-    if !has_visible_markup(active.markup()) {
-        return;
+    if let Some(block) = take_block(active) {
+        blocks.push(block);
     }
-    blocks.push(match active {
+}
+
+fn take_block(active: &mut Option<ActiveBlock>) -> Option<DocumentBlock> {
+    let active = active.take()?;
+    if !has_visible_markup(active.markup()) {
+        return None;
+    }
+    Some(match active {
         ActiveBlock::Heading { level, markup } => DocumentBlock::Heading { level, markup },
         ActiveBlock::Paragraph(markup) => DocumentBlock::Paragraph(markup),
         ActiveBlock::ListItem {
@@ -1028,7 +1061,7 @@ fn finish_block(active: &mut Option<ActiveBlock>, blocks: &mut Vec<DocumentBlock
         },
         ActiveBlock::Quote(markup) => DocumentBlock::Quote(markup),
         ActiveBlock::Code(markup) => DocumentBlock::Code(markup),
-    });
+    })
 }
 
 fn has_visible_markup(markup: &str) -> bool {

@@ -339,6 +339,32 @@ fn html_paragraphs_inside_list_items_keep_list_semantics() {
 }
 
 #[test]
+fn html_restores_parent_list_items_after_nested_lists() {
+    assert_eq!(
+        parse_document(
+            DocumentKind::Html,
+            "<ul><li><p>outer</p><ul><li>inner</li></ul><p>tail</p></li></ul>",
+            &Cancellation::default(),
+        )
+        .expect("nested lists should resume their parent item")
+        .document
+        .blocks,
+        vec![
+            DocumentBlock::ListItem {
+                marker: "•".to_owned(),
+                depth: 0,
+                markup: "outer\ntail".to_owned(),
+            },
+            DocumentBlock::ListItem {
+                marker: "•".to_owned(),
+                depth: 1,
+                markup: "inner".to_owned(),
+            },
+        ]
+    );
+}
+
+#[test]
 fn separate_lists_and_tables_keep_container_boundaries() {
     let markdown = parse_document(
         DocumentKind::Markdown,
