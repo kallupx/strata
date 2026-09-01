@@ -15,8 +15,8 @@ use crate::{
         ArchiveFormat, CompressRequest, CreateDirectoryRequest, CreateFileRequest, DeleteRequest,
         DirectoryChange, DirectoryEvent, DirectoryRequest, ExtractRequest, FileSource, LoadHandle,
         LocationValidationError, OperationEvent, OperationProvider, OperationRequestId, PasteItem,
-        PasteRequest, RenameRequest, RequestId, RestoreRequest, uri_has_embedded_password,
-        validate_basename,
+        PasteRequest, RenameRequest, RequestId, RestoreRequest, TransferConflict,
+        uri_has_embedded_password, validate_basename,
     },
 };
 
@@ -923,6 +923,7 @@ impl Browser {
         entries: Vec<FileEntry>,
         destination: Location,
         archive_name: String,
+        conflict: TransferConflict,
         format: ArchiveFormat,
         password: Option<String>,
     ) {
@@ -942,6 +943,7 @@ impl Browser {
                 entries,
                 destination,
                 archive_name,
+                conflict,
                 format,
                 password,
             },

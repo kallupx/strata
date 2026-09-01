@@ -124,6 +124,7 @@ pub struct CompressRequest {
     pub entries: Vec<FileEntry>,
     pub destination: Location,
     pub archive_name: String,
+    pub conflict: TransferConflict,
     pub format: ArchiveFormat,
     pub password: Option<String>,
 }

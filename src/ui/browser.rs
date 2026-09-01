@@ -2248,6 +2248,109 @@ impl ViewState {
         (layout.body, layout.confirm, dismiss)
     }
 
+    fn start_compression(
+        self: &Rc<Self>,
+        entries: Vec<FileEntry>,
+        destination: Location,
+        archive_name: String,
+        format: ArchiveFormat,
+        password: Option<String>,
+    ) {
+        let final_name = format!("{archive_name}.{}", format.extension());
+        if !archive_has_collision(&destination, &final_name) {
+            self.browser.compress(
+                entries,
+                destination,
+                archive_name,
+                TransferConflict::FailIfExists,
+                format,
+                password,
+            );
+            return;
+        }
+        let Some(window_overlay) = self
+            .overlay
+            .root()
+            .and_downcast::<gtk::Window>()
+            .and_then(|window| window.child())
+            .and_downcast::<gtk::Overlay>()
+        else {
+            return;
+        };
+        let blurred_root = window_overlay.child().and_downcast::<BlurBin>();
+        if let Some(root) = blurred_root.as_ref() {
+            root.set_blurred(true);
+        }
+        let layout = message_dialog_layout(
+            crate::assets::icons::FILE_ARCHIVE,
+            "File already exists",
+            &final_name,
+            "Replace",
+            ModalTone::Danger,
+        );
+        layout.body.append(&message_dialog_description(&format!(
+            "An archive named “{final_name}” already exists in {}. Replacing it will overwrite its contents.",
+            compact_display_path(&destination)
+        )));
+        let content = layout.content;
+        let close = layout.close;
+        let cancel = layout.cancel;
+        let replace = layout.confirm;
+        let layer = modal_layer(&content, &window_overlay, blurred_root.clone(), None);
+        window_overlay.add_overlay(&layer);
+
+        for button in [&close, &cancel] {
+            let dismissed_layer = layer.clone();
+            let dismissed_overlay = window_overlay.clone();
+            let dismissed_root = blurred_root.clone();
+            let browser = self.browser.clone();
+            button.connect_clicked(move |_| {
+                dismiss_modal_layer(
+                    &dismissed_layer,
+                    &dismissed_overlay,
+                    dismissed_root.as_ref(),
+                );
+                browser.focus_active();
+            });
+        }
+
+        let replaced_layer = layer.clone();
+        let replaced_overlay = window_overlay.clone();
+        let replaced_root = blurred_root.clone();
+        let browser = self.browser.clone();
+        replace.connect_clicked(move |_| {
+            dismiss_modal_layer(&replaced_layer, &replaced_overlay, replaced_root.as_ref());
+            browser.compress(
+                entries.clone(),
+                destination.clone(),
+                archive_name.clone(),
+                TransferConflict::ReplaceExisting,
+                format,
+                password.clone(),
+            );
+        });
+
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let escaped_layer = layer.clone();
+        let escaped_overlay = window_overlay;
+        let escaped_root = blurred_root;
+        let enter_replace = replace.clone();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                dismiss_modal_layer(&escaped_layer, &escaped_overlay, escaped_root.as_ref());
+                glib::Propagation::Stop
+            } else if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
+                enter_replace.emit_clicked();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        layer.add_controller(keys);
+        replace.grab_focus();
+    }
+
     fn show_compress_dialog(self: &Rc<Self>, entries: Vec<FileEntry>) {
         if entries.is_empty() {
             return;
@@ -2268,6 +2371,9 @@ impl ViewState {
 
         let name_entry = form_entry();
         name_entry.set_text(&default_name);
+        name_entry.connect_changed(|field| {
+            update_basename_validation(field);
+        });
         let password_entry = form_password_entry();
         password_entry.set_show_peek_icon(true);
         let confirm_entry = form_password_entry();
@@ -2350,7 +2456,7 @@ impl ViewState {
             });
         }
 
-        let browser = self.browser.clone();
+        let state = Rc::downgrade(self);
         let confirm_entries = entries.clone();
         let confirm_destination = destination.clone();
         let name_for_confirm = name_entry.clone();
@@ -2363,6 +2469,13 @@ impl ViewState {
         confirm.connect_clicked(move |_| {
             let name = name_for_confirm.text().to_string();
             let format = format_for_confirm.get();
+            let archive_name = normalized_archive_name(&name, format);
+            if let Err(message) = validate_basename(&archive_name) {
+                name_for_confirm.add_css_class("error");
+                name_for_confirm.set_tooltip_text(Some(message));
+                name_for_confirm.grab_focus();
+                return;
+            }
             let password = if format.supports_password() && protected_for_confirm.is_active() {
                 let pw = password_for_confirm.text().to_string();
                 if pw.is_empty() {
@@ -2386,19 +2499,16 @@ impl ViewState {
             } else {
                 None
             };
-            let archive_name = if name.ends_with(format.extension()) {
-                name.trim_end_matches(format.extension()).to_owned()
-            } else {
-                name
-            };
             dismiss_for_confirm();
-            browser.compress(
-                confirm_entries.clone(),
-                confirm_destination.clone(),
-                archive_name,
-                format,
-                password,
-            );
+            if let Some(state) = state.upgrade() {
+                state.start_compression(
+                    confirm_entries.clone(),
+                    confirm_destination.clone(),
+                    archive_name,
+                    format,
+                    password,
+                );
+            }
         });
         name_entry.grab_focus();
     }
@@ -6039,6 +6149,18 @@ fn transfer_has_collision(source: &Location, destination: &Location) -> bool {
     target.query_exists(None::<&gio::Cancellable>)
 }
 
+fn normalized_archive_name(name: &str, format: ArchiveFormat) -> String {
+    name.strip_suffix(&format!(".{}", format.extension()))
+        .unwrap_or(name)
+        .to_owned()
+}
+
+fn archive_has_collision(destination: &Location, archive_name: &str) -> bool {
+    gio_file_for_location(destination)
+        .child(archive_name)
+        .query_exists(None::<&gio::Cancellable>)
+}
+
 fn transfer_dropped_files(
     state: &Rc<ViewState>,
     target: &gtk::DropTarget,
@@ -6861,10 +6983,23 @@ pub(super) fn dismiss_modal_layer(
     let root = root.cloned();
     animate_out(&layer_for_anim, move || {
         overlay.remove_overlay(&layer);
-        if let Some(root) = root {
+        if let Some(root) = root
+            && !overlay_has_modal_layer(&overlay)
+        {
             root.set_blurred(false);
         }
     });
+}
+
+fn overlay_has_modal_layer(overlay: &gtk::Overlay) -> bool {
+    let mut child = overlay.first_child();
+    while let Some(widget) = child {
+        if widget.is_visible() && widget.has_css_class("app-modal-layer") {
+            return true;
+        }
+        child = widget.next_sibling();
+    }
+    false
 }
 
 fn gio_file_for_location(location: &Location) -> gio::File {
