@@ -578,8 +578,13 @@ impl ModeViews {
             BrowserEvent::ColumnReloaded { depth } => {
                 for pane in self.panes_at(*depth) {
                     pane.syncing_selection.set(true);
-                    pane.selection.unselect_all();
+                    pane.selection.set_model(None::<&gio::ListModel>);
                     pane.model.splice(0, pane.model.n_items(), &[]);
+                    if let Some(filtered) = pane.filtered_model.as_ref() {
+                        pane.selection.set_model(Some(filtered));
+                    } else {
+                        pane.selection.set_model(Some(&pane.model));
+                    }
                     pane.syncing_selection.set(false);
                     pane.spinner.set_visible(true);
                     pane.spinner.start();

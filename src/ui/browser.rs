@@ -3539,8 +3539,9 @@ impl ViewState {
             BrowserEvent::ColumnReloaded { depth } => {
                 if let Some(column) = self.columns.borrow().get(depth) {
                     column.syncing_selection.set(true);
-                    column.selection.unselect_all();
+                    column.selection.set_model(None::<&gio::ListModel>);
                     column.model.splice(0, column.model.n_items(), &[]);
+                    column.selection.set_model(Some(&column.filtered_model));
                     column.syncing_selection.set(false);
                     column.entry_count.set(0);
                     set_filter_placeholder(column, 0);
