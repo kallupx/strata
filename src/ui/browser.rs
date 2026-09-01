@@ -5222,6 +5222,8 @@ pub(super) fn install_folder_context_menu(
 pub(super) type ContextPickPosition = Rc<dyn Fn(&gtk::Widget) -> Option<u32>>;
 pub(super) type ContextSourcePosition = Rc<dyn Fn(u32) -> Option<usize>>;
 
+const ITEM_CONTEXT_SUMMARY_MAX_CHARS: i32 = 60;
+
 pub(super) fn install_item_context_menu(
     state: &Rc<ViewState>,
     widget: &gtk::Widget,
@@ -5242,10 +5244,12 @@ pub(super) fn install_item_context_menu(
     let heading = gtk::Label::new(None);
     heading.add_css_class("item-context-title");
     heading.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    heading.set_max_width_chars(ITEM_CONTEXT_SUMMARY_MAX_CHARS);
     heading.set_xalign(0.0);
     let summary = gtk::Label::new(None);
     summary.add_css_class("item-context-summary");
     summary.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    summary.set_max_width_chars(ITEM_CONTEXT_SUMMARY_MAX_CHARS);
     summary.set_xalign(0.0);
     header.append(&heading);
     header.append(&summary);
@@ -5487,13 +5491,6 @@ pub(super) fn install_item_context_menu(
         if !selection.is_selected(filtered_position) {
             selection.select_item(filtered_position, true);
         }
-        let selected_positions = bitset_positions(&selection.selection())
-            .into_iter()
-            .filter_map(|position| source_position(position))
-            .collect::<Vec<_>>();
-        state
-            .browser
-            .set_selection(depth, &selected_positions, Some(resolved_position));
         target.replace(Some((resolved_position, entry.clone())));
         let entries = state.browser.selected_entries();
         preview.set_visible(entry_supports_quick_preview(&entry));
@@ -5815,6 +5812,11 @@ fn selected_items_summary(entries: &[FileEntry]) -> String {
         .join(", ");
     if entries.len() > 3 {
         names.push_str(", …");
+    }
+    let max_chars = ITEM_CONTEXT_SUMMARY_MAX_CHARS as usize;
+    if names.chars().count() > max_chars {
+        names = names.chars().take(max_chars - 1).collect();
+        names.push('…');
     }
     names
 }

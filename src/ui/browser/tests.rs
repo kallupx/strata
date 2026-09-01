@@ -331,6 +331,15 @@ fn multi_selection_summary_lists_at_most_three_names() {
         selected_items_summary(&[entry("one"), entry("two"), entry("three"), entry("four")]),
         "one, two, three, …"
     );
+    let summary = selected_items_summary(&[
+        entry("a-very-long-file-name-that-would-expand-the-context-menu"),
+        entry("another-very-long-file-name-that-would-expand-the-menu"),
+    ]);
+    assert_eq!(
+        summary.chars().count(),
+        ITEM_CONTEXT_SUMMARY_MAX_CHARS as usize
+    );
+    assert!(summary.ends_with('…'));
 }
 
 #[test]
