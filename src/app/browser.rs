@@ -160,6 +160,8 @@ pub enum BrowserEvent {
 type Observer = Rc<dyn Fn(BrowserEvent)>;
 type PreferencesObserver = Rc<dyn Fn(ViewPreferences)>;
 
+const MAX_INCREMENTAL_OPERATION_UPDATES: usize = 64;
+
 pub struct Browser {
     source: Rc<dyn FileSource>,
     state: RefCell<NavigationState>,
@@ -1060,7 +1062,9 @@ impl Browser {
                 ..
             } = &event
             {
-                if let Some(location) = deleted_location {
+                if *total <= MAX_INCREMENTAL_OPERATION_UPDATES
+                    && let Some(location) = deleted_location
+                {
                     browser.remove_deleted_locations(std::slice::from_ref(location));
                 }
                 browser.emit(BrowserEvent::DeletionProgress {
@@ -1086,7 +1090,9 @@ impl Browser {
                 ..
             } = &event
             {
-                if let Some(location) = restored_location {
+                if *total <= MAX_INCREMENTAL_OPERATION_UPDATES
+                    && let Some(location) = restored_location
+                {
                     browser.remove_deleted_locations(std::slice::from_ref(location));
                 }
                 browser.emit(BrowserEvent::RestorationProgress {
@@ -1170,9 +1176,6 @@ impl Browser {
                     browser.emit(BrowserEvent::OperationCompletedWithErrors { message });
                 }
                 OperationEvent::Cancelled { result, .. } => {
-                    if deleting || restoring {
-                        browser.remove_deleted_locations(&result.completed);
-                    }
                     let mut affected_locations = refresh_locations.clone();
                     affected_locations.extend(result.affected_locations);
                     browser.refresh_columns_at_or_below(&affected_locations);
@@ -1454,6 +1457,16 @@ impl Browser {
     }
 
     fn remove_deleted_locations(self: &Rc<Self>, locations: &[Location]) {
+        if locations.len() > MAX_INCREMENTAL_OPERATION_UPDATES {
+            let parents: HashSet<_> = locations
+                .iter()
+                .filter_map(deletion_parent_location)
+                .collect();
+            for parent in parents {
+                self.refresh_columns_at(&parent);
+            }
+            return;
+        }
         for location in locations {
             let Some(parent) = deletion_parent_location(location) else {
                 continue;

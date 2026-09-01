@@ -283,6 +283,32 @@ impl FileSource for FakeFileSource {
     }
 }
 
+struct TrashFileSource;
+
+impl FileSource for TrashFileSource {
+    fn validate_location(&self, _location: &Location) -> Result<(), LocationValidationError> {
+        Ok(())
+    }
+
+    fn enumerate(&self, request: DirectoryRequest, emit: Rc<dyn Fn(DirectoryEvent)>) -> LoadHandle {
+        emit(DirectoryEvent::Batch {
+            request_id: request.id,
+            entries: vec![FileEntry {
+                location: Location::uri("trash:///item"),
+                native_name: OsString::from("item"),
+                display_name: "item".into(),
+                kind: EntryKind::File,
+                size: MetadataValue::Unknown,
+                modified_unix_seconds: MetadataValue::Unknown,
+            }],
+        });
+        emit(DirectoryEvent::Finished {
+            request_id: request.id,
+        });
+        LoadHandle::new(|| {})
+    }
+}
+
 struct CountingFileSource {
     enumerate_calls: Rc<Cell<usize>>,
 }
@@ -299,6 +325,39 @@ impl FileSource for CountingFileSource {
         });
         LoadHandle::new(|| {})
     }
+}
+
+#[test]
+fn large_restore_progress_defers_model_removal() {
+    let browser = Browser::new(Rc::new(TrashFileSource));
+    browser.navigate(Location::uri("trash:///"));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = events.clone();
+    browser.observe(move |event| observed.borrow_mut().push(event));
+    let request_id = browser.begin_operation();
+    browser.restoration_operation.set(true);
+    let emit = browser.operation_callback(request_id, false, HashSet::new());
+
+    emit(OperationEvent::RestoreProgress {
+        request_id,
+        completed: 1,
+        total: 3_000,
+        restored_location: Some(Location::uri("trash:///item")),
+    });
+
+    assert!(events.borrow().iter().any(|event| matches!(
+        event,
+        BrowserEvent::RestorationProgress {
+            completed: 1,
+            total: 3_000,
+        }
+    )));
+    assert!(
+        !events
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, BrowserEvent::EntriesSpliced { .. }))
+    );
 }
 
 #[test]
