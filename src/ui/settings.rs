@@ -626,7 +626,9 @@ fn set_release_note_blocks(notes: &gtk::Box, blocks: &[DocumentBlock]) {
                 separator.add_css_class("release-notes-rule");
                 notes.append(&separator);
             }
-            DocumentBlock::Quote(_) | DocumentBlock::TableRow { .. } => {}
+            DocumentBlock::Quote(_)
+            | DocumentBlock::TableRow { .. }
+            | DocumentBlock::ContainerBoundary => {}
         }
     }
 }

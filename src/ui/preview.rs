@@ -1032,6 +1032,7 @@ fn rendered_document(document: &Document, warnings: &[String]) -> gtk::ScrolledW
                 content.append(&rule);
                 index += 1;
             }
+            DocumentBlock::ContainerBoundary => index += 1,
         }
     }
 

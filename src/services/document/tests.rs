@@ -320,6 +320,90 @@ fn html_paragraphs_inside_blockquotes_keep_quote_semantics() {
 }
 
 #[test]
+fn html_paragraphs_inside_list_items_keep_list_semantics() {
+    assert_eq!(
+        parse_document(
+            DocumentKind::Html,
+            "<ul><li><p>one</p></li></ul>",
+            &Cancellation::default(),
+        )
+        .expect("paragraphs are valid list-item content")
+        .document
+        .blocks,
+        vec![DocumentBlock::ListItem {
+            marker: "•".to_owned(),
+            depth: 0,
+            markup: "one".to_owned(),
+        }]
+    );
+}
+
+#[test]
+fn separate_lists_and_tables_keep_container_boundaries() {
+    let markdown = parse_document(
+        DocumentKind::Markdown,
+        "- one\n\n1. two",
+        &Cancellation::default(),
+    )
+    .expect("separate Markdown lists should render");
+    assert!(matches!(
+        markdown.document.blocks.as_slice(),
+        [
+            DocumentBlock::ListItem { .. },
+            DocumentBlock::ContainerBoundary,
+            DocumentBlock::ListItem { .. }
+        ]
+    ));
+
+    let html_lists = parse_document(
+        DocumentKind::Html,
+        "<ul><li>one</ul><ol><li>two</ol>",
+        &Cancellation::default(),
+    )
+    .expect("separate HTML lists should render");
+    assert!(matches!(
+        html_lists.document.blocks.as_slice(),
+        [
+            DocumentBlock::ListItem { .. },
+            DocumentBlock::ContainerBoundary,
+            DocumentBlock::ListItem { .. }
+        ]
+    ));
+
+    let markdown_tables = parse_document(
+        DocumentKind::Markdown,
+        "| A |\n| - |\n| 1 |\n\n| B |\n| - |\n| 2 |",
+        &Cancellation::default(),
+    )
+    .expect("adjacent Markdown tables should render");
+    assert!(matches!(
+        markdown_tables.document.blocks.as_slice(),
+        [
+            DocumentBlock::TableRow { .. },
+            DocumentBlock::TableRow { .. },
+            DocumentBlock::ContainerBoundary,
+            DocumentBlock::TableRow { .. },
+            DocumentBlock::TableRow { .. }
+        ]
+    ));
+
+    let html = parse_document(
+        DocumentKind::Html,
+        "<table><tr><td>A</table><table><tr><td>B</table>",
+        &Cancellation::default(),
+    )
+    .expect("adjacent HTML tables should render");
+    assert!(matches!(
+        html.document.blocks.as_slice(),
+        [
+            DocumentBlock::TableRow { .. },
+            DocumentBlock::ContainerBoundary,
+            DocumentBlock::TableRow { .. }
+        ]
+    ));
+}
+
+#[test]
 fn html_markup_limit_applies_while_links_are_reemitted() {
     let limits = ParseLimits {
         events: 2,

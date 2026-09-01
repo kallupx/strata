@@ -39,6 +39,7 @@ pub enum DocumentBlock {
     Quote(String),
     Code(String),
     Rule,
+    ContainerBoundary,
     TableRow {
         cells: Vec<DocumentTableCell>,
     },
@@ -310,6 +311,10 @@ fn parse_markdown_bounded(
                 if matches!(active, Some(ActiveBlock::ListItem { .. })) {
                     finish_block(&mut active, &mut blocks);
                 }
+                if lists.is_empty() && matches!(blocks.last(), Some(DocumentBlock::ListItem { .. }))
+                {
+                    blocks.push(DocumentBlock::ContainerBoundary);
+                }
                 lists.push(*start);
             }
             Event::End(TagEnd::List(_)) => {
@@ -331,9 +336,13 @@ fn parse_markdown_bounded(
                     finish_block(&mut active, &mut blocks);
                 }
             }
-            Event::Start(Tag::Table(_)) | Event::End(TagEnd::Table) => {
+            Event::Start(Tag::Table(_)) => {
                 finish_block(&mut active, &mut blocks);
+                if matches!(blocks.last(), Some(DocumentBlock::TableRow { .. })) {
+                    blocks.push(DocumentBlock::ContainerBoundary);
+                }
             }
+            Event::End(TagEnd::Table) => finish_block(&mut active, &mut blocks),
             Event::Start(Tag::TableHead) => {
                 table_header = true;
                 table_row = Some(Vec::new());
@@ -524,25 +533,36 @@ impl HtmlState {
                 });
             }
             "p" => {
-                self.finish_active();
-                self.start_active(if self.quote_depth > 0 {
-                    ActiveBlock::Quote(String::new())
+                if matches!(self.active, Some(ActiveBlock::ListItem { .. })) {
+                    if self
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| has_visible_markup(active.markup()))
+                    {
+                        self.append_markup("\n");
+                    }
                 } else {
-                    ActiveBlock::Paragraph(String::new())
-                });
+                    self.finish_active();
+                    self.start_active(if self.quote_depth > 0 {
+                        ActiveBlock::Quote(String::new())
+                    } else {
+                        ActiveBlock::Paragraph(String::new())
+                    });
+                }
             }
             "blockquote" => {
                 self.finish_active();
                 self.quote_depth = self.quote_depth.saturating_add(1);
                 self.start_active(ActiveBlock::Quote(String::new()));
             }
-            "ul" => {
+            "ul" | "ol" => {
                 self.finish_active();
-                self.lists.push(None);
-            }
-            "ol" => {
-                self.finish_active();
-                self.lists.push(Some(1));
+                if self.lists.is_empty()
+                    && matches!(self.blocks.last(), Some(DocumentBlock::ListItem { .. }))
+                {
+                    self.blocks.push(DocumentBlock::ContainerBoundary);
+                }
+                self.lists.push((name == "ol").then_some(1));
             }
             "li" => {
                 self.finish_active();
@@ -583,7 +603,12 @@ impl HtmlState {
                 self.ensure_text_target();
                 self.append_markup("\n");
             }
-            "table" => self.finish_active(),
+            "table" => {
+                self.finish_active();
+                if matches!(self.blocks.last(), Some(DocumentBlock::TableRow { .. })) {
+                    self.blocks.push(DocumentBlock::ContainerBoundary);
+                }
+            }
             "tr" => self.table_row = Some(Vec::new()),
             "th" | "td" => {
                 self.table_cell_header = name == "th";
@@ -616,9 +641,17 @@ impl HtmlState {
 
     fn end_supported(&mut self, name: &str) {
         match name {
-            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "p" | "li" => {
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "li" => {
                 self.finish_active();
             }
+            "p" if matches!(
+                self.active,
+                Some(ActiveBlock::Paragraph(_) | ActiveBlock::Quote(_))
+            ) =>
+            {
+                self.finish_active();
+            }
+            "p" => {}
             "blockquote" => {
                 self.finish_active();
                 self.quote_depth = self.quote_depth.saturating_sub(1);
@@ -879,6 +912,7 @@ fn validate_document(
         .iter()
         .map(|block| match block {
             DocumentBlock::TableRow { cells, .. } => cells.len(),
+            DocumentBlock::ContainerBoundary => 0,
             _ => 1,
         })
         .sum::<usize>();
@@ -915,7 +949,7 @@ fn block_has_balanced_markup(block: &DocumentBlock) -> bool {
         DocumentBlock::TableRow { cells } => {
             cells.iter().all(|cell| has_balanced_markup(&cell.markup))
         }
-        DocumentBlock::Rule => true,
+        DocumentBlock::Rule | DocumentBlock::ContainerBoundary => true,
     }
 }
 
@@ -954,7 +988,7 @@ fn block_markup_bytes(block: &DocumentBlock) -> usize {
         | DocumentBlock::Quote(markup)
         | DocumentBlock::Code(markup) => markup.len(),
         DocumentBlock::TableRow { cells } => cells.iter().map(|cell| cell.markup.len()).sum(),
-        DocumentBlock::Rule => 0,
+        DocumentBlock::Rule | DocumentBlock::ContainerBoundary => 0,
     }
 }
 
