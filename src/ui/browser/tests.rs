@@ -69,6 +69,18 @@ fn password_storage_selection_maps_to_gio_values() {
 }
 
 #[test]
+fn location_input_credentials_are_one_shot_and_never_saved() {
+    let (location, credentials) = credentials_from_location_input("smb://alice:secret@host/share")
+        .expect("credential URI should parse");
+    let credentials = credentials.expect("credentials should be separated");
+
+    assert_eq!(location, "smb://alice@host/share");
+    assert_eq!(credentials.username, "alice");
+    assert_eq!(credentials.password, "secret");
+    assert_eq!(credentials.save, gio::PasswordSave::Never);
+}
+
+#[test]
 fn remote_permission_denials_are_treated_as_authentication_failures() {
     let denied = glib::Error::new(gio::IOErrorEnum::PermissionDenied, "Permission denied");
     let smb_denied = glib::Error::new(
@@ -250,6 +262,35 @@ fn incoming_file_lists_preserve_local_and_remote_locations() {
             Location::local("/fixture/photo.raw"),
             Location::uri("sftp://host.example/home/user/video.mp4"),
         ])
+    );
+}
+
+#[test]
+fn incoming_file_lists_sanitize_remote_credentials() {
+    let files = gtk::gdk::FileList::from_array(&[
+        gio::File::for_uri("smb://user%3Asecret@host/share"),
+        gio::File::for_uri("smb://user%3Bpassword=secret@host/share"),
+        gio::File::for_uri("sftp://user@host/home/user/video.mp4"),
+    ]);
+
+    let locations = locations_from_file_list_value(&files.to_value())
+        .expect("file list should contain sanitized locations");
+    let uris = locations
+        .iter()
+        .map(|location| {
+            location
+                .uri_value()
+                .expect("remote location should have a URI")
+                .trim_end_matches('/')
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        uris,
+        [
+            "smb://user@host/share",
+            "smb://user@host/share",
+            "sftp://user@host/home/user/video.mp4",
+        ]
     );
 }
 

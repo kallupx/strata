@@ -861,6 +861,12 @@ fn location_input_rejects_uris_with_an_embedded_password() {
 
     for uri in [
         "smb://user:secret@host/share",
+        "smb://user%3Asecret@host/share",
+        "smb://user:sec%72et@host/share",
+        "smb://user;password=secret@host/share",
+        "smb://user%3Bpassword=secret@host/share",
+        "smb://user%3Bpassword%3Dsecret@host/share",
+        "smb://user;password=sec%72et@host/share",
         "sftp://user:secret@host:2222/path",
     ] {
         assert_eq!(
@@ -869,6 +875,12 @@ fn location_input_rejects_uris_with_an_embedded_password() {
         );
         assert_eq!(browser.active_location(), Some(Location::local("/fixture")));
     }
+
+    assert_eq!(
+        browser.navigate_input("smb://user%ZZ@host/share"),
+        Err(LocationValidationError::InvalidUri)
+    );
+    assert_eq!(browser.active_location(), Some(Location::local("/fixture")));
 
     assert_eq!(
         browser.navigate_input("smb://user@host/share"),

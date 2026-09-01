@@ -1,35 +1,81 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use super::{backend_unavailable_message, uri_has_embedded_password};
+use super::{
+    LocationValidationError, UriCredentials, backend_unavailable_message, sanitize_uri_credentials,
+    validate_uri_credentials,
+};
 
 #[test]
-fn embedded_passwords_are_detected_in_the_uri_authority() {
+fn embedded_uri_credentials_are_rejected() {
     for uri in [
         "smb://user:secret@host/share",
+        "smb://user%3Asecret@host/share",
+        "smb://user:sec%72et@host/share",
+        "smb://user:@host/share",
+        "smb://user;password=secret@host/share",
+        "smb://user%3Bpassword=secret@host/share",
+        "smb://user%3Bpassword%3Dsecret@host/share",
+        "smb://user;password=sec%72et@host/share",
+        "smb://user;@host/share",
         "sftp://user:secret@host:2222/path",
         "ftp://user:secret@host/public",
     ] {
-        assert!(
-            uri_has_embedded_password(uri),
-            "{uri:?} should be flagged as carrying a password"
+        assert_eq!(
+            validate_uri_credentials(uri),
+            Err(LocationValidationError::EmbeddedCredential),
+            "{uri:?} should be rejected"
         );
     }
 }
 
 #[test]
-fn uris_without_an_embedded_password_are_not_flagged() {
+fn embedded_uri_credentials_are_separated_from_the_sanitized_uri() {
+    for uri in [
+        "smb://user:secret@host/share",
+        "smb://user%3Asecret@host/share",
+        "smb://user;password=secret@host/share",
+        "smb://user%3Bpassword=secret@host/share",
+    ] {
+        assert_eq!(
+            sanitize_uri_credentials(uri),
+            Ok((
+                "smb://user@host/share".to_owned(),
+                Some(UriCredentials {
+                    username: "user".to_owned(),
+                    password: "secret".to_owned(),
+                }),
+            )),
+            "did not separate {uri:?}"
+        );
+    }
+}
+
+#[test]
+fn credential_free_uris_are_accepted() {
     for uri in [
         "smb://host/share",
         "smb://user@host/share",
         "sftp://user@host:2222/path",
         "network:///",
-        "/regular/absolute/path",
     ] {
-        assert!(
-            !uri_has_embedded_password(uri),
-            "{uri:?} should not be flagged"
+        assert_eq!(
+            validate_uri_credentials(uri),
+            Ok(()),
+            "{uri:?} should be safe"
         );
     }
+}
+
+#[test]
+fn malformed_uris_fail_without_echoing_input() {
+    assert_eq!(
+        validate_uri_credentials("smb://user%ZZ@host/share"),
+        Err(LocationValidationError::InvalidUri)
+    );
+    assert_eq!(
+        LocationValidationError::InvalidUri.to_string(),
+        "Enter a valid URI."
+    );
 }
 
 #[test]

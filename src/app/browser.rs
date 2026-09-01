@@ -16,7 +16,7 @@ use crate::{
         DirectoryChange, DirectoryEvent, DirectoryRequest, ExtractRequest, FileSource, LoadHandle,
         LocationValidationError, OperationEvent, OperationProvider, OperationRequestId, PasteItem,
         PasteRequest, RenameRequest, RequestId, RestoreRequest, TransferConflict,
-        uri_has_embedded_password, validate_basename,
+        validate_basename, validate_uri_credentials,
     },
 };
 
@@ -226,9 +226,6 @@ impl Browser {
             return Err(LocationValidationError::UnsupportedShorthand(
                 message.to_owned(),
             ));
-        }
-        if uri_has_embedded_password(input) {
-            return Err(LocationValidationError::EmbeddedCredential);
         }
         if let Some(current) = self
             .active_location()
@@ -1599,6 +1596,7 @@ fn location_from_input(input: &str) -> Result<Location, LocationValidationError>
              smb://, sftp://, ftp://, ftps://, dav://, or davs://."
         )));
     }
+    validate_uri_credentials(input)?;
     let uri = format!("{normalized}{}", &input[scheme_end..]);
     Ok(Location::uri(uri))
 }

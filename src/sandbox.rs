@@ -374,6 +374,10 @@ fn sandbox_command(
         }
         command.args(["--ro-bind", "/sys", "/sys"]);
     }
+    if operation != ParseOperation::PreviewMedia {
+        // Keep CPU-scaled glibc arenas within the helper's address-space limit.
+        command.args(["--setenv", "MALLOC_ARENA_MAX", "1"]);
+    }
     command.arg("--");
     if operation != ParseOperation::PreviewMedia {
         command

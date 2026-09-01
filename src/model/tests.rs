@@ -77,6 +77,28 @@ fn diagnostic_paths_preserve_native_paths_and_redact_remote_secrets() {
 }
 
 #[test]
+fn display_paths_hide_remote_credentials_but_preserve_usernames() {
+    for uri in [
+        "smb://alice:secret@host/share",
+        "smb://alice%3Asecret@host/share",
+        "smb://alice:sec%72et@host/share",
+        "smb://alice;password=secret@host/share",
+        "smb://alice%3Bpassword=secret@host/share",
+        "smb://alice;password=sec%72et@host/share",
+    ] {
+        assert_eq!(Location::uri(uri).display_path(), "smb://host/share");
+    }
+    assert_eq!(
+        Location::uri("smb://alice@host/share").display_path(),
+        "smb://alice@host/share"
+    );
+    assert_eq!(
+        Location::uri("smb://alice%ZZ@host/share").display_path(),
+        "<invalid-uri>"
+    );
+}
+
+#[test]
 fn root_has_one_breadcrumb() {
     assert_eq!(
         Location::local("/").breadcrumbs(),
