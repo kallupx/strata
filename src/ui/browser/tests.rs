@@ -531,6 +531,28 @@ fn cut_clipboard_locations_match_regardless_of_order() {
         &[Location::local("/fixture/first")],
         &[Location::local("/fixture/other")]
     ));
+    assert!(!same_locations(
+        &[
+            Location::local("/fixture/first"),
+            Location::local("/fixture/first")
+        ],
+        &[
+            Location::local("/fixture/first"),
+            Location::local("/fixture/second")
+        ]
+    ));
+}
+
+#[test]
+fn completed_moves_are_removed_from_the_cut_list() {
+    let first = Location::local("/fixture/first");
+    let second = Location::local("/fixture/second");
+    let third = Location::local("/fixture/third");
+    let mut cut = vec![first.clone(), second.clone(), third.clone()];
+
+    retain_untransferred(&mut cut, &[first, third]);
+
+    assert_eq!(cut, vec![second]);
 }
 
 #[test]

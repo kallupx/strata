@@ -2,6 +2,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashSet,
     future::Future,
     path::Path,
     pin::Pin,
@@ -1215,9 +1216,7 @@ impl ViewState {
     }
 
     fn complete_cut_transfer(&self, transferred: &[Location]) {
-        self.cut_locations
-            .borrow_mut()
-            .retain(|location| !transferred.contains(location));
+        retain_untransferred(&mut self.cut_locations.borrow_mut(), transferred);
         let remaining = self.cut_locations.borrow().clone();
         if remaining.is_empty() {
             if let Some(display) = gtk::gdk::Display::default() {
@@ -6360,9 +6359,17 @@ fn new_folder_destination_depth(
 }
 
 fn same_locations(left: &[Location], right: &[Location]) -> bool {
-    !left.is_empty()
-        && left.len() == right.len()
-        && left.iter().all(|location| right.contains(location))
+    if left.is_empty() || left.len() != right.len() {
+        return false;
+    }
+    let left: HashSet<_> = left.iter().collect();
+    let right: HashSet<_> = right.iter().collect();
+    left.len() == right.len() && left == right
+}
+
+fn retain_untransferred(cut: &mut Vec<Location>, transferred: &[Location]) {
+    let transferred: HashSet<_> = transferred.iter().collect();
+    cut.retain(|location| !transferred.contains(location));
 }
 
 fn item_context_option(icon: &str, label: &str, accelerator: &str) -> gtk::Button {
