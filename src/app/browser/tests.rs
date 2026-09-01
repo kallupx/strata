@@ -623,11 +623,21 @@ fn hidden_file_preference_is_applied_to_reloaded_requests() {
     let browser = Browser::new(Rc::new(RecordingFileSource {
         include_hidden: include_hidden.clone(),
     }));
+    let observed_preferences = Rc::new(Cell::new(None));
+    let observed = observed_preferences.clone();
+    browser.observe_preferences(move |preferences| observed.set(Some(preferences)));
 
     browser.navigate(Location::local("/fixture"));
     browser.toggle_hidden();
 
     assert_eq!(*include_hidden.borrow(), vec![false, true]);
+    assert_eq!(
+        observed_preferences.get(),
+        Some(ViewPreferences {
+            show_hidden: true,
+            ..ViewPreferences::default()
+        })
+    );
 }
 
 #[test]

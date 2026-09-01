@@ -762,6 +762,7 @@ fn build_appearance_menu(
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     append_menu_heading(&content, "DENSITY");
     let current_density = preferences.browser_density();
+    let hidden_files_shown = preferences.sort_preferences().show_hidden;
     let (compact, compact_check, _) = appearance_option(
         crate::assets::icons::ROWS,
         "Compact",
@@ -799,22 +800,31 @@ fn build_appearance_menu(
     content.append(&airy);
 
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    let (hidden, hidden_check, hidden_icon) =
-        appearance_option(crate::assets::icons::EYE_OFF, "Hidden files", false, true);
-    let hidden_state = Rc::new(Cell::new(false));
-    let weak_controller = Rc::downgrade(controller);
-    hidden.connect_clicked(move |_| {
-        let shown = !hidden_state.get();
-        hidden_state.set(shown);
-        hidden_check.set_visible(shown);
+    let (hidden, hidden_check, hidden_icon) = appearance_option(
+        if hidden_files_shown {
+            crate::assets::icons::EYE
+        } else {
+            crate::assets::icons::EYE_OFF
+        },
+        "Hidden files",
+        hidden_files_shown,
+        true,
+    );
+    let observed_hidden_check = hidden_check.clone();
+    let observed_hidden_icon = hidden_icon.clone();
+    controller.observe_preferences(move |preferences| {
+        observed_hidden_check.set_visible(preferences.show_hidden);
         crate::assets::set_primary_icon(
-            &hidden_icon,
-            if shown {
+            &observed_hidden_icon,
+            if preferences.show_hidden {
                 crate::assets::icons::EYE
             } else {
                 crate::assets::icons::EYE_OFF
             },
         );
+    });
+    let weak_controller = Rc::downgrade(controller);
+    hidden.connect_clicked(move |_| {
         if let Some(controller) = weak_controller.upgrade() {
             controller.toggle_hidden();
         }

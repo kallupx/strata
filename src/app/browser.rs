@@ -206,6 +206,13 @@ impl Browser {
             .push(Rc::new(observer));
     }
 
+    fn notify_preferences_observers(&self) {
+        let preferences = self.preferences.get();
+        for observer in self.preferences_observers.borrow().iter() {
+            observer(preferences);
+        }
+    }
+
     pub fn set_operation_provider(&self, provider: Rc<dyn OperationProvider>) {
         self.operation_provider.replace(Some(provider));
     }
@@ -525,6 +532,7 @@ impl Browser {
         let mut preferences = self.preferences.get();
         preferences.show_hidden = !preferences.show_hidden;
         self.preferences.set(preferences);
+        self.notify_preferences_observers();
 
         let locations = {
             let mut state = self.state.borrow_mut();
@@ -583,10 +591,7 @@ impl Browser {
                 browser.preferences.set(preferences);
                 result
             };
-            let preferences = browser.preferences.get();
-            for observer in browser.preferences_observers.borrow().iter() {
-                observer(preferences);
-            }
+            browser.notify_preferences_observers();
             if let Some((entries, focused, positions)) = result {
                 browser.emit(BrowserEvent::EntriesReplaced { depth, entries });
                 if let Some(focused) = focused {
