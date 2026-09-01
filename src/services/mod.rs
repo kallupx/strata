@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+mod document;
 mod file_source;
 mod operations;
 mod preview;
@@ -8,6 +9,7 @@ mod search;
 mod update_check;
 mod update_install;
 
+pub(crate) use document::{DocumentBlock, parse_markdown};
 pub use file_source::{
     DirectoryChange, DirectoryEvent, DirectoryRequest, FileSource, LoadHandle,
     LocationValidationError, RequestId, UriCredentials, backend_unavailable_message,
@@ -30,7 +32,6 @@ pub(crate) use preview::{content_family, has_plain_text_extension};
 pub(crate) use release_channel::{BuildKind, Channel, Version};
 pub(crate) use search::{SearchEvent, SearchHandle, SearchItem, index_tree};
 pub(crate) use update_check::{
-    ReleaseMetadata, ReleaseNoteBlock, ReleaseNotes, UpdateCheck, check_for_updates,
-    fetch_release_notes,
+    ReleaseMetadata, ReleaseNotes, UpdateCheck, check_for_updates, fetch_release_notes,
 };
 pub(crate) use update_install::{InstallRequest, UpdateInstall, install_update};

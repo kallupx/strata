@@ -12,7 +12,7 @@ use gtk::{gdk, glib, prelude::*, subclass::prelude::*};
 use crate::{
     assets::icons,
     services::{
-        self, BuildKind, Channel, InstallRequest, ReleaseMetadata, ReleaseNoteBlock, ReleaseNotes,
+        self, BuildKind, Channel, DocumentBlock, InstallRequest, ReleaseMetadata, ReleaseNotes,
         UpdateCheck, UpdateInstall, Version,
     },
 };
@@ -570,23 +570,23 @@ fn set_release_notes_message(notes: &gtk::Box, message: &str) {
     notes.append(&label);
 }
 
-fn set_release_note_blocks(notes: &gtk::Box, blocks: &[ReleaseNoteBlock]) {
+fn set_release_note_blocks(notes: &gtk::Box, blocks: &[DocumentBlock]) {
     clear_release_notes(notes);
     for block in blocks {
         match block {
-            ReleaseNoteBlock::Heading { level, markup } => {
+            DocumentBlock::Heading { level, markup } => {
                 let label = release_notes_label();
                 label.add_css_class("release-notes-heading");
                 label.add_css_class(&format!("level-{level}"));
                 label.set_markup(markup);
                 notes.append(&label);
             }
-            ReleaseNoteBlock::Paragraph(markup) => {
+            DocumentBlock::Paragraph(markup) => {
                 let label = release_notes_label();
                 label.set_markup(markup);
                 notes.append(&label);
             }
-            ReleaseNoteBlock::ListItem {
+            DocumentBlock::ListItem {
                 marker,
                 depth,
                 markup,
@@ -603,17 +603,18 @@ fn set_release_note_blocks(notes: &gtk::Box, blocks: &[ReleaseNoteBlock]) {
                 row.append(&copy);
                 notes.append(&row);
             }
-            ReleaseNoteBlock::Code(markup) => {
+            DocumentBlock::Code(markup) => {
                 let label = release_notes_label();
                 label.add_css_class("release-notes-code");
                 label.set_markup(&format!("<tt>{markup}</tt>"));
                 notes.append(&label);
             }
-            ReleaseNoteBlock::Rule => {
+            DocumentBlock::Rule => {
                 let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
                 separator.add_css_class("release-notes-rule");
                 notes.append(&separator);
             }
+            DocumentBlock::Quote(_) | DocumentBlock::TableRow { .. } => {}
         }
     }
 }
