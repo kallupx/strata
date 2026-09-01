@@ -1285,7 +1285,7 @@ impl ViewState {
             };
             let sources = files
                 .into_iter()
-                .map(|file| location_for_file(&file))
+                .filter_map(|file| location_for_file(&file))
                 .collect::<Vec<_>>();
             if let Some(state) = weak.upgrade() {
                 let move_sources = same_locations(&sources, &state.cut_locations.borrow());
@@ -6058,13 +6058,9 @@ pub(super) fn locations_from_file_list_value(value: &glib::Value) -> Option<Vec<
     let locations = files
         .files()
         .iter()
-        .map(location_for_gio_file)
+        .filter_map(location_for_file)
         .collect::<Vec<_>>();
     (!locations.is_empty()).then_some(locations)
-}
-
-pub(super) fn location_for_gio_file(file: &gio::File) -> Location {
-    location_for_file(file)
 }
 
 pub(super) fn file_drag_content(entries: &[FileEntry]) -> Option<gtk::gdk::ContentProvider> {

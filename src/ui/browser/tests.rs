@@ -254,6 +254,20 @@ fn incoming_file_lists_preserve_local_and_remote_locations() {
 }
 
 #[test]
+fn incoming_file_lists_omit_remote_credentials() {
+    let files = gtk::gdk::FileList::from_array(&[
+        gio::File::for_uri("smb://user%3Asecret@host/share"),
+        gio::File::for_uri("smb://user%3Bpassword=secret@host/share"),
+        gio::File::for_uri("sftp://user@host/home/user/video.mp4"),
+    ]);
+
+    assert_eq!(
+        locations_from_file_list_value(&files.to_value()),
+        Some(vec![Location::uri("sftp://user@host/home/user/video.mp4")])
+    );
+}
+
+#[test]
 fn local_file_drops_prefer_move_while_external_drops_prefer_copy() {
     let both = gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE;
 

@@ -14,6 +14,7 @@ use crate::{
     adapters::{LocalFileSource, LocalOperationProvider, LocalPreviewProvider, location_for_file},
     app::{Browser, BrowserEvent},
     model::{EntryKind, FileEntry, Location, MetadataValue},
+    services::validate_uri_credentials,
 };
 
 use super::{
@@ -965,10 +966,10 @@ impl SidebarState {
             .mounts()
             .into_iter()
             .filter(|mount| !mount.is_shadowed() && mount.volume().is_none())
-            .map(|mount| {
+            .filter_map(|mount| {
                 let name = mount.name().to_string();
-                let location = location_for_file(&mount.root());
-                (name, location, mount)
+                let location = location_for_file(&mount.root())?;
+                Some((name, location, mount))
             })
             .collect();
         if !volumes.is_empty() || !mounts.is_empty() {
@@ -1187,8 +1188,9 @@ impl SidebarState {
         let name = volume.name().to_string();
         let row = sidebar_button(crate::assets::icons::HARD_DRIVE, &name);
         row.set_tooltip_text(Some(&name));
-        if let Some(mount) = volume.get_mount() {
-            let location = location_for_file(&mount.root());
+        if let Some(mount) = volume.get_mount()
+            && let Some(location) = location_for_file(&mount.root())
+        {
             self.place_rows.borrow_mut().push((location, row.clone()));
         }
         let weak_browser = Rc::downgrade(&self.browser);
@@ -1517,7 +1519,9 @@ fn sidebar_button(icon: &str, name: &str) -> gtk::Button {
 }
 
 fn navigate_to_gio_file(browser: &Rc<Browser>, file: &gio::File) {
-    browser.navigate(location_for_file(file));
+    if let Some(location) = location_for_file(file) {
+        browser.navigate(location);
+    }
 }
 
 fn build_sidebar(view: BrowserView) -> SidebarView {
@@ -1649,11 +1653,13 @@ fn parse_pinned_places(contents: &str) -> Vec<(Location, String)> {
         let (uri, label) = line
             .split_once(' ')
             .map_or((line, None), |(uri, label)| (uri, Some(label)));
-        if uri.is_empty() {
+        if uri.is_empty() || validate_uri_credentials(uri).is_err() {
             continue;
         }
         let file = gio::File::for_uri(uri);
-        let location = location_for_file(&file);
+        let Some(location) = location_for_file(&file) else {
+            continue;
+        };
         if places
             .iter()
             .any(|(existing, _): &(Location, String)| existing == &location)
@@ -1677,6 +1683,11 @@ fn save_pinned_places(places: &[(Location, String)]) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
+    let contents = serialize_pinned_places(places);
+    let _result = crate::storage::atomic_write(&path, contents.as_bytes());
+}
+
+fn serialize_pinned_places(places: &[(Location, String)]) -> String {
     let mut contents = String::new();
     for (location, name) in places {
         let uri = location
@@ -1684,12 +1695,13 @@ fn save_pinned_places(places: &[(Location, String)]) {
             .map(gio::File::for_path)
             .map(|file| file.uri().to_string())
             .or_else(|| location.uri_value().map(str::to_owned));
-        if let Some(uri) = uri {
-            let label = name.replace(['\n', '\r'], " ");
-            contents.push_str(&format!("{uri} {label}\n"));
-        }
+        let Some(uri) = uri.filter(|uri| validate_uri_credentials(uri).is_ok()) else {
+            continue;
+        };
+        let label = name.replace(['\n', '\r'], " ");
+        contents.push_str(&format!("{uri} {label}\n"));
     }
-    let _result = crate::storage::atomic_write(&path, contents.as_bytes());
+    contents
 }
 
 fn home_directory() -> PathBuf {

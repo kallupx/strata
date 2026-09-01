@@ -15,7 +15,7 @@ use crate::{
     model::{EntryKind, FileEntry, Location, MetadataValue},
     services::{
         DirectoryChange, DirectoryEvent, DirectoryRequest, FileSource, LoadHandle,
-        LocationValidationError, RequestId, backend_unavailable_message,
+        LocationValidationError, RequestId, backend_unavailable_message, validate_uri_credentials,
     },
 };
 
@@ -45,13 +45,16 @@ fn map_validation_error(error: std::io::Error) -> LocationValidationError {
 /// SFTP, ...) can still return a `.path()` via its FUSE mirror even though the
 /// file isn't native; using that path would leak the mirror's opaque
 /// `/run/user/$UID/gvfs/...` location instead of the clean URI (lgse/strata#5).
-pub(crate) fn location_for_file(file: &gio::File) -> Location {
+/// Returns `None` when GIO preserves embedded credentials in that URI.
+pub(crate) fn location_for_file(file: &gio::File) -> Option<Location> {
     if file.is_native()
         && let Some(path) = file.path()
     {
-        return Location::local(path);
+        return Some(Location::local(path));
     }
-    Location::uri(file.uri())
+    let uri = file.uri();
+    validate_uri_credentials(&uri).ok()?;
+    Some(Location::uri(uri))
 }
 
 fn uri_validation_result(
@@ -227,9 +230,9 @@ impl FileSource for LocalFileSource {
                         let entries: Vec<_> = files
                             .into_iter()
                             .filter(|info| request.include_hidden || !info_is_hidden(info))
-                            .map(|info| {
+                            .filter_map(|info| {
                                 let child = directory.child(info.name());
-                                entry_from_info(location_for_file(&child), info)
+                                Some(entry_from_info(location_for_file(&child)?, info))
                             })
                             .collect();
                         total_entries += entries.len();

@@ -5,7 +5,7 @@ mod tests;
 
 use std::{fmt, rc::Rc};
 
-use crate::model::{FileEntry, Location};
+use crate::model::{FileEntry, Location, uri_contains_credentials};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RequestId(pub u64);
@@ -21,6 +21,7 @@ pub struct DirectoryRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocationValidationError {
     Empty,
+    InvalidUri,
     NotAbsolute,
     Missing,
     NotDirectory,
@@ -38,6 +39,7 @@ impl fmt::Display for LocationValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => formatter.write_str("Enter a location."),
+            Self::InvalidUri => formatter.write_str("Enter a valid URI."),
             Self::NotAbsolute => formatter.write_str("Enter an absolute path."),
             Self::Missing => formatter.write_str("That location does not exist."),
             Self::NotDirectory => formatter.write_str("That location is not a directory."),
@@ -86,21 +88,18 @@ pub fn backend_unavailable_message(uri: &str) -> String {
     }
 }
 
-/// Detects a `user:password@host` (or `user:password@host:port`) userinfo
-/// segment in a URI's authority. Per lgse/strata#20, a URI typed with an
-/// embedded password must never be accepted, stored, or echoed back.
-pub fn uri_has_embedded_password(uri: &str) -> bool {
-    let Some(after_scheme) = uri.split_once("://").map(|(_, rest)| rest) else {
-        return false;
-    };
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    let Some((userinfo, _host)) = authority.rsplit_once('@') else {
-        return false;
-    };
-    userinfo.contains(':')
+/// Rejects URI password and authentication-parameter fields, including encoded delimiters.
+pub fn validate_uri_credentials(uri: &str) -> Result<(), LocationValidationError> {
+    let uri = glib::Uri::parse(
+        uri,
+        glib::UriFlags::HAS_PASSWORD | glib::UriFlags::HAS_AUTH_PARAMS,
+    )
+    .map_err(|_| LocationValidationError::InvalidUri)?;
+    if uri_contains_credentials(&uri) {
+        Err(LocationValidationError::EmbeddedCredential)
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
