@@ -159,6 +159,14 @@ impl<'a> ParseBudget<'a> {
     fn leave(&mut self) {
         self.depth = self.depth.saturating_sub(1);
     }
+
+    fn nesting(&mut self, depth: usize) -> Result<(), String> {
+        self.depth = depth;
+        if self.depth > self.limits.depth {
+            return Err("Rendered preview exceeded the nesting-depth limit of 32".to_owned());
+        }
+        Ok(())
+    }
 }
 
 pub fn document_kind(content_type: &str, name: &OsStr, is_native: bool) -> Option<DocumentKind> {
@@ -448,9 +456,10 @@ struct HtmlState {
     blocks: Vec<DocumentBlock>,
     active: Option<ActiveBlock>,
     lists: Vec<Option<u64>>,
-    links: Vec<bool>,
+    links: Vec<Option<String>>,
     stack: Vec<String>,
     skipped_depth: usize,
+    quote_depth: usize,
     table_header: bool,
     table_row: Option<Vec<String>>,
     table_cell: Option<String>,
@@ -468,6 +477,7 @@ impl HtmlState {
             links: Vec::new(),
             stack: Vec::new(),
             skipped_depth: 0,
+            quote_depth: 0,
             table_header: false,
             table_row: None,
             table_cell: None,
@@ -486,6 +496,8 @@ impl HtmlState {
             }
             return;
         }
+
+        self.close_implied_before_start(name);
         if is_omitted_html_tag(name) {
             self.warned = true;
             if !void {
@@ -497,27 +509,40 @@ impl HtmlState {
 
         match name {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                finish_block(&mut self.active, &mut self.blocks);
-                self.active = Some(ActiveBlock::Heading {
+                self.finish_active();
+                self.start_active(ActiveBlock::Heading {
                     level: name[1..].parse().unwrap_or(6),
                     markup: String::new(),
                 });
             }
             "p" => {
-                finish_block(&mut self.active, &mut self.blocks);
-                self.active = Some(ActiveBlock::Paragraph(String::new()));
+                self.finish_active();
+                self.start_active(if self.quote_depth > 0 {
+                    ActiveBlock::Quote(String::new())
+                } else {
+                    ActiveBlock::Paragraph(String::new())
+                });
             }
             "blockquote" => {
-                finish_block(&mut self.active, &mut self.blocks);
-                self.active = Some(ActiveBlock::Quote(String::new()));
+                self.finish_active();
+                self.quote_depth = self.quote_depth.saturating_add(1);
+                self.start_active(ActiveBlock::Quote(String::new()));
             }
-            "ul" => self.lists.push(None),
-            "ol" => self.lists.push(Some(1)),
+            "ul" => {
+                self.finish_active();
+                self.lists.push(None);
+            }
+            "ol" => {
+                self.finish_active();
+                self.lists.push(Some(1));
+            }
             "li" => {
-                finish_block(&mut self.active, &mut self.blocks);
-                self.active = Some(ActiveBlock::ListItem {
-                    marker: next_list_marker(&mut self.lists),
-                    depth: self.lists.len().saturating_sub(1),
+                self.finish_active();
+                let marker = next_list_marker(&mut self.lists);
+                let depth = self.lists.len().saturating_sub(1);
+                self.start_active(ActiveBlock::ListItem {
+                    marker,
+                    depth,
                     markup: String::new(),
                 });
             }
@@ -525,42 +550,45 @@ impl HtmlState {
             "strong" | "b" => append_markup(&mut self.active, &mut self.table_cell, "<b>"),
             "s" | "del" => append_markup(&mut self.active, &mut self.table_cell, "<s>"),
             "a" => {
-                let external = href.is_some_and(has_web_scheme);
-                self.links.push(external);
-                if external {
-                    append_markup(&mut self.active, &mut self.table_cell, "<a href=\"");
-                    append_escaped(
-                        &mut self.active,
-                        &mut self.table_cell,
-                        href.unwrap_or_default(),
-                    );
-                    append_markup(&mut self.active, &mut self.table_cell, "\">");
-                } else {
-                    if href.is_some() {
-                        self.warned = true;
-                    }
-                    append_markup(&mut self.active, &mut self.table_cell, "<u>");
+                self.ensure_text_target();
+                let destination = href.filter(|href| has_web_scheme(href)).map(str::to_owned);
+                if href.is_some() && destination.is_none() {
+                    self.warned = true;
                 }
+                append_link_open(
+                    &mut self.active,
+                    &mut self.table_cell,
+                    destination.as_deref(),
+                );
+                self.links.push(destination);
             }
             "pre" => {
-                finish_block(&mut self.active, &mut self.blocks);
-                self.active = Some(ActiveBlock::Code(String::new()));
+                self.finish_active();
+                self.start_active(ActiveBlock::Code(String::new()));
                 self.preformatted = true;
             }
             "code" if !self.preformatted => {
                 append_markup(&mut self.active, &mut self.table_cell, "<tt>");
             }
             "hr" => {
-                finish_block(&mut self.active, &mut self.blocks);
+                self.finish_active();
                 self.blocks.push(DocumentBlock::Rule);
             }
-            "br" => append_markup(&mut self.active, &mut self.table_cell, "\n"),
-            "table" => finish_block(&mut self.active, &mut self.blocks),
+            "br" => {
+                self.ensure_text_target();
+                append_markup(&mut self.active, &mut self.table_cell, "\n");
+            }
+            "table" => self.finish_active(),
             "thead" => self.table_header = true,
             "tr" => self.table_row = Some(Vec::new()),
-            "th" | "td" => self.table_cell = Some(String::new()),
-            "html" | "body" | "main" | "article" | "section" | "header" | "footer" | "nav"
-            | "aside" | "div" | "span" | "tbody" => {}
+            "th" | "td" => {
+                self.table_cell = Some(String::new());
+                self.append_link_openings();
+            }
+            "main" | "article" | "section" | "header" | "footer" | "nav" | "aside" | "div" => {
+                self.finish_active();
+            }
+            "html" | "body" | "span" | "tbody" => {}
             _ => self.warned = true,
         }
 
@@ -572,46 +600,40 @@ impl HtmlState {
     }
 
     fn end(&mut self, name: &str) {
-        let Some(open) = self.stack.pop() else {
+        let Some(position) = self.stack.iter().rposition(|open| open == name) else {
             self.malformed = true;
             return;
         };
-        if open != name {
-            self.malformed = true;
-            return;
+        while self.stack.len() > position {
+            self.close_top();
         }
-        if self.skipped_depth > 0 {
-            self.skipped_depth -= 1;
-            return;
-        }
-        self.end_supported(name);
     }
 
     fn end_supported(&mut self, name: &str) {
         match name {
-            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "p" | "blockquote" | "li" => {
-                finish_block(&mut self.active, &mut self.blocks);
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "p" | "li" => {
+                self.finish_active();
+            }
+            "blockquote" => {
+                self.finish_active();
+                self.quote_depth = self.quote_depth.saturating_sub(1);
             }
             "ul" | "ol" => {
                 if matches!(self.active, Some(ActiveBlock::ListItem { .. })) {
-                    finish_block(&mut self.active, &mut self.blocks);
+                    self.finish_active();
                 }
                 self.lists.pop();
             }
             "em" | "i" => append_markup(&mut self.active, &mut self.table_cell, "</i>"),
             "strong" | "b" => append_markup(&mut self.active, &mut self.table_cell, "</b>"),
             "s" | "del" => append_markup(&mut self.active, &mut self.table_cell, "</s>"),
-            "a" => append_markup(
-                &mut self.active,
-                &mut self.table_cell,
-                if self.links.pop().unwrap_or(false) {
-                    "</a>"
-                } else {
-                    "</u>"
-                },
-            ),
+            "a" => {
+                if let Some(link) = self.links.pop() {
+                    append_link_close(&mut self.active, &mut self.table_cell, link.is_some());
+                }
+            }
             "pre" => {
-                finish_block(&mut self.active, &mut self.blocks);
+                self.finish_active();
                 self.preformatted = false;
             }
             "code" if !self.preformatted => {
@@ -627,9 +649,13 @@ impl HtmlState {
                 }
             }
             "th" | "td" => {
+                self.append_link_closings();
                 if let Some(cell) = self.table_cell.take() {
                     self.table_row.get_or_insert_with(Vec::new).push(cell);
                 }
+            }
+            "main" | "article" | "section" | "header" | "footer" | "nav" | "aside" | "div" => {
+                self.finish_active();
             }
             _ => {}
         }
@@ -639,7 +665,71 @@ impl HtmlState {
         if self.skipped_depth > 0 || (self.active.is_none() && text.trim().is_empty()) {
             return;
         }
+        self.ensure_text_target();
         append_escaped(&mut self.active, &mut self.table_cell, text);
+    }
+
+    fn start_active(&mut self, active: ActiveBlock) {
+        self.active = Some(active);
+        self.append_link_openings();
+    }
+
+    fn ensure_text_target(&mut self) {
+        if self.active.is_none() && self.table_cell.is_none() {
+            self.start_active(if self.quote_depth > 0 {
+                ActiveBlock::Quote(String::new())
+            } else {
+                ActiveBlock::Paragraph(String::new())
+            });
+        }
+    }
+
+    fn finish_active(&mut self) {
+        if self.active.is_some() {
+            self.append_link_closings();
+            finish_block(&mut self.active, &mut self.blocks);
+        }
+    }
+
+    fn append_link_openings(&mut self) {
+        for link in self.links.clone() {
+            append_link_open(&mut self.active, &mut self.table_cell, link.as_deref());
+        }
+    }
+
+    fn append_link_closings(&mut self) {
+        for link in self.links.iter().rev() {
+            append_link_close(&mut self.active, &mut self.table_cell, link.is_some());
+        }
+    }
+
+    fn close_top(&mut self) {
+        let Some(open) = self.stack.pop() else {
+            return;
+        };
+        if self.skipped_depth > 0 {
+            self.skipped_depth -= 1;
+        } else {
+            self.end_supported(&open);
+        }
+    }
+
+    fn close_implied_before_start(&mut self, incoming: &str) {
+        while self
+            .stack
+            .last()
+            .is_some_and(|open| html_start_implies_end(open, incoming))
+        {
+            self.close_top();
+        }
+    }
+
+    fn finish(mut self) -> Self {
+        while !self.stack.is_empty() {
+            self.close_top();
+        }
+        self.finish_active();
+        self
     }
 }
 
@@ -658,9 +748,6 @@ fn parse_html_bounded(
         match token {
             Token::StartTag(tag) => {
                 let name = String::from_utf8_lossy(&tag.name).to_ascii_lowercase();
-                if !tag.self_closing && !is_void_html_tag(&name) {
-                    budget.enter()?;
-                }
                 let mut href = None;
                 for (attribute, value) in &tag.attributes {
                     let attribute = String::from_utf8_lossy(attribute).to_ascii_lowercase();
@@ -671,19 +758,20 @@ fn parse_html_bounded(
                     }
                 }
                 state.start(&name, href.as_deref(), tag.self_closing);
+                budget.nesting(state.stack.len())?;
             }
             Token::EndTag(tag) => {
                 let name = String::from_utf8_lossy(&tag.name).to_ascii_lowercase();
                 state.end(&name);
-                budget.leave();
+                budget.nesting(state.stack.len())?;
             }
             Token::String(text) => state.text(&String::from_utf8_lossy(&text.value)),
             Token::Error(_) => state.malformed = true,
             Token::Comment(_) | Token::Doctype(_) => {}
         }
     }
-    finish_block(&mut state.active, &mut state.blocks);
-    if state.malformed || !state.stack.is_empty() || state.skipped_depth > 0 {
+    let state = state.finish();
+    if state.malformed {
         return Err("Rendered preview is unavailable because the HTML is malformed".to_owned());
     }
     Ok(ParsedDocument {
@@ -726,7 +814,54 @@ fn validate_document(
     if markup > limits.markup {
         return Err("Rendered preview exceeded the 4 MB markup limit".to_owned());
     }
+    if parsed
+        .document
+        .blocks
+        .iter()
+        .any(|block| !block_has_balanced_markup(block))
+    {
+        return Err("Rendered preview contains unsupported document structure".to_owned());
+    }
     Ok(parsed)
+}
+
+fn block_has_balanced_markup(block: &DocumentBlock) -> bool {
+    match block {
+        DocumentBlock::Heading { markup, .. }
+        | DocumentBlock::Paragraph(markup)
+        | DocumentBlock::ListItem { markup, .. }
+        | DocumentBlock::Quote(markup)
+        | DocumentBlock::Code(markup) => has_balanced_markup(markup),
+        DocumentBlock::TableRow { cells, .. } => cells.iter().all(|cell| has_balanced_markup(cell)),
+        DocumentBlock::Rule => true,
+    }
+}
+
+fn has_balanced_markup(markup: &str) -> bool {
+    let mut tags = Vec::new();
+    let mut remaining = markup;
+    while let Some(start) = remaining.find('<') {
+        let Some(end) = remaining[start + 1..].find('>') else {
+            return false;
+        };
+        let tag = &remaining[start + 1..start + 1 + end];
+        if let Some(closing) = tag.strip_prefix('/') {
+            if tags.pop() != Some(closing) {
+                return false;
+            }
+        } else {
+            let name = if tag.starts_with("a href=\"") && tag.ends_with('"') {
+                "a"
+            } else if matches!(tag, "i" | "b" | "s" | "tt" | "u") {
+                tag
+            } else {
+                return false;
+            };
+            tags.push(name);
+        }
+        remaining = &remaining[start + end + 2..];
+    }
+    tags.is_empty()
 }
 
 fn block_markup_bytes(block: &DocumentBlock) -> usize {
@@ -808,6 +943,62 @@ fn append_markup(active: &mut Option<ActiveBlock>, cell: &mut Option<String>, ma
 
 fn append_escaped(active: &mut Option<ActiveBlock>, cell: &mut Option<String>, text: &str) {
     append_markup(active, cell, &glib::markup_escape_text(text));
+}
+
+fn append_link_open(
+    active: &mut Option<ActiveBlock>,
+    cell: &mut Option<String>,
+    destination: Option<&str>,
+) {
+    if let Some(destination) = destination {
+        append_markup(active, cell, "<a href=\"");
+        append_escaped(active, cell, destination);
+        append_markup(active, cell, "\">");
+    } else {
+        append_markup(active, cell, "<u>");
+    }
+}
+
+fn append_link_close(active: &mut Option<ActiveBlock>, cell: &mut Option<String>, external: bool) {
+    if active.is_some() || cell.is_some() {
+        append_markup(active, cell, if external { "</a>" } else { "</u>" });
+    }
+}
+
+fn html_start_implies_end(open: &str, incoming: &str) -> bool {
+    (open == "li" && incoming == "li")
+        || (matches!(open, "th" | "td") && matches!(incoming, "th" | "td" | "tr"))
+        || (open == "tr" && incoming == "tr")
+        || (matches!(open, "thead" | "tbody") && matches!(incoming, "thead" | "tbody" | "tfoot"))
+        || (open == "p"
+            && matches!(
+                incoming,
+                "address"
+                    | "article"
+                    | "aside"
+                    | "blockquote"
+                    | "div"
+                    | "dl"
+                    | "fieldset"
+                    | "footer"
+                    | "form"
+                    | "h1"
+                    | "h2"
+                    | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
+                    | "header"
+                    | "hr"
+                    | "menu"
+                    | "nav"
+                    | "ol"
+                    | "p"
+                    | "pre"
+                    | "section"
+                    | "table"
+                    | "ul"
+            ))
 }
 
 fn is_void_html_tag(name: &str) -> bool {

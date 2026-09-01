@@ -222,11 +222,97 @@ fn html_contentless_and_malformed_documents_fall_back_to_source() {
 
     let malformed = parse_document(
         DocumentKind::Html,
-        "<html><body><p>unfinished</body></html>",
+        "<p>text</span>",
         &Cancellation::default(),
     )
-    .expect_err("misnested HTML should fall back");
+    .expect_err("an unmatched end tag should fall back");
     assert!(malformed.contains("malformed"));
+}
+
+#[test]
+fn html_links_remain_balanced_when_they_contain_blocks() {
+    let blocks = parse_document(
+        DocumentKind::Html,
+        "<a href=\"https://e\">lead<h2>Title</h2>tail</a>",
+        &Cancellation::default(),
+    )
+    .expect("anchors may contain flow content")
+    .document
+    .blocks;
+    assert_eq!(
+        blocks,
+        vec![
+            DocumentBlock::Paragraph("<a href=\"https://e\">lead</a>".to_owned()),
+            DocumentBlock::Heading {
+                level: 2,
+                markup: "<a href=\"https://e\">Title</a>".to_owned(),
+            },
+            DocumentBlock::Paragraph("<a href=\"https://e\">tail</a>".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn html_never_publishes_unbalanced_pango_markup() {
+    assert!(
+        parse_document(
+            DocumentKind::Html,
+            "<em>lead<h2>Title</h2>tail</em>",
+            &Cancellation::default(),
+        )
+        .expect_err("invalid phrasing-content nesting must fall back safely")
+        .contains("unsupported document structure")
+    );
+}
+
+#[test]
+fn html_accepts_optional_end_tags_and_omitted_document_closures() {
+    let parsed = parse_document(
+        DocumentKind::Html,
+        "<p>Hello, <ul><li>one<li>two</ul>",
+        &Cancellation::default(),
+    )
+    .expect("optional paragraph and list-item end tags are valid");
+    assert_eq!(
+        parsed.document.blocks,
+        vec![
+            DocumentBlock::Paragraph("Hello, ".to_owned()),
+            DocumentBlock::ListItem {
+                marker: "•".to_owned(),
+                depth: 0,
+                markup: "one".to_owned(),
+            },
+            DocumentBlock::ListItem {
+                marker: "•".to_owned(),
+                depth: 0,
+                markup: "two".to_owned(),
+            },
+        ]
+    );
+
+    assert!(
+        parse_document(
+            DocumentKind::Html,
+            "<html><body><p>open document",
+            &Cancellation::default(),
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn html_paragraphs_inside_blockquotes_keep_quote_semantics() {
+    assert_eq!(
+        parse_document(
+            DocumentKind::Html,
+            "<blockquote><p>quote</p></blockquote>",
+            &Cancellation::default(),
+        )
+        .expect("normal blockquote markup should render")
+        .document
+        .blocks,
+        vec![DocumentBlock::Quote("quote".to_owned())]
+    );
 }
 
 #[test]

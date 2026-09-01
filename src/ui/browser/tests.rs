@@ -265,6 +265,12 @@ fn quick_preview_is_offered_only_for_supported_files() {
         "notes.txt",
         crate::model::EntryKind::FileSymbolicLink,
     )));
+    for name in ["notes.mdown", "notes.mkdn", "notes.mdwn", "page.xhtml"] {
+        assert!(
+            entry_supports_quick_preview(&entry(name, crate::model::EntryKind::File)),
+            "{name} should reach the preview provider"
+        );
+    }
     assert!(!entry_supports_quick_preview(&entry(
         "archive.zip",
         crate::model::EntryKind::File,
