@@ -22,6 +22,11 @@
 - Put module unit tests in an adjacent test module, such as `src/app/navigation/tests.rs`, and declare it from the implementation with `#[cfg(test)] mod tests;`.
 - Use the top-level `tests/` directory for integration tests that exercise the crate through its public API.
 
+## Comments
+
+- Prefer self-explanatory names and structure. Do not add comments that narrate obvious code or restate a test's setup, actions, or assertions.
+- Use concise comments for non-obvious intent, invariants, safety requirements, external constraints, workarounds, or surprising behavior.
+
 ## Icons
 
 - Add new interface icons only from the Lucide icon set.
