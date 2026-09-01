@@ -36,9 +36,17 @@ pub enum DocumentBlock {
         depth: usize,
         markup: String,
     },
-    ListContinuation {
+    ListChild {
         depth: usize,
+        kind: DocumentListChildKind,
         markup: String,
+    },
+    ListRule {
+        depth: usize,
+    },
+    ListTableRow {
+        depth: usize,
+        cells: Vec<DocumentTableCell>,
     },
     Quote(String),
     Code(String),
@@ -53,6 +61,14 @@ pub enum DocumentBlock {
 pub struct DocumentTableCell {
     pub header: bool,
     pub markup: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DocumentListChildKind {
+    Paragraph,
+    Heading(u8),
+    Quote,
+    Code,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,8 +115,9 @@ enum ActiveBlock {
         depth: usize,
         markup: String,
     },
-    ListContinuation {
+    ListChild {
         depth: usize,
+        kind: DocumentListChildKind,
         markup: String,
     },
     Quote(String),
@@ -113,7 +130,7 @@ impl ActiveBlock {
             Self::Heading { markup, .. }
             | Self::Paragraph(markup)
             | Self::ListItem { markup, .. }
-            | Self::ListContinuation { markup, .. }
+            | Self::ListChild { markup, .. }
             | Self::Quote(markup)
             | Self::Code(markup) => markup,
         }
@@ -124,7 +141,7 @@ impl ActiveBlock {
             Self::Heading { markup, .. }
             | Self::Paragraph(markup)
             | Self::ListItem { markup, .. }
-            | Self::ListContinuation { markup, .. }
+            | Self::ListChild { markup, .. }
             | Self::Quote(markup)
             | Self::Code(markup) => markup,
         }
@@ -263,11 +280,12 @@ fn parse_markdown_bounded(
     let mut active = None;
     let mut links = Vec::new();
     let mut lists = Vec::<Option<u64>>::new();
-    let mut list_parents = Vec::<Option<usize>>::new();
+    let mut list_items = Vec::<usize>::new();
     let mut quote_depth = 0usize;
     let mut table_header = false;
     let mut table_row: Option<Vec<DocumentTableCell>> = None;
     let mut table_cell: Option<String> = None;
+    let mut table_depth = None;
     let mut raw_html = false;
     let mut options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     if document_features {
@@ -281,16 +299,48 @@ fn parse_markdown_bounded(
         }
         match &event {
             Event::Start(Tag::Heading { level, .. }) => {
-                finish_block(&mut active, &mut blocks);
-                active = Some(ActiveBlock::Heading {
-                    level: heading_level(*level),
-                    markup: String::new(),
+                finish_parent_list_item(&mut active, &mut blocks);
+                let level = heading_level(*level);
+                active = Some(if let Some(depth) = list_items.last() {
+                    ActiveBlock::ListChild {
+                        depth: *depth,
+                        kind: DocumentListChildKind::Heading(level),
+                        markup: String::new(),
+                    }
+                } else {
+                    ActiveBlock::Heading {
+                        level,
+                        markup: String::new(),
+                    }
                 });
             }
             Event::End(TagEnd::Heading(_)) => finish_block(&mut active, &mut blocks),
             Event::Start(Tag::Paragraph) => {
+                let starts_another_list_paragraph = active.as_ref().is_some_and(|active| {
+                    matches!(
+                        active,
+                        ActiveBlock::ListItem { .. }
+                            | ActiveBlock::ListChild {
+                                kind: DocumentListChildKind::Paragraph,
+                                ..
+                            }
+                    ) && has_visible_markup(active.markup())
+                });
+                if starts_another_list_paragraph {
+                    finish_block(&mut active, &mut blocks);
+                }
                 if active.is_none() {
-                    active = Some(if quote_depth > 0 {
+                    active = Some(if let Some(depth) = list_items.last() {
+                        ActiveBlock::ListChild {
+                            depth: *depth,
+                            kind: if quote_depth > 0 {
+                                DocumentListChildKind::Quote
+                            } else {
+                                DocumentListChildKind::Paragraph
+                            },
+                            markup: String::new(),
+                        }
+                    } else if quote_depth > 0 {
                         ActiveBlock::Quote(String::new())
                     } else {
                         ActiveBlock::Paragraph(String::new())
@@ -300,16 +350,32 @@ fn parse_markdown_bounded(
             Event::End(TagEnd::Paragraph) => {
                 if matches!(
                     active,
-                    Some(ActiveBlock::Paragraph(_) | ActiveBlock::Quote(_))
+                    Some(
+                        ActiveBlock::Paragraph(_)
+                            | ActiveBlock::Quote(_)
+                            | ActiveBlock::ListChild {
+                                kind: DocumentListChildKind::Paragraph
+                                    | DocumentListChildKind::Quote,
+                                ..
+                            }
+                    )
                 ) {
                     finish_block(&mut active, &mut blocks);
                 }
             }
             Event::Start(Tag::BlockQuote(_)) => {
                 if document_features {
-                    finish_block(&mut active, &mut blocks);
+                    finish_parent_list_item(&mut active, &mut blocks);
                     quote_depth = quote_depth.saturating_add(1);
-                    active = Some(ActiveBlock::Quote(String::new()));
+                    active = Some(if let Some(depth) = list_items.last() {
+                        ActiveBlock::ListChild {
+                            depth: *depth,
+                            kind: DocumentListChildKind::Quote,
+                            markup: String::new(),
+                        }
+                    } else {
+                        ActiveBlock::Quote(String::new())
+                    });
                 }
             }
             Event::End(TagEnd::BlockQuote(_)) => {
@@ -319,81 +385,81 @@ fn parse_markdown_bounded(
                 }
             }
             Event::Start(Tag::List(start)) => {
-                let parent_depth = match &active {
-                    Some(
-                        ActiveBlock::ListItem { depth, .. }
-                        | ActiveBlock::ListContinuation { depth, .. },
-                    ) => Some(*depth),
-                    _ => None,
-                };
-                if parent_depth.is_some() {
-                    finish_block(&mut active, &mut blocks);
-                }
+                finish_parent_list_item(&mut active, &mut blocks);
                 if lists.is_empty()
                     && matches!(
                         blocks.last(),
-                        Some(
-                            DocumentBlock::ListItem { .. } | DocumentBlock::ListContinuation { .. }
-                        )
+                        Some(DocumentBlock::ListItem { .. } | DocumentBlock::ListChild { .. })
                     )
                 {
                     blocks.push(DocumentBlock::ContainerBoundary);
                 }
                 lists.push(*start);
-                list_parents.push(parent_depth);
             }
             Event::End(TagEnd::List(_)) => {
                 if matches!(
                     active,
-                    Some(ActiveBlock::ListItem { .. } | ActiveBlock::ListContinuation { .. })
+                    Some(ActiveBlock::ListItem { .. } | ActiveBlock::ListChild { .. })
                 ) {
                     finish_block(&mut active, &mut blocks);
                 }
                 lists.pop();
-                if let Some(Some(depth)) = list_parents.pop() {
-                    active = Some(ActiveBlock::ListContinuation {
-                        depth,
-                        markup: String::new(),
-                    });
-                }
             }
             Event::Start(Tag::Item) => {
                 finish_block(&mut active, &mut blocks);
+                let depth = lists.len().saturating_sub(1);
+                list_items.push(depth);
                 active = Some(ActiveBlock::ListItem {
                     marker: next_list_marker(&mut lists),
-                    depth: lists.len().saturating_sub(1),
+                    depth,
                     markup: String::new(),
                 });
             }
             Event::End(TagEnd::Item) => {
                 if matches!(
                     active,
-                    Some(ActiveBlock::ListItem { .. } | ActiveBlock::ListContinuation { .. })
+                    Some(ActiveBlock::ListItem { .. } | ActiveBlock::ListChild { .. })
                 ) {
                     finish_block(&mut active, &mut blocks);
                 }
+                list_items.pop();
             }
             Event::Start(Tag::Table(_)) => {
-                finish_block(&mut active, &mut blocks);
-                if matches!(blocks.last(), Some(DocumentBlock::TableRow { .. })) {
+                finish_parent_list_item(&mut active, &mut blocks);
+                table_depth = list_items.last().copied();
+                let follows_table = match (table_depth, blocks.last()) {
+                    (None, Some(DocumentBlock::TableRow { .. })) => true,
+                    (
+                        Some(depth),
+                        Some(DocumentBlock::ListTableRow {
+                            depth: previous_depth,
+                            ..
+                        }),
+                    ) => depth == *previous_depth,
+                    _ => false,
+                };
+                if follows_table {
                     blocks.push(DocumentBlock::ContainerBoundary);
                 }
             }
-            Event::End(TagEnd::Table) => finish_block(&mut active, &mut blocks),
+            Event::End(TagEnd::Table) => {
+                finish_block(&mut active, &mut blocks);
+                table_depth = None;
+            }
             Event::Start(Tag::TableHead) => {
                 table_header = true;
                 table_row = Some(Vec::new());
             }
             Event::End(TagEnd::TableHead) => {
                 if let Some(cells) = table_row.take() {
-                    blocks.push(DocumentBlock::TableRow { cells });
+                    push_table_row(&mut blocks, table_depth, cells);
                 }
                 table_header = false;
             }
             Event::Start(Tag::TableRow) => table_row = Some(Vec::new()),
             Event::End(TagEnd::TableRow) => {
                 if let Some(cells) = table_row.take() {
-                    blocks.push(DocumentBlock::TableRow { cells });
+                    push_table_row(&mut blocks, table_depth, cells);
                 }
             }
             Event::Start(Tag::TableCell) => table_cell = Some(String::new()),
@@ -446,19 +512,38 @@ fn parse_markdown_bounded(
                 if matches!(
                     active,
                     Some(
-                        ActiveBlock::ListItem { .. }
-                            | ActiveBlock::ListContinuation { .. }
-                            | ActiveBlock::Quote(_)
+                        ActiveBlock::Quote(_)
+                            | ActiveBlock::ListChild {
+                                kind: DocumentListChildKind::Quote,
+                                ..
+                            }
                     )
                 ) {
                     append_markup(&mut active, &mut table_cell, "<tt>");
                 } else {
-                    finish_block(&mut active, &mut blocks);
-                    active = Some(ActiveBlock::Code(String::new()));
+                    finish_parent_list_item(&mut active, &mut blocks);
+                    active = Some(if let Some(depth) = list_items.last() {
+                        ActiveBlock::ListChild {
+                            depth: *depth,
+                            kind: DocumentListChildKind::Code,
+                            markup: String::new(),
+                        }
+                    } else {
+                        ActiveBlock::Code(String::new())
+                    });
                 }
             }
             Event::End(TagEnd::CodeBlock) => {
-                if matches!(active, Some(ActiveBlock::Code(_))) {
+                if matches!(
+                    active,
+                    Some(
+                        ActiveBlock::Code(_)
+                            | ActiveBlock::ListChild {
+                                kind: DocumentListChildKind::Code,
+                                ..
+                            }
+                    )
+                ) {
                     finish_block(&mut active, &mut blocks);
                 } else {
                     append_markup(&mut active, &mut table_cell, "</tt>");
@@ -474,8 +559,12 @@ fn parse_markdown_bounded(
                 append_markup(&mut active, &mut table_cell, "\n");
             }
             Event::Rule => {
-                finish_block(&mut active, &mut blocks);
-                blocks.push(DocumentBlock::Rule);
+                finish_parent_list_item(&mut active, &mut blocks);
+                if let Some(depth) = list_items.last().copied() {
+                    blocks.push(DocumentBlock::ListRule { depth });
+                } else {
+                    blocks.push(DocumentBlock::Rule);
+                }
             }
             Event::Html(text) | Event::InlineHtml(text) => {
                 raw_html = true;
@@ -510,7 +599,7 @@ struct HtmlState {
     blocks: Vec<DocumentBlock>,
     active: Option<ActiveBlock>,
     lists: Vec<Option<u64>>,
-    list_parents: Vec<Option<usize>>,
+    list_items: Vec<usize>,
     links: Vec<Option<String>>,
     stack: Vec<String>,
     skipped_depth: usize,
@@ -518,6 +607,7 @@ struct HtmlState {
     table_row: Option<Vec<DocumentTableCell>>,
     table_cell: Option<String>,
     table_cell_header: bool,
+    table_depth: Option<usize>,
     markup_remaining: usize,
     markup_exceeded: bool,
     preformatted: bool,
@@ -531,7 +621,7 @@ impl HtmlState {
             blocks: Vec::new(),
             active: None,
             lists: Vec::new(),
-            list_parents: Vec::new(),
+            list_items: Vec::new(),
             links: Vec::new(),
             stack: Vec::new(),
             skipped_depth: 0,
@@ -539,6 +629,7 @@ impl HtmlState {
             table_row: None,
             table_cell: None,
             table_cell_header: false,
+            table_depth: None,
             markup_remaining: markup_limit,
             markup_exceeded: false,
             preformatted: false,
@@ -569,64 +660,88 @@ impl HtmlState {
 
         match name {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                self.finish_active();
-                self.start_active(ActiveBlock::Heading {
-                    level: name[1..].parse().unwrap_or(6),
-                    markup: String::new(),
+                self.finish_list_parent();
+                let level = name[1..].parse().unwrap_or(6);
+                self.start_active(if let Some(depth) = self.list_items.last() {
+                    ActiveBlock::ListChild {
+                        depth: *depth,
+                        kind: DocumentListChildKind::Heading(level),
+                        markup: String::new(),
+                    }
+                } else {
+                    ActiveBlock::Heading {
+                        level,
+                        markup: String::new(),
+                    }
                 });
             }
             "p" => {
-                if matches!(
-                    self.active,
-                    Some(ActiveBlock::ListItem { .. } | ActiveBlock::ListContinuation { .. })
-                ) {
-                    if self
-                        .active
-                        .as_ref()
-                        .is_some_and(|active| has_visible_markup(active.markup()))
-                    {
-                        self.append_markup("\n");
-                    }
-                } else {
+                if self.list_items.is_empty() {
                     self.finish_active();
                     self.start_active(if self.quote_depth > 0 {
                         ActiveBlock::Quote(String::new())
                     } else {
                         ActiveBlock::Paragraph(String::new())
                     });
+                } else {
+                    let kind = if self.quote_depth > 0 {
+                        DocumentListChildKind::Quote
+                    } else {
+                        DocumentListChildKind::Paragraph
+                    };
+                    if self.active.as_ref().is_some_and(|active| {
+                        (matches!(active, ActiveBlock::ListItem { .. })
+                            || matches!(
+                                active,
+                                ActiveBlock::ListChild {
+                                    kind: active_kind,
+                                    ..
+                                } if *active_kind == kind
+                            ))
+                            && has_visible_markup(active.markup())
+                    }) {
+                        self.finish_active();
+                    }
+                    if self.active.is_none() {
+                        let depth = *self.list_items.last().expect("list item checked above");
+                        self.start_active(ActiveBlock::ListChild {
+                            depth,
+                            kind,
+                            markup: String::new(),
+                        });
+                    }
                 }
             }
             "blockquote" => {
-                self.finish_active();
+                self.finish_list_parent();
                 self.quote_depth = self.quote_depth.saturating_add(1);
-                self.start_active(ActiveBlock::Quote(String::new()));
+                self.start_active(if let Some(depth) = self.list_items.last() {
+                    ActiveBlock::ListChild {
+                        depth: *depth,
+                        kind: DocumentListChildKind::Quote,
+                        markup: String::new(),
+                    }
+                } else {
+                    ActiveBlock::Quote(String::new())
+                });
             }
             "ul" | "ol" => {
-                let parent_depth = match &self.active {
-                    Some(
-                        ActiveBlock::ListItem { depth, .. }
-                        | ActiveBlock::ListContinuation { depth, .. },
-                    ) => Some(*depth),
-                    _ => None,
-                };
-                self.finish_active();
+                self.finish_list_parent();
                 if self.lists.is_empty()
                     && matches!(
                         self.blocks.last(),
-                        Some(
-                            DocumentBlock::ListItem { .. } | DocumentBlock::ListContinuation { .. }
-                        )
+                        Some(DocumentBlock::ListItem { .. } | DocumentBlock::ListChild { .. })
                     )
                 {
                     self.blocks.push(DocumentBlock::ContainerBoundary);
                 }
                 self.lists.push((name == "ol").then_some(1));
-                self.list_parents.push(parent_depth);
             }
             "li" => {
                 self.finish_active();
                 let marker = next_list_marker(&mut self.lists);
                 let depth = self.lists.len().saturating_sub(1);
+                self.list_items.push(depth);
                 self.start_active(ActiveBlock::ListItem {
                     marker,
                     depth,
@@ -646,8 +761,16 @@ impl HtmlState {
                 self.links.push(destination);
             }
             "pre" => {
-                self.finish_active();
-                self.start_active(ActiveBlock::Code(String::new()));
+                self.finish_list_parent();
+                self.start_active(if let Some(depth) = self.list_items.last() {
+                    ActiveBlock::ListChild {
+                        depth: *depth,
+                        kind: DocumentListChildKind::Code,
+                        markup: String::new(),
+                    }
+                } else {
+                    ActiveBlock::Code(String::new())
+                });
                 self.preformatted = true;
             }
             "code" if !self.preformatted => {
@@ -655,16 +778,32 @@ impl HtmlState {
             }
             "code" => {}
             "hr" => {
-                self.finish_active();
-                self.blocks.push(DocumentBlock::Rule);
+                self.finish_list_parent();
+                if let Some(depth) = self.list_items.last().copied() {
+                    self.blocks.push(DocumentBlock::ListRule { depth });
+                } else {
+                    self.blocks.push(DocumentBlock::Rule);
+                }
             }
             "br" => {
                 self.ensure_text_target();
                 self.append_markup("\n");
             }
             "table" => {
-                self.finish_active();
-                if matches!(self.blocks.last(), Some(DocumentBlock::TableRow { .. })) {
+                self.finish_list_parent();
+                self.table_depth = self.list_items.last().copied();
+                let follows_table = match (self.table_depth, self.blocks.last()) {
+                    (None, Some(DocumentBlock::TableRow { .. })) => true,
+                    (
+                        Some(depth),
+                        Some(DocumentBlock::ListTableRow {
+                            depth: previous_depth,
+                            ..
+                        }),
+                    ) => depth == *previous_depth,
+                    _ => false,
+                };
+                if follows_table {
                     self.blocks.push(DocumentBlock::ContainerBoundary);
                 }
             }
@@ -675,7 +814,7 @@ impl HtmlState {
                 self.append_link_openings();
             }
             "main" | "article" | "section" | "header" | "footer" | "nav" | "aside" | "div" => {
-                self.finish_active();
+                self.finish_list_parent();
             }
             "html" | "body" | "span" | "thead" | "tbody" | "tfoot" => {}
             _ => self.warned = true,
@@ -700,12 +839,23 @@ impl HtmlState {
 
     fn end_supported(&mut self, name: &str) {
         match name {
-            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "li" => {
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 self.finish_active();
+            }
+            "li" => {
+                self.finish_active();
+                self.list_items.pop();
             }
             "p" if matches!(
                 self.active,
-                Some(ActiveBlock::Paragraph(_) | ActiveBlock::Quote(_))
+                Some(
+                    ActiveBlock::Paragraph(_)
+                        | ActiveBlock::Quote(_)
+                        | ActiveBlock::ListChild {
+                            kind: DocumentListChildKind::Paragraph | DocumentListChildKind::Quote,
+                            ..
+                        }
+                )
             ) =>
             {
                 self.finish_active();
@@ -718,17 +868,11 @@ impl HtmlState {
             "ul" | "ol" => {
                 if matches!(
                     self.active,
-                    Some(ActiveBlock::ListItem { .. } | ActiveBlock::ListContinuation { .. })
+                    Some(ActiveBlock::ListItem { .. } | ActiveBlock::ListChild { .. })
                 ) {
                     self.finish_active();
                 }
                 self.lists.pop();
-                if let Some(Some(depth)) = self.list_parents.pop() {
-                    self.start_active(ActiveBlock::ListContinuation {
-                        depth,
-                        markup: String::new(),
-                    });
-                }
             }
             "em" | "i" => self.append_markup("</i>"),
             "strong" | "b" => self.append_markup("</b>"),
@@ -745,9 +889,10 @@ impl HtmlState {
             "code" if !self.preformatted => {
                 self.append_markup("</tt>");
             }
+            "table" => self.table_depth = None,
             "tr" => {
                 if let Some(cells) = self.table_row.take() {
-                    self.blocks.push(DocumentBlock::TableRow { cells });
+                    push_table_row(&mut self.blocks, self.table_depth, cells);
                 }
             }
             "th" | "td" => {
@@ -783,7 +928,17 @@ impl HtmlState {
 
     fn ensure_text_target(&mut self) {
         if self.active.is_none() && self.table_cell.is_none() {
-            self.start_active(if self.quote_depth > 0 {
+            self.start_active(if let Some(depth) = self.list_items.last().copied() {
+                ActiveBlock::ListChild {
+                    depth,
+                    kind: if self.quote_depth > 0 {
+                        DocumentListChildKind::Quote
+                    } else {
+                        DocumentListChildKind::Paragraph
+                    },
+                    markup: String::new(),
+                }
+            } else if self.quote_depth > 0 {
                 ActiveBlock::Quote(String::new())
             } else {
                 ActiveBlock::Paragraph(String::new())
@@ -795,6 +950,13 @@ impl HtmlState {
         if self.active.is_some() {
             self.append_link_closings();
             finish_block(&mut self.active, &mut self.blocks);
+        }
+    }
+
+    fn finish_list_parent(&mut self) {
+        if self.active.is_some() {
+            self.append_link_closings();
+            finish_parent_list_item(&mut self.active, &mut self.blocks);
         }
     }
 
@@ -979,7 +1141,9 @@ fn validate_document(
         .blocks
         .iter()
         .map(|block| match block {
-            DocumentBlock::TableRow { cells, .. } => cells.len(),
+            DocumentBlock::TableRow { cells, .. } | DocumentBlock::ListTableRow { cells, .. } => {
+                cells.len()
+            }
             DocumentBlock::ContainerBoundary => 0,
             _ => 1,
         })
@@ -1012,13 +1176,15 @@ fn block_has_balanced_markup(block: &DocumentBlock) -> bool {
         DocumentBlock::Heading { markup, .. }
         | DocumentBlock::Paragraph(markup)
         | DocumentBlock::ListItem { markup, .. }
-        | DocumentBlock::ListContinuation { markup, .. }
+        | DocumentBlock::ListChild { markup, .. }
         | DocumentBlock::Quote(markup)
         | DocumentBlock::Code(markup) => has_balanced_markup(markup),
-        DocumentBlock::TableRow { cells } => {
+        DocumentBlock::TableRow { cells } | DocumentBlock::ListTableRow { cells, .. } => {
             cells.iter().all(|cell| has_balanced_markup(&cell.markup))
         }
-        DocumentBlock::Rule | DocumentBlock::ContainerBoundary => true,
+        DocumentBlock::Rule | DocumentBlock::ListRule { .. } | DocumentBlock::ContainerBoundary => {
+            true
+        }
     }
 }
 
@@ -1054,11 +1220,15 @@ fn block_markup_bytes(block: &DocumentBlock) -> usize {
         DocumentBlock::Heading { markup, .. }
         | DocumentBlock::Paragraph(markup)
         | DocumentBlock::ListItem { markup, .. }
-        | DocumentBlock::ListContinuation { markup, .. }
+        | DocumentBlock::ListChild { markup, .. }
         | DocumentBlock::Quote(markup)
         | DocumentBlock::Code(markup) => markup.len(),
-        DocumentBlock::TableRow { cells } => cells.iter().map(|cell| cell.markup.len()).sum(),
-        DocumentBlock::Rule | DocumentBlock::ContainerBoundary => 0,
+        DocumentBlock::TableRow { cells } | DocumentBlock::ListTableRow { cells, .. } => {
+            cells.iter().map(|cell| cell.markup.len()).sum()
+        }
+        DocumentBlock::Rule | DocumentBlock::ListRule { .. } | DocumentBlock::ContainerBoundary => {
+            0
+        }
     }
 }
 
@@ -1075,6 +1245,18 @@ fn next_list_marker(lists: &mut [Option<u64>]) -> String {
         }
         _ => "•".to_owned(),
     }
+}
+
+fn push_table_row(
+    blocks: &mut Vec<DocumentBlock>,
+    list_depth: Option<usize>,
+    cells: Vec<DocumentTableCell>,
+) {
+    blocks.push(if let Some(depth) = list_depth {
+        DocumentBlock::ListTableRow { depth, cells }
+    } else {
+        DocumentBlock::TableRow { cells }
+    });
 }
 
 fn finish_block(active: &mut Option<ActiveBlock>, blocks: &mut Vec<DocumentBlock>) {
@@ -1096,12 +1278,36 @@ fn finish_block(active: &mut Option<ActiveBlock>, blocks: &mut Vec<DocumentBlock
             depth,
             markup,
         },
-        ActiveBlock::ListContinuation { depth, markup } => {
-            DocumentBlock::ListContinuation { depth, markup }
-        }
+        ActiveBlock::ListChild {
+            depth,
+            kind,
+            markup,
+        } => DocumentBlock::ListChild {
+            depth,
+            kind,
+            markup,
+        },
         ActiveBlock::Quote(markup) => DocumentBlock::Quote(markup),
         ActiveBlock::Code(markup) => DocumentBlock::Code(markup),
     });
+}
+
+fn finish_parent_list_item(active: &mut Option<ActiveBlock>, blocks: &mut Vec<DocumentBlock>) {
+    match active.take() {
+        Some(ActiveBlock::ListItem {
+            marker,
+            depth,
+            markup,
+        }) => blocks.push(DocumentBlock::ListItem {
+            marker,
+            depth,
+            markup,
+        }),
+        other => {
+            *active = other;
+            finish_block(active, blocks);
+        }
+    }
 }
 
 fn has_visible_markup(markup: &str) -> bool {

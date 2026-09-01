@@ -615,12 +615,28 @@ fn set_release_note_blocks(notes: &gtk::Box, blocks: &[DocumentBlock]) {
                 row.append(&copy);
                 notes.append(&row);
             }
-            DocumentBlock::ListContinuation { depth, markup } => {
+            DocumentBlock::ListChild {
+                depth,
+                kind,
+                markup,
+            } => {
                 let copy = release_notes_label();
                 copy.set_margin_start(
                     i32::try_from(depth.saturating_add(1).saturating_mul(18)).unwrap_or(i32::MAX),
                 );
-                copy.set_markup(markup);
+                match kind {
+                    services::DocumentListChildKind::Heading(level) => {
+                        copy.add_css_class("release-notes-heading");
+                        copy.add_css_class(&format!("level-{level}"));
+                        copy.set_markup(markup);
+                    }
+                    services::DocumentListChildKind::Code => {
+                        copy.add_css_class("release-notes-code");
+                        copy.set_markup(&format!("<tt>{markup}</tt>"));
+                    }
+                    services::DocumentListChildKind::Paragraph
+                    | services::DocumentListChildKind::Quote => copy.set_markup(markup),
+                }
                 notes.append(&copy);
             }
             DocumentBlock::Code(markup) => {
@@ -634,8 +650,17 @@ fn set_release_note_blocks(notes: &gtk::Box, blocks: &[DocumentBlock]) {
                 separator.add_css_class("release-notes-rule");
                 notes.append(&separator);
             }
+            DocumentBlock::ListRule { depth } => {
+                let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+                separator.add_css_class("release-notes-rule");
+                separator.set_margin_start(
+                    i32::try_from(depth.saturating_add(1).saturating_mul(18)).unwrap_or(i32::MAX),
+                );
+                notes.append(&separator);
+            }
             DocumentBlock::Quote(_)
             | DocumentBlock::TableRow { .. }
+            | DocumentBlock::ListTableRow { .. }
             | DocumentBlock::ContainerBoundary => {}
         }
     }

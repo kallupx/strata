@@ -13,8 +13,8 @@ use sourceview5::prelude::*;
 use crate::{
     model::{FileEntry, Location, MetadataValue},
     services::{
-        Document, DocumentBlock, LoadHandle, Preview, PreviewContent, PreviewEvent,
-        PreviewProvider, PreviewRequest, PreviewRequestId, has_web_scheme,
+        Document, DocumentBlock, DocumentListChildKind, LoadHandle, Preview, PreviewContent,
+        PreviewEvent, PreviewProvider, PreviewRequest, PreviewRequestId, has_web_scheme,
     },
 };
 
@@ -955,29 +955,7 @@ fn rendered_document(document: &Document, warnings: &[String]) -> gtk::ScrolledW
                 content.append(&rendered_list(&document.blocks, &mut index));
             }
             DocumentBlock::TableRow { .. } => {
-                let table = gtk::Grid::builder()
-                    .column_homogeneous(true)
-                    .column_spacing(1)
-                    .row_spacing(1)
-                    .build();
-                table.add_css_class("preview-document-table");
-                table.set_accessible_role(gtk::AccessibleRole::Table);
-                let mut row = 0;
-                while let Some(DocumentBlock::TableRow { cells }) = document.blocks.get(index) {
-                    for (column, cell) in cells.iter().enumerate() {
-                        let label = document_label(&cell.markup, "preview-document-table-cell");
-                        if cell.header {
-                            label.add_css_class("header");
-                            label.set_accessible_role(gtk::AccessibleRole::ColumnHeader);
-                        } else {
-                            label.set_accessible_role(gtk::AccessibleRole::Cell);
-                        }
-                        table.attach(&label, i32::try_from(column).unwrap_or(i32::MAX), row, 1, 1);
-                    }
-                    row += 1;
-                    index += 1;
-                }
-                content.append(&table);
+                content.append(&rendered_table(&document.blocks, &mut index, None));
             }
             DocumentBlock::Heading { level, markup } => {
                 let label = document_label(markup, "preview-document-heading");
@@ -1009,7 +987,9 @@ fn rendered_document(document: &Document, warnings: &[String]) -> gtk::ScrolledW
                 index += 1;
             }
             DocumentBlock::ContainerBoundary => index += 1,
-            DocumentBlock::ListContinuation { .. } => index += 1,
+            DocumentBlock::ListChild { .. }
+            | DocumentBlock::ListRule { .. }
+            | DocumentBlock::ListTableRow { .. } => index += 1,
         }
     }
 
@@ -1059,11 +1039,40 @@ fn rendered_list(blocks: &[DocumentBlock], index: &mut usize) -> gtk::Box {
                 bodies.push(body);
                 *index += 1;
             }
-            Some(DocumentBlock::ListContinuation { depth, markup }) => {
-                let label = document_label(markup, "preview-document-copy");
-                bodies.get(*depth).unwrap_or(&root).append(&label);
+            Some(DocumentBlock::ListChild {
+                depth,
+                kind,
+                markup,
+            }) => {
+                bodies
+                    .get(*depth)
+                    .unwrap_or(&root)
+                    .append(&rendered_list_child(*kind, markup));
                 lists.truncate(depth.saturating_add(1));
                 bodies.truncate(depth.saturating_add(1));
+                *index += 1;
+            }
+            Some(DocumentBlock::ListRule { depth }) => {
+                let rule = gtk::Separator::new(gtk::Orientation::Horizontal);
+                rule.add_css_class("preview-document-rule");
+                bodies.get(*depth).unwrap_or(&root).append(&rule);
+                lists.truncate(depth.saturating_add(1));
+                bodies.truncate(depth.saturating_add(1));
+                *index += 1;
+            }
+            Some(DocumentBlock::ListTableRow { depth, .. }) => {
+                let depth = *depth;
+                let table = rendered_table(blocks, index, Some(depth));
+                bodies.get(depth).unwrap_or(&root).append(&table);
+                lists.truncate(depth.saturating_add(1));
+                bodies.truncate(depth.saturating_add(1));
+            }
+            Some(DocumentBlock::ContainerBoundary)
+                if matches!(
+                    blocks.get(index.saturating_add(1)),
+                    Some(DocumentBlock::ListTableRow { .. })
+                ) =>
+            {
                 *index += 1;
             }
             _ => break,
@@ -1071,6 +1080,61 @@ fn rendered_list(blocks: &[DocumentBlock], index: &mut usize) -> gtk::Box {
     }
 
     root
+}
+
+fn rendered_list_child(kind: DocumentListChildKind, markup: &str) -> gtk::Widget {
+    let label = match kind {
+        DocumentListChildKind::Paragraph => document_label(markup, "preview-document-copy"),
+        DocumentListChildKind::Heading(level) => {
+            let label = document_label(markup, "preview-document-heading");
+            label.add_css_class(&format!("level-{level}"));
+            label.set_accessible_role(gtk::AccessibleRole::Heading);
+            label.update_property(&[gtk::accessible::Property::Level(i32::from(level))]);
+            label
+        }
+        DocumentListChildKind::Quote => document_label(markup, "preview-document-quote"),
+        DocumentListChildKind::Code => {
+            document_label(&format!("<tt>{markup}</tt>"), "preview-document-code")
+        }
+    };
+    label.upcast()
+}
+
+fn rendered_table(
+    blocks: &[DocumentBlock],
+    index: &mut usize,
+    list_depth: Option<usize>,
+) -> gtk::Grid {
+    let table = gtk::Grid::builder()
+        .column_homogeneous(true)
+        .column_spacing(1)
+        .row_spacing(1)
+        .build();
+    table.add_css_class("preview-document-table");
+    table.set_accessible_role(gtk::AccessibleRole::Table);
+    let mut row = 0;
+    loop {
+        let cells = match blocks.get(*index) {
+            Some(DocumentBlock::TableRow { cells }) if list_depth.is_none() => cells,
+            Some(DocumentBlock::ListTableRow { depth, cells }) if Some(*depth) == list_depth => {
+                cells
+            }
+            _ => break,
+        };
+        for (column, cell) in cells.iter().enumerate() {
+            let label = document_label(&cell.markup, "preview-document-table-cell");
+            if cell.header {
+                label.add_css_class("header");
+                label.set_accessible_role(gtk::AccessibleRole::ColumnHeader);
+            } else {
+                label.set_accessible_role(gtk::AccessibleRole::Cell);
+            }
+            table.attach(&label, i32::try_from(column).unwrap_or(i32::MAX), row, 1, 1);
+        }
+        row += 1;
+        *index += 1;
+    }
+    table
 }
 
 fn document_list() -> gtk::Box {

@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use super::{
-    DocumentBlock, DocumentKind, DocumentTableCell, ParseLimits, document_kind, parse_document,
-    parse_document_with_limits, parse_markdown,
+    DocumentBlock, DocumentKind, DocumentListChildKind, DocumentTableCell, ParseLimits,
+    document_kind, parse_document, parse_document_with_limits, parse_markdown,
 };
 use crate::sandbox::Cancellation;
 
@@ -360,8 +360,9 @@ fn html_restores_parent_list_items_after_nested_lists() {
                 depth: 1,
                 markup: "inner".to_owned(),
             },
-            DocumentBlock::ListContinuation {
+            DocumentBlock::ListChild {
                 depth: 0,
+                kind: DocumentListChildKind::Paragraph,
                 markup: "tail".to_owned(),
             },
         ]
@@ -390,11 +391,221 @@ fn markdown_restores_parent_list_items_after_nested_lists() {
                 depth: 1,
                 markup: "inner".to_owned(),
             },
-            DocumentBlock::ListContinuation {
+            DocumentBlock::ListChild {
                 depth: 0,
+                kind: DocumentListChildKind::Paragraph,
                 markup: "tail".to_owned(),
             },
         ]
+    );
+}
+
+#[test]
+fn list_item_paragraphs_remain_separate_children() {
+    let expected = vec![
+        DocumentBlock::ListItem {
+            marker: "•".to_owned(),
+            depth: 0,
+            markup: "first".to_owned(),
+        },
+        DocumentBlock::ListChild {
+            depth: 0,
+            kind: DocumentListChildKind::Paragraph,
+            markup: "second".to_owned(),
+        },
+    ];
+
+    assert_eq!(
+        parse_document(
+            DocumentKind::Markdown,
+            "- first\n\n  second",
+            &Cancellation::default(),
+        )
+        .expect("Markdown list paragraphs should render separately")
+        .document
+        .blocks,
+        expected
+    );
+    assert_eq!(
+        parse_document(
+            DocumentKind::Html,
+            "<ul><li><p>first</p><p>second</p></li></ul>",
+            &Cancellation::default(),
+        )
+        .expect("HTML list paragraphs should render separately")
+        .document
+        .blocks,
+        expected
+    );
+}
+
+#[test]
+fn markdown_keeps_semantic_block_children_inside_list_items() {
+    assert_eq!(
+        parse_document(
+            DocumentKind::Markdown,
+            "- outer\n\n  ## heading\n\n  > quote\n\n  ```\n  code\n  ```",
+            &Cancellation::default(),
+        )
+        .expect("Markdown block children should retain their list context")
+        .document
+        .blocks,
+        vec![
+            DocumentBlock::ListItem {
+                marker: "•".to_owned(),
+                depth: 0,
+                markup: "outer".to_owned(),
+            },
+            DocumentBlock::ListChild {
+                depth: 0,
+                kind: DocumentListChildKind::Heading(2),
+                markup: "heading".to_owned(),
+            },
+            DocumentBlock::ListChild {
+                depth: 0,
+                kind: DocumentListChildKind::Quote,
+                markup: "quote".to_owned(),
+            },
+            DocumentBlock::ListChild {
+                depth: 0,
+                kind: DocumentListChildKind::Code,
+                markup: "code\n".to_owned(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn html_keeps_semantic_block_children_inside_list_items() {
+    assert_eq!(
+        parse_document(
+            DocumentKind::Html,
+            "<ul><li>outer<h2>heading</h2><blockquote><p>quote</p></blockquote><pre><code>code</code></pre></li></ul>",
+            &Cancellation::default(),
+        )
+        .expect("HTML block children should retain their list context")
+        .document
+        .blocks,
+        vec![
+            DocumentBlock::ListItem {
+                marker: "•".to_owned(),
+                depth: 0,
+                markup: "outer".to_owned(),
+            },
+            DocumentBlock::ListChild {
+                depth: 0,
+                kind: DocumentListChildKind::Heading(2),
+                markup: "heading".to_owned(),
+            },
+            DocumentBlock::ListChild {
+                depth: 0,
+                kind: DocumentListChildKind::Quote,
+                markup: "quote".to_owned(),
+            },
+            DocumentBlock::ListChild {
+                depth: 0,
+                kind: DocumentListChildKind::Code,
+                markup: "code".to_owned(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn list_blockquote_paragraphs_keep_both_semantics() {
+    let expected = vec![
+        DocumentBlock::ListItem {
+            marker: "•".to_owned(),
+            depth: 0,
+            markup: String::new(),
+        },
+        DocumentBlock::ListChild {
+            depth: 0,
+            kind: DocumentListChildKind::Quote,
+            markup: "first".to_owned(),
+        },
+        DocumentBlock::ListChild {
+            depth: 0,
+            kind: DocumentListChildKind::Quote,
+            markup: "second".to_owned(),
+        },
+    ];
+
+    assert_eq!(
+        parse_document(
+            DocumentKind::Markdown,
+            "- > first\n  >\n  > second",
+            &Cancellation::default(),
+        )
+        .expect("Markdown quote paragraphs should remain inside their list item")
+        .document
+        .blocks,
+        expected
+    );
+    assert_eq!(
+        parse_document(
+            DocumentKind::Html,
+            "<ul><li><blockquote><p>first</p><p>second</p></blockquote></li></ul>",
+            &Cancellation::default(),
+        )
+        .expect("HTML quote paragraphs should remain inside their list item")
+        .document
+        .blocks,
+        expected
+    );
+}
+
+#[test]
+fn list_rules_and_tables_do_not_orphan_trailing_content() {
+    let expected = vec![
+        DocumentBlock::ListItem {
+            marker: "•".to_owned(),
+            depth: 0,
+            markup: "outer".to_owned(),
+        },
+        DocumentBlock::ListRule { depth: 0 },
+        DocumentBlock::ListTableRow {
+            depth: 0,
+            cells: vec![DocumentTableCell {
+                header: true,
+                markup: "A".to_owned(),
+            }],
+        },
+        DocumentBlock::ListTableRow {
+            depth: 0,
+            cells: vec![DocumentTableCell {
+                header: false,
+                markup: "B".to_owned(),
+            }],
+        },
+        DocumentBlock::ListChild {
+            depth: 0,
+            kind: DocumentListChildKind::Paragraph,
+            markup: "tail".to_owned(),
+        },
+    ];
+
+    assert_eq!(
+        parse_document(
+            DocumentKind::Markdown,
+            "- outer\n\n  ---\n\n  | A |\n  |---|\n  | B |\n\n  tail",
+            &Cancellation::default(),
+        )
+        .expect("Markdown rules and tables should remain inside their list item")
+        .document
+        .blocks,
+        expected
+    );
+    assert_eq!(
+        parse_document(
+            DocumentKind::Html,
+            "<ul><li>outer<hr><table><tr><th>A</th></tr><tr><td>B</td></tr></table><p>tail</p></li></ul>",
+            &Cancellation::default(),
+        )
+        .expect("HTML rules and tables should remain inside their list item")
+        .document
+        .blocks,
+        expected
     );
 }
 
