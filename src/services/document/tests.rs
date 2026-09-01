@@ -641,6 +641,71 @@ fn separate_lists_and_tables_keep_container_boundaries() {
         ]
     ));
 
+    let markdown_rule = parse_document(
+        DocumentKind::Markdown,
+        "- first\n\n  ---\n\n1. second",
+        &Cancellation::default(),
+    )
+    .expect("a rule must not merge separate Markdown lists");
+    assert!(matches!(
+        markdown_rule.document.blocks.as_slice(),
+        [
+            DocumentBlock::ListItem { .. },
+            DocumentBlock::ListRule { .. },
+            DocumentBlock::ContainerBoundary,
+            DocumentBlock::ListItem { .. }
+        ]
+    ));
+
+    let html_rule = parse_document(
+        DocumentKind::Html,
+        "<ul><li>first<hr></li></ul><ol><li>second</li></ol>",
+        &Cancellation::default(),
+    )
+    .expect("a rule must not merge separate HTML lists");
+    assert!(matches!(
+        html_rule.document.blocks.as_slice(),
+        [
+            DocumentBlock::ListItem { .. },
+            DocumentBlock::ListRule { .. },
+            DocumentBlock::ContainerBoundary,
+            DocumentBlock::ListItem { .. }
+        ]
+    ));
+
+    let markdown_table = parse_document(
+        DocumentKind::Markdown,
+        "- first\n\n  | A |\n  | - |\n  | B |\n\n1. second",
+        &Cancellation::default(),
+    )
+    .expect("a table must not merge separate Markdown lists");
+    assert!(matches!(
+        markdown_table.document.blocks.as_slice(),
+        [
+            DocumentBlock::ListItem { .. },
+            DocumentBlock::ListTableRow { .. },
+            DocumentBlock::ListTableRow { .. },
+            DocumentBlock::ContainerBoundary,
+            DocumentBlock::ListItem { .. }
+        ]
+    ));
+
+    let html_table = parse_document(
+        DocumentKind::Html,
+        "<ul><li>first<table><tr><td>A</td></tr></table></li></ul><ol><li>second</li></ol>",
+        &Cancellation::default(),
+    )
+    .expect("a table must not merge separate HTML lists");
+    assert!(matches!(
+        html_table.document.blocks.as_slice(),
+        [
+            DocumentBlock::ListItem { .. },
+            DocumentBlock::ListTableRow { .. },
+            DocumentBlock::ContainerBoundary,
+            DocumentBlock::ListItem { .. }
+        ]
+    ));
+
     let markdown_tables = parse_document(
         DocumentKind::Markdown,
         "| A |\n| - |\n| 1 |\n\n| B |\n| - |\n| 2 |",

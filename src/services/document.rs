@@ -386,12 +386,7 @@ fn parse_markdown_bounded(
             }
             Event::Start(Tag::List(start)) => {
                 finish_parent_list_item(&mut active, &mut blocks);
-                if lists.is_empty()
-                    && matches!(
-                        blocks.last(),
-                        Some(DocumentBlock::ListItem { .. } | DocumentBlock::ListChild { .. })
-                    )
-                {
+                if lists.is_empty() && blocks.last().is_some_and(is_list_block) {
                     blocks.push(DocumentBlock::ContainerBoundary);
                 }
                 lists.push(*start);
@@ -727,12 +722,7 @@ impl HtmlState {
             }
             "ul" | "ol" => {
                 self.finish_list_parent();
-                if self.lists.is_empty()
-                    && matches!(
-                        self.blocks.last(),
-                        Some(DocumentBlock::ListItem { .. } | DocumentBlock::ListChild { .. })
-                    )
-                {
+                if self.lists.is_empty() && self.blocks.last().is_some_and(is_list_block) {
                     self.blocks.push(DocumentBlock::ContainerBoundary);
                 }
                 self.lists.push((name == "ol").then_some(1));
@@ -1245,6 +1235,16 @@ fn next_list_marker(lists: &mut [Option<u64>]) -> String {
         }
         _ => "•".to_owned(),
     }
+}
+
+fn is_list_block(block: &DocumentBlock) -> bool {
+    matches!(
+        block,
+        DocumentBlock::ListItem { .. }
+            | DocumentBlock::ListChild { .. }
+            | DocumentBlock::ListRule { .. }
+            | DocumentBlock::ListTableRow { .. }
+    )
 }
 
 fn push_table_row(
