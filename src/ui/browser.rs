@@ -26,7 +26,7 @@ use super::{
     blur::BlurBin,
     browser_modes::{BrowserDensity, BrowserMode, ModeViews},
     controls::{
-        ModalTone, form_check_button, form_entry, form_label, form_password_entry,
+        ModalTone, form_check_button, form_entry, form_label, form_password_entry, menu_option,
         message_dialog_description, message_dialog_layout, modal_layout, segmented_control,
         wrap_dialog_text,
     },
@@ -6127,7 +6127,7 @@ pub(super) fn column_sort_menu(browser: &Rc<Browser>, depth: usize) -> gtk::Menu
         ("Modified", SortKey::Modified),
         ("Type", SortKey::Type),
     ] {
-        let (option, check) = column_menu_option(label, preferences.sort_key == key);
+        let (option, check) = menu_option(label, preferences.sort_key == key);
         selected_checks.borrow_mut().push((key, check));
         let checks = selected_checks.clone();
         let weak_browser = Rc::downgrade(browser);
@@ -6143,8 +6143,7 @@ pub(super) fn column_sort_menu(browser: &Rc<Browser>, depth: usize) -> gtk::Menu
     }
 
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    let (folders_first, folders_check) =
-        column_menu_option("Folders first", preferences.folders_first);
+    let (folders_first, folders_check) = menu_option("Folders first", preferences.folders_first);
     let folders_enabled = Rc::new(Cell::new(preferences.folders_first));
     let weak_browser = Rc::downgrade(browser);
     let folders_enabled_for_click = folders_enabled.clone();
@@ -6296,21 +6295,6 @@ pub(super) fn empty_trash_button(browser: &Rc<Browser>) -> gtk::Button {
         }
     });
     button
-}
-
-fn column_menu_option(label: &str, selected: bool) -> (gtk::Button, gtk::Image) {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    let check = crate::assets::primary_icon(crate::assets::icons::CHECK, 16);
-    check.set_visible(selected);
-    let label = gtk::Label::new(Some(label));
-    label.set_xalign(0.0);
-    label.set_hexpand(true);
-    row.append(&label);
-    row.append(&check);
-    let option = gtk::Button::builder().child(&row).build();
-    option.add_css_class("column-menu-option");
-    option.set_has_frame(false);
-    (option, check)
 }
 
 fn file_row_target(mut target: gtk::Widget) -> Option<gtk::Box> {

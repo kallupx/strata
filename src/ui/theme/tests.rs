@@ -3,11 +3,12 @@
 use std::collections::HashSet;
 
 use super::{
-    Preferences, Theme, azure_tokens, blend, builtins, is_omarchy_theme_event,
-    merge_builtin_and_custom_themes, slugify, sort_preferences, title_case_slug,
-    tokens_from_quattro, validate_tokens,
+    Preferences, Theme, azure_tokens, blend, builtins, configured_hardware_acceleration,
+    configured_video_preview_backend, is_omarchy_theme_event, merge_builtin_and_custom_themes,
+    slugify, sort_preferences, title_case_slug, tokens_from_quattro, validate_tokens,
 };
 use crate::model::{SortDirection, SortKey, ViewPreferences};
+use crate::sandbox::MediaPreviewBackend;
 
 #[test]
 fn bundled_catalog_is_valid_unique_and_alphabetical() {
@@ -163,6 +164,13 @@ theme = "azure-glow"
 
     assert!(preferences.folder_peeking);
     assert!(preferences.single_click_previews);
+    assert_eq!(preferences.hardware_accelerated_video_previews, None);
+    assert!(configured_hardware_acceleration(&preferences, false));
+    assert!(!configured_hardware_acceleration(&preferences, true));
+    assert_eq!(
+        configured_video_preview_backend(&preferences),
+        MediaPreviewBackend::Automatic
+    );
     assert!(!preferences.search_open_files_directly);
     assert_eq!(preferences.browser_mode, "columns");
     assert_eq!(preferences.browser_density, "compact");
@@ -233,4 +241,54 @@ single_click_previews = false
     .expect("preferences should be valid");
 
     assert!(!preferences.single_click_previews);
+}
+
+#[test]
+fn video_preview_acceleration_can_be_disabled_and_persisted() {
+    let preferences = Preferences {
+        hardware_accelerated_video_previews: Some(false),
+        ..Preferences::default()
+    };
+    let serialized = toml::to_string(&preferences).expect("serialize preferences");
+    let restored: Preferences = toml::from_str(&serialized).expect("deserialize preferences");
+
+    assert_eq!(restored.hardware_accelerated_video_previews, Some(false));
+}
+
+#[test]
+fn video_preview_acceleration_can_be_enabled_and_persisted() {
+    let preferences = Preferences {
+        hardware_accelerated_video_previews: Some(true),
+        ..Preferences::default()
+    };
+    let serialized = toml::to_string(&preferences).expect("serialize preferences");
+    let restored: Preferences = toml::from_str(&serialized).expect("deserialize preferences");
+
+    assert_eq!(restored.hardware_accelerated_video_previews, Some(true));
+}
+
+#[test]
+fn video_preview_backends_round_trip_and_invalid_values_fall_back() {
+    for (stored, backend) in [
+        ("automatic", MediaPreviewBackend::Automatic),
+        ("vaapi", MediaPreviewBackend::VaApi),
+        ("vulkan", MediaPreviewBackend::Vulkan),
+    ] {
+        let preferences = Preferences {
+            video_preview_backend: stored.to_owned(),
+            ..Preferences::default()
+        };
+        let serialized = toml::to_string(&preferences).expect("serialize preferences");
+        let restored: Preferences = toml::from_str(&serialized).expect("deserialize preferences");
+        assert_eq!(configured_video_preview_backend(&restored), backend);
+    }
+
+    let invalid = Preferences {
+        video_preview_backend: "unsupported".to_owned(),
+        ..Preferences::default()
+    };
+    assert_eq!(
+        configured_video_preview_backend(&invalid),
+        MediaPreviewBackend::Automatic
+    );
 }

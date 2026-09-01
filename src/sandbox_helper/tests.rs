@@ -10,6 +10,7 @@ use super::{
     MediaBackend, bounded_output, bounded_surface_dimensions, media_backends, media_command,
     run_command_with_timeout, run_media_backends,
 };
+use crate::sandbox::MediaPreviewBackend;
 
 fn arguments(backend: &MediaBackend) -> String {
     media_command(
@@ -33,7 +34,7 @@ fn media_backends_are_deterministic_and_ordered() {
     ];
 
     assert_eq!(
-        media_backends(&devices),
+        media_backends(&devices, MediaPreviewBackend::Automatic),
         [
             MediaBackend::VaApi("/dev/dri/renderD128".into()),
             MediaBackend::VaApi("/dev/dri/renderD129".into()),
@@ -43,7 +44,30 @@ fn media_backends_are_deterministic_and_ordered() {
         ]
     );
     assert_eq!(
-        media_backends(&["/dev/nvidia0".into(), "/dev/nvidiactl".into()]),
+        media_backends(&devices, MediaPreviewBackend::VaApi),
+        [
+            MediaBackend::VaApi("/dev/dri/renderD128".into()),
+            MediaBackend::VaApi("/dev/dri/renderD129".into()),
+            MediaBackend::Software,
+        ]
+    );
+    assert_eq!(
+        media_backends(&devices, MediaPreviewBackend::Vulkan),
+        [
+            MediaBackend::Vulkan(0),
+            MediaBackend::Vulkan(1),
+            MediaBackend::Software,
+        ]
+    );
+    assert_eq!(
+        media_backends(&devices, MediaPreviewBackend::Software),
+        [MediaBackend::Software]
+    );
+    assert_eq!(
+        media_backends(
+            &["/dev/nvidia0".into(), "/dev/nvidiactl".into()],
+            MediaPreviewBackend::Automatic,
+        ),
         [MediaBackend::Vulkan(0), MediaBackend::Software]
     );
 }
@@ -83,6 +107,23 @@ fn final_software_failure_returns_the_normalization_error() {
         run_media_backends(&[MediaBackend::Software], |_| Ok::<_, ()>(false)),
         Err("Unable to normalize media preview".to_owned())
     );
+}
+
+#[test]
+fn forced_backend_failure_goes_directly_to_software() {
+    for backends in [
+        media_backends(&["/dev/dri/renderD128".into()], MediaPreviewBackend::VaApi),
+        media_backends(&["/dev/dri/renderD128".into()], MediaPreviewBackend::Vulkan),
+    ] {
+        let mut attempts = Vec::new();
+        run_media_backends(&backends, |backend| {
+            attempts.push(backend.clone());
+            Ok::<_, ()>(*backend == MediaBackend::Software)
+        })
+        .expect("software fallback should succeed");
+        assert_eq!(attempts, backends);
+        assert_eq!(attempts.len(), 2);
+    }
 }
 
 #[test]
@@ -153,7 +194,7 @@ fn media_commands_select_the_backend_and_preserve_limits() {
     assert!(vaapi.contains("-hwaccel_output_format vaapi"));
     assert!(
         vaapi.contains(
-            "-vf scale_vaapi=w=1280:h=1280:force_original_aspect_ratio=decrease:force_divisible_by=2:format=nv12 -c:v h264_vaapi"
+            "-vf scale_vaapi=w=1280:h=1280:force_original_aspect_ratio=decrease:force_divisible_by=16:format=nv12 -c:v h264_vaapi"
         )
     );
     assert!(vaapi.contains("-c:a aac -b:a 96k -f mp4"));
@@ -163,7 +204,7 @@ fn media_commands_select_the_backend_and_preserve_limits() {
     assert!(vulkan.contains("-init_hw_device vulkan=vk:1 -filter_hw_device vk"));
     assert!(vulkan.contains("-hwaccel vulkan -hwaccel_device vk"));
     assert!(vulkan.contains(
-        "-vf scale_vulkan=w='if(gte(iw,ih),min(1280,trunc(iw/2)*2),-2)':h='if(gte(iw,ih),-2,min(1280,trunc(ih/2)*2))':format=nv12 -c:v h264_vulkan"
+        "-vf scale_vulkan=w='max(16,trunc(min(iw,iw*1280/max(iw,ih))/16)*16)':h='max(16,trunc(min(ih,ih*1280/max(iw,ih))/16)*16)':format=nv12 -c:v h264_vulkan"
     ));
     assert!(vulkan.contains("-usage transcode -tune ull"));
     assert!(vulkan.contains("-c:a aac -b:a 96k -f mp4"));

@@ -2,16 +2,16 @@
 
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     thread,
     time::{Duration, Instant},
 };
 
 use super::{
-    Cancellation, MAX_RASTER_INPUT_BYTES, MEDIA_WALL_TIME_LIMIT, ParseOperation, PrivateOutput,
-    WALL_TIME_LIMIT, gpu_devices, parse, sandbox_command, spawn_renderer, valid_output,
-    wait_for_renderer,
+    Cancellation, MAX_RASTER_INPUT_BYTES, MEDIA_WALL_TIME_LIMIT, MediaPreviewBackend,
+    ParseOperation, PrivateOutput, WALL_TIME_LIMIT, gpu_devices, parse, polaris_gpu_available_at,
+    sandbox_command, spawn_renderer, valid_output, wait_for_renderer,
 };
 
 fn limit_from(arguments: &[String], flag: &str) -> u64 {
@@ -38,6 +38,7 @@ fn file_size_limit_holds_a_full_resolution_decoded_frame() {
         Path::new("/tmp/private-output"),
         ParseOperation::ThumbnailImage,
         256,
+        MediaPreviewBackend::Software,
         &[],
     );
     let arguments: Vec<_> = command
@@ -69,6 +70,7 @@ fn sandbox_exposes_only_runtime_input_and_private_output() {
         Path::new("/tmp/private-output"),
         ParseOperation::PreviewPdf,
         2,
+        MediaPreviewBackend::Software,
         &[],
     );
     let arguments: Vec<_> = command
@@ -100,6 +102,7 @@ fn media_previews_use_a_longer_wall_timeout_instead_of_a_cpu_limit() {
         Path::new("/tmp/private-output"),
         operation,
         0,
+        MediaPreviewBackend::Automatic,
         &[],
     );
 
@@ -133,7 +136,7 @@ fn discovers_only_supported_gpu_devices_in_stable_order() {
     }
 
     assert_eq!(
-        gpu_devices(&dev),
+        gpu_devices(&dev, MediaPreviewBackend::Automatic),
         [
             dev.join("dri/renderD128"),
             dev.join("dri/renderD129"),
@@ -142,6 +145,109 @@ fn discovers_only_supported_gpu_devices_in_stable_order() {
             dev.join("nvidiactl"),
         ]
     );
+}
+
+fn create_render_node(dev: &Path, drm: &Path, name: &str, pci_ids: Option<(u16, u16)>) -> PathBuf {
+    fs::create_dir_all(dev.join("dri")).expect("create DRI directory");
+    let node = dev.join("dri").join(name);
+    fs::write(&node, []).expect("create render node");
+    if let Some((vendor, device)) = pci_ids {
+        let metadata = drm.join(name).join("device");
+        fs::create_dir_all(&metadata).expect("create PCI metadata");
+        fs::write(metadata.join("vendor"), format!("0x{vendor:04x}\n")).expect("write PCI vendor");
+        fs::write(metadata.join("device"), format!("0x{device:04x}\n")).expect("write PCI device");
+    }
+    node
+}
+
+#[test]
+fn every_polaris_range_uses_the_safe_default_but_remains_available_for_opt_in() {
+    let root = PrivateOutput::create().expect("create temporary device tree");
+    let dev = root.path().join("dev");
+    let drm = root.path().join("sys/class/drm");
+    let blocked = [0x67c0, 0x67df, 0x67e0, 0x67ff, 0x6980, 0x699f];
+    for (index, device) in blocked.into_iter().enumerate() {
+        create_render_node(
+            &dev,
+            &drm,
+            &format!("renderD{}", 128 + index),
+            Some((0x1002, device)),
+        );
+    }
+
+    let devices = gpu_devices(&dev, MediaPreviewBackend::Automatic);
+    assert_eq!(devices.len(), blocked.len());
+    assert!(polaris_gpu_available_at(&dev, &drm));
+    let command = sandbox_command(
+        Path::new("/tmp/strata"),
+        Path::new("/home/alice/Videos/untrusted.mkv"),
+        Path::new("/tmp/private-output"),
+        ParseOperation::PreviewMedia,
+        0,
+        MediaPreviewBackend::Automatic,
+        &devices,
+    );
+    for device in &devices {
+        assert!(
+            command
+                .get_args()
+                .any(|argument| argument == device.as_os_str())
+        );
+    }
+}
+
+#[test]
+fn explicit_opt_in_exposes_mixed_and_unidentified_gpus_by_policy() {
+    let root = PrivateOutput::create().expect("create temporary device tree");
+    let dev = root.path().join("dev");
+    let drm = root.path().join("sys/class/drm");
+    create_render_node(&dev, &drm, "renderD128", Some((0x1002, 0x67df)));
+    let modern = create_render_node(&dev, &drm, "renderD129", Some((0x1002, 0x73bf)));
+    let unidentified = create_render_node(&dev, &drm, "renderD130", None);
+    fs::write(dev.join("nvidia0"), []).expect("create NVIDIA device");
+    fs::write(dev.join("nvidiactl"), []).expect("create NVIDIA control device");
+
+    assert_eq!(
+        gpu_devices(&dev, MediaPreviewBackend::VaApi),
+        [
+            dev.join("dri/renderD128"),
+            modern.clone(),
+            unidentified.clone()
+        ]
+    );
+    assert_eq!(
+        gpu_devices(&dev, MediaPreviewBackend::Vulkan),
+        [
+            dev.join("dri/renderD128"),
+            modern.clone(),
+            unidentified.clone(),
+            dev.join("nvidia0"),
+            dev.join("nvidiactl"),
+        ]
+    );
+    assert_eq!(
+        gpu_devices(&dev, MediaPreviewBackend::Automatic),
+        [
+            dev.join("dri/renderD128"),
+            modern,
+            unidentified,
+            dev.join("nvidia0"),
+            dev.join("nvidiactl"),
+        ]
+    );
+    assert!(gpu_devices(&dev, MediaPreviewBackend::Software).is_empty());
+    assert!(polaris_gpu_available_at(&dev, &drm));
+}
+
+#[test]
+fn modern_and_unidentified_gpus_keep_the_accelerated_default() {
+    let root = PrivateOutput::create().expect("create temporary device tree");
+    let dev = root.path().join("dev");
+    let drm = root.path().join("sys/class/drm");
+    create_render_node(&dev, &drm, "renderD128", Some((0x1002, 0x73bf)));
+    create_render_node(&dev, &drm, "renderD129", None);
+
+    assert!(!polaris_gpu_available_at(&dev, &drm));
 }
 
 #[test]
@@ -157,6 +263,7 @@ fn media_sandbox_exposes_only_supplied_gpu_devices_and_sysfs() {
         Path::new("/tmp/private-output"),
         ParseOperation::PreviewMedia,
         0,
+        MediaPreviewBackend::Automatic,
         &devices,
     );
     let joined = command
@@ -175,6 +282,28 @@ fn media_sandbox_exposes_only_supplied_gpu_devices_and_sysfs() {
 }
 
 #[test]
+fn software_media_sandbox_exposes_no_gpu_devices_or_sysfs() {
+    let command = sandbox_command(
+        Path::new("/tmp/strata"),
+        Path::new("/home/alice/Videos/untrusted.mkv"),
+        Path::new("/tmp/private-output"),
+        ParseOperation::PreviewMedia,
+        0,
+        MediaPreviewBackend::Software,
+        &["/dev/dri/renderD128".into(), "/dev/nvidia0".into()],
+    );
+    let joined = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(!joined.contains("--dev-bind-try"));
+    assert!(!joined.contains("/sys"));
+    assert!(joined.ends_with("0 software"));
+}
+
+#[test]
 fn non_media_sandboxes_never_expose_gpu_devices_or_sysfs() {
     let command = sandbox_command(
         Path::new("/tmp/strata"),
@@ -182,6 +311,7 @@ fn non_media_sandboxes_never_expose_gpu_devices_or_sysfs() {
         Path::new("/tmp/private-output"),
         ParseOperation::ThumbnailVideo,
         128,
+        MediaPreviewBackend::Automatic,
         &["/dev/dri/renderD128".into(), "/dev/nvidia0".into()],
     );
     let joined = command
@@ -237,6 +367,7 @@ fn cancelled_requests_fail_without_starting_a_renderer() {
         Path::new("does-not-need-to-exist"),
         ParseOperation::PreviewImage,
         0,
+        MediaPreviewBackend::Software,
         &cancellation,
     )
     .err()
@@ -258,6 +389,7 @@ fn rejects_oversized_raster_inputs_before_starting_a_renderer() {
         &input,
         ParseOperation::ThumbnailImage,
         64,
+        MediaPreviewBackend::Software,
         &Cancellation::default(),
     )
     .err()

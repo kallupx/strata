@@ -51,7 +51,10 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
     browser.set_operation_provider(Rc::new(LocalOperationProvider));
     let controller = browser.browser();
 
-    let preview = PreviewDrawer::new(Rc::new(LocalPreviewProvider));
+    let preview_preferences = theme_manager.clone();
+    let preview = PreviewDrawer::new(Rc::new(LocalPreviewProvider::new(Rc::new(move || {
+        preview_preferences.media_preview_backend()
+    }))));
     let preview_for_selection = preview.clone();
     let weak_controller = Rc::downgrade(&controller);
     controller.observe(move |event| match event {

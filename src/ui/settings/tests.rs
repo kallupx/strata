@@ -5,8 +5,10 @@ use crate::services::{ReleaseMetadata, UpdateCheck};
 use super::{
     COMPACT_NAVIGATION_BREAKPOINT, DIALOG_HEIGHT, DIALOG_MARGIN, DIALOG_WIDTH,
     responsive_dialog_size, shows_available_release_notes, theme_background_is_light,
-    theme_name_matches, uses_compact_navigation,
+    theme_name_matches, uses_compact_navigation, video_preview_backend_label,
+    video_preview_control_state,
 };
+use crate::sandbox::MediaPreviewBackend;
 
 #[test]
 fn settings_dialog_keeps_its_preferred_size_when_space_allows() {
@@ -68,4 +70,25 @@ fn available_notes_are_shown_only_for_a_newer_release() {
         },
         download_url: None,
     }));
+}
+
+#[test]
+fn video_preview_backend_selector_labels_all_options() {
+    for (backend, label) in [
+        (MediaPreviewBackend::Automatic, "Automatic"),
+        (MediaPreviewBackend::VaApi, "VA-API"),
+        (MediaPreviewBackend::Vulkan, "Vulkan"),
+    ] {
+        assert_eq!(video_preview_backend_label(backend), label);
+    }
+    assert_eq!(
+        video_preview_backend_label(MediaPreviewBackend::Software),
+        "Automatic"
+    );
+}
+
+#[test]
+fn video_preview_controls_follow_enabled_state() {
+    assert_eq!(video_preview_control_state(true), (true, true, true));
+    assert_eq!(video_preview_control_state(false), (false, true, false));
 }

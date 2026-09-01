@@ -11,6 +11,7 @@ use gtk::{gdk, glib, prelude::*, subclass::prelude::*};
 
 use crate::{
     assets::icons,
+    sandbox::MediaPreviewBackend,
     services::{self, ReleaseMetadata, ReleaseNoteBlock, ReleaseNotes, UpdateCheck, UpdateInstall},
 };
 
@@ -20,7 +21,7 @@ mod tests;
 use super::{
     blur::BlurBin,
     browser::{BrowserView, dismiss_modal_layer, modal_layer},
-    controls::{form_entry, modal_layout, segmented_control},
+    controls::{form_entry, menu_option, modal_layout, segmented_control},
     motion::set_reduce_motion,
     theme::{Theme, ThemeManager, ThemeTokens},
 };
@@ -392,6 +393,29 @@ fn general_page(browser: &BrowserView, manager: Rc<ThemeManager>) -> gtk::Widget
         manager_for_search_open.set_search_open_files_directly(toggle.is_active());
     });
     preferences.append(&search_open_row);
+
+    append_heading(&preferences, "VIDEO PREVIEWS");
+    let (acceleration_active, acceleration_sensitive, backend_sensitive) =
+        video_preview_control_state(manager.hardware_accelerated_video_previews());
+    let description = "Choose a hardware backend.";
+    let selected_backend = manager.video_preview_backend();
+    let manager_for_backend = manager.clone();
+    let (video_row, acceleration, backend) = video_preview_option(
+        description,
+        acceleration_active,
+        acceleration_sensitive,
+        backend_sensitive,
+        selected_backend,
+        Rc::new(move |backend| manager_for_backend.set_video_preview_backend(backend)),
+    );
+    let manager_for_acceleration = manager.clone();
+    let backend_for_acceleration = backend.clone();
+    acceleration.connect_active_notify(move |toggle| {
+        let enabled = toggle.is_active();
+        backend_for_acceleration.set_sensitive(enabled);
+        manager_for_acceleration.set_hardware_accelerated_video_previews(enabled);
+    });
+    preferences.append(&video_row);
 
     append_heading(&preferences, "MOTION");
     let (motion_row, reduce_motion) = settings_option(
@@ -1738,22 +1762,109 @@ fn settings_option(title: &str, description: &str, active: bool) -> (gtk::Box, g
     let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
     copy.set_hexpand(true);
     copy.set_valign(gtk::Align::Center);
-    let title = gtk::Label::new(Some(title));
-    title.set_xalign(0.0);
-    title.add_css_class("settings-option-title");
-    let description = gtk::Label::new(Some(description));
-    description.set_xalign(0.0);
-    description.set_wrap(true);
-    description.add_css_class("settings-option-description");
-    copy.append(&title);
-    copy.append(&description);
+    let title_label = gtk::Label::new(Some(title));
+    title_label.set_xalign(0.0);
+    title_label.add_css_class("settings-option-title");
+    let description_label = gtk::Label::new(Some(description));
+    description_label.set_xalign(0.0);
+    description_label.set_wrap(true);
+    description_label.add_css_class("settings-option-description");
+    copy.append(&title_label);
+    copy.append(&description_label);
     let toggle = gtk::Switch::builder()
         .active(active)
         .valign(gtk::Align::Center)
         .build();
+    toggle.update_property(&[
+        gtk::accessible::Property::Label(title),
+        gtk::accessible::Property::Description(description),
+    ]);
     row.append(&copy);
     row.append(&toggle);
     (row, toggle)
+}
+
+fn video_preview_option(
+    description: &str,
+    active: bool,
+    toggle_sensitive: bool,
+    backend_sensitive: bool,
+    selected_backend: MediaPreviewBackend,
+    on_backend_selected: Rc<dyn Fn(MediaPreviewBackend)>,
+) -> (gtk::Box, gtk::Switch, gtk::MenuButton) {
+    let (row, toggle) = settings_option(
+        "Use hardware acceleration for video previews.",
+        description,
+        active,
+    );
+    row.remove(&toggle);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    content.add_css_class("column-menu");
+    let options = [
+        ("Automatic", MediaPreviewBackend::Automatic),
+        ("VA-API", MediaPreviewBackend::VaApi),
+        ("Vulkan", MediaPreviewBackend::Vulkan),
+    ]
+    .map(|(label, value)| {
+        let (option, check) = menu_option(label, selected_backend == value);
+        content.append(&option);
+        (label, value, option, check)
+    });
+    let popover = gtk::Popover::builder()
+        .child(&content)
+        .has_arrow(false)
+        .halign(gtk::Align::End)
+        .position(gtk::PositionType::Bottom)
+        .build();
+    popover.add_css_class("column-popover");
+    let backend = gtk::MenuButton::builder()
+        .label(video_preview_backend_label(selected_backend))
+        .always_show_arrow(true)
+        .popover(&popover)
+        .build();
+    backend.add_css_class("form-control");
+    backend.set_sensitive(backend_sensitive);
+    backend.set_valign(gtk::Align::Center);
+    backend.update_property(&[
+        gtk::accessible::Property::Label("Video preview hardware backend"),
+        gtk::accessible::Property::Description(description),
+    ]);
+    let checks = Rc::new(
+        options
+            .iter()
+            .map(|(_, value, _, check)| (*value, check.clone()))
+            .collect::<Vec<_>>(),
+    );
+    for (label, value, option, _) in options {
+        let backend = backend.clone();
+        let checks = checks.clone();
+        let on_backend_selected = on_backend_selected.clone();
+        option.connect_clicked(move |_| {
+            backend.set_label(label);
+            for (candidate, check) in checks.iter() {
+                check.set_visible(*candidate == value);
+            }
+            backend.popdown();
+            on_backend_selected(value);
+        });
+    }
+    toggle.set_sensitive(toggle_sensitive);
+    row.append(&backend);
+    row.append(&toggle);
+    (row, toggle, backend)
+}
+
+fn video_preview_backend_label(backend: MediaPreviewBackend) -> &'static str {
+    match backend {
+        MediaPreviewBackend::Automatic | MediaPreviewBackend::Software => "Automatic",
+        MediaPreviewBackend::VaApi => "VA-API",
+        MediaPreviewBackend::Vulkan => "Vulkan",
+    }
+}
+
+fn video_preview_control_state(enabled: bool) -> (bool, bool, bool) {
+    (enabled, true, enabled)
 }
 
 fn append_heading(container: &gtk::Box, text: &str) -> gtk::Label {
