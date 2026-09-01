@@ -40,9 +40,14 @@ pub enum DocumentBlock {
     Code(String),
     Rule,
     TableRow {
-        header: bool,
-        cells: Vec<String>,
+        cells: Vec<DocumentTableCell>,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentTableCell {
+    pub header: bool,
+    pub markup: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -249,7 +254,7 @@ fn parse_markdown_bounded(
     let mut lists = Vec::<Option<u64>>::new();
     let mut quote_depth = 0usize;
     let mut table_header = false;
-    let mut table_row: Option<Vec<String>> = None;
+    let mut table_row: Option<Vec<DocumentTableCell>> = None;
     let mut table_cell: Option<String> = None;
     let mut raw_html = false;
     let mut options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
@@ -335,26 +340,25 @@ fn parse_markdown_bounded(
             }
             Event::End(TagEnd::TableHead) => {
                 if let Some(cells) = table_row.take() {
-                    blocks.push(DocumentBlock::TableRow {
-                        header: true,
-                        cells,
-                    });
+                    blocks.push(DocumentBlock::TableRow { cells });
                 }
                 table_header = false;
             }
             Event::Start(Tag::TableRow) => table_row = Some(Vec::new()),
             Event::End(TagEnd::TableRow) => {
                 if let Some(cells) = table_row.take() {
-                    blocks.push(DocumentBlock::TableRow {
-                        header: table_header,
-                        cells,
-                    });
+                    blocks.push(DocumentBlock::TableRow { cells });
                 }
             }
             Event::Start(Tag::TableCell) => table_cell = Some(String::new()),
             Event::End(TagEnd::TableCell) => {
                 if let Some(cell) = table_cell.take() {
-                    table_row.get_or_insert_with(Vec::new).push(cell);
+                    table_row
+                        .get_or_insert_with(Vec::new)
+                        .push(DocumentTableCell {
+                            header: table_header,
+                            markup: cell,
+                        });
                 }
             }
             Event::Start(Tag::Emphasis) => append_markup(&mut active, &mut table_cell, "<i>"),
@@ -460,10 +464,9 @@ struct HtmlState {
     stack: Vec<String>,
     skipped_depth: usize,
     quote_depth: usize,
-    table_header: bool,
-    table_row_header: bool,
-    table_row: Option<Vec<String>>,
+    table_row: Option<Vec<DocumentTableCell>>,
     table_cell: Option<String>,
+    table_cell_header: bool,
     markup_remaining: usize,
     markup_exceeded: bool,
     preformatted: bool,
@@ -481,10 +484,9 @@ impl HtmlState {
             stack: Vec::new(),
             skipped_depth: 0,
             quote_depth: 0,
-            table_header: false,
-            table_row_header: false,
             table_row: None,
             table_cell: None,
+            table_cell_header: false,
             markup_remaining: markup_limit,
             markup_exceeded: false,
             preformatted: false,
@@ -572,6 +574,7 @@ impl HtmlState {
             "code" if !self.preformatted => {
                 self.append_markup("<tt>");
             }
+            "code" => {}
             "hr" => {
                 self.finish_active();
                 self.blocks.push(DocumentBlock::Rule);
@@ -581,20 +584,16 @@ impl HtmlState {
                 self.append_markup("\n");
             }
             "table" => self.finish_active(),
-            "thead" => self.table_header = true,
-            "tr" => {
-                self.table_row_header = false;
-                self.table_row = Some(Vec::new());
-            }
+            "tr" => self.table_row = Some(Vec::new()),
             "th" | "td" => {
-                self.table_row_header |= name == "th";
+                self.table_cell_header = name == "th";
                 self.table_cell = Some(String::new());
                 self.append_link_openings();
             }
             "main" | "article" | "section" | "header" | "footer" | "nav" | "aside" | "div" => {
                 self.finish_active();
             }
-            "html" | "body" | "span" | "tbody" | "tfoot" => {}
+            "html" | "body" | "span" | "thead" | "tbody" | "tfoot" => {}
             _ => self.warned = true,
         }
 
@@ -645,19 +644,20 @@ impl HtmlState {
             "code" if !self.preformatted => {
                 self.append_markup("</tt>");
             }
-            "thead" => self.table_header = false,
             "tr" => {
                 if let Some(cells) = self.table_row.take() {
-                    self.blocks.push(DocumentBlock::TableRow {
-                        header: self.table_header || self.table_row_header,
-                        cells,
-                    });
+                    self.blocks.push(DocumentBlock::TableRow { cells });
                 }
             }
             "th" | "td" => {
                 self.append_link_closings();
                 if let Some(cell) = self.table_cell.take() {
-                    self.table_row.get_or_insert_with(Vec::new).push(cell);
+                    self.table_row
+                        .get_or_insert_with(Vec::new)
+                        .push(DocumentTableCell {
+                            header: self.table_cell_header,
+                            markup: cell,
+                        });
                 }
             }
             "main" | "article" | "section" | "header" | "footer" | "nav" | "aside" | "div" => {
@@ -764,11 +764,36 @@ impl HtmlState {
     }
 
     fn close_implied_before_start(&mut self, incoming: &str) {
+        match incoming {
+            "th" | "td" => self.close_current_table_element(&["th", "td"]),
+            "tr" => self.close_current_table_element(&["tr"]),
+            "thead" | "tbody" | "tfoot" => {
+                self.close_current_table_element(&["tr"]);
+                self.close_current_table_element(&["thead", "tbody", "tfoot"]);
+            }
+            _ => {}
+        }
         while self
             .stack
             .last()
             .is_some_and(|open| html_start_implies_end(open, incoming))
         {
+            self.close_top();
+        }
+    }
+
+    fn close_current_table_element(&mut self, names: &[&str]) {
+        let Some(table) = self.stack.iter().rposition(|open| open == "table") else {
+            return;
+        };
+        let Some(position) = self.stack[table + 1..]
+            .iter()
+            .rposition(|open| names.contains(&open.as_str()))
+            .map(|position| table + 1 + position)
+        else {
+            return;
+        };
+        while self.stack.len() > position {
             self.close_top();
         }
     }
@@ -887,7 +912,9 @@ fn block_has_balanced_markup(block: &DocumentBlock) -> bool {
         | DocumentBlock::ListItem { markup, .. }
         | DocumentBlock::Quote(markup)
         | DocumentBlock::Code(markup) => has_balanced_markup(markup),
-        DocumentBlock::TableRow { cells, .. } => cells.iter().all(|cell| has_balanced_markup(cell)),
+        DocumentBlock::TableRow { cells } => {
+            cells.iter().all(|cell| has_balanced_markup(&cell.markup))
+        }
         DocumentBlock::Rule => true,
     }
 }
@@ -926,7 +953,7 @@ fn block_markup_bytes(block: &DocumentBlock) -> usize {
         | DocumentBlock::ListItem { markup, .. }
         | DocumentBlock::Quote(markup)
         | DocumentBlock::Code(markup) => markup.len(),
-        DocumentBlock::TableRow { cells, .. } => cells.iter().map(String::len).sum(),
+        DocumentBlock::TableRow { cells } => cells.iter().map(|cell| cell.markup.len()).sum(),
         DocumentBlock::Rule => 0,
     }
 }
@@ -1002,10 +1029,6 @@ fn append_escaped(active: &mut Option<ActiveBlock>, cell: &mut Option<String>, t
 
 fn html_start_implies_end(open: &str, incoming: &str) -> bool {
     (open == "li" && incoming == "li")
-        || (matches!(open, "th" | "td")
-            && matches!(incoming, "th" | "td" | "tr" | "thead" | "tbody" | "tfoot"))
-        || (open == "tr" && matches!(incoming, "tr" | "thead" | "tbody" | "tfoot"))
-        || (matches!(open, "thead" | "tbody") && matches!(incoming, "thead" | "tbody" | "tfoot"))
         || (open == "p"
             && matches!(
                 incoming,

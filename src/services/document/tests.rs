@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use super::{
-    DocumentBlock, DocumentKind, ParseLimits, document_kind, parse_document,
+    DocumentBlock, DocumentKind, DocumentTableCell, ParseLimits, document_kind, parse_document,
     parse_document_with_limits, parse_markdown,
 };
 use crate::sandbox::Cancellation;
@@ -146,7 +146,11 @@ fn markdown_supports_quotes_tables_tasks_strikethrough_and_safe_images() {
     assert!(format!("{:?}", parsed.document.blocks).contains("☑ <s>done</s>"));
     assert!(parsed.document.blocks.iter().any(|block| matches!(
         block,
-        DocumentBlock::TableRow { header: true, cells } if cells == &["A", "B"]
+        DocumentBlock::TableRow { cells }
+            if cells == &[
+                DocumentTableCell { header: true, markup: "A".to_owned() },
+                DocumentTableCell { header: true, markup: "B".to_owned() },
+            ]
     )));
     let debug = format!("{:?}", parsed.document.blocks);
     assert!(debug.contains("[Image: alt]"));
@@ -180,8 +184,8 @@ fn html_supports_semantic_blocks_formatting_entities_lists_tables_and_breaks() {
     assert!(debug.contains("marker: \"1.\""));
     assert!(debug.contains("Quote(\"quote\")"));
     assert!(debug.contains("Code(\"x &lt; y\")"));
-    assert!(debug.contains("TableRow { header: true"));
-    assert!(debug.contains("TableRow { header: false"));
+    assert!(debug.contains("DocumentTableCell { header: true"));
+    assert!(debug.contains("DocumentTableCell { header: false"));
     assert!(parsed.warnings.is_empty());
 }
 
@@ -347,33 +351,86 @@ fn html_closes_compact_table_rows_and_sections_without_losing_cells() {
         .blocks,
         vec![
             DocumentBlock::TableRow {
-                header: true,
-                cells: vec!["A".to_owned()],
+                cells: vec![DocumentTableCell {
+                    header: true,
+                    markup: "A".to_owned(),
+                }],
             },
             DocumentBlock::TableRow {
-                header: false,
-                cells: vec!["B".to_owned()],
+                cells: vec![DocumentTableCell {
+                    header: false,
+                    markup: "B".to_owned(),
+                }],
             },
         ]
     );
 }
 
 #[test]
-fn html_th_cells_mark_rows_as_headers_without_thead() {
+fn html_preserves_header_semantics_per_table_cell() {
     assert_eq!(
         parse_document(
             DocumentKind::Html,
-            "<table><tr><th>Name</th></tr></table>",
+            "<table><tr><th>Name</th><td>Alice</td></tr></table>",
             &Cancellation::default(),
         )
-        .expect("th should retain header semantics without thead")
+        .expect("th and td should retain distinct semantics")
         .document
         .blocks,
         vec![DocumentBlock::TableRow {
-            header: true,
-            cells: vec!["Name".to_owned()],
+            cells: vec![
+                DocumentTableCell {
+                    header: true,
+                    markup: "Name".to_owned(),
+                },
+                DocumentTableCell {
+                    header: false,
+                    markup: "Alice".to_owned(),
+                },
+            ],
         }]
     );
+}
+
+#[test]
+fn html_closes_nested_content_before_an_optional_table_cell_end() {
+    assert_eq!(
+        parse_document(
+            DocumentKind::Html,
+            "<table><tr><td><p>A<td>B</table>",
+            &Cancellation::default(),
+        )
+        .expect("a new cell should close nested content in the previous cell")
+        .document
+        .blocks,
+        vec![DocumentBlock::TableRow {
+            cells: vec![
+                DocumentTableCell {
+                    header: false,
+                    markup: "A".to_owned(),
+                },
+                DocumentTableCell {
+                    header: false,
+                    markup: "B".to_owned(),
+                },
+            ],
+        }]
+    );
+}
+
+#[test]
+fn html_pre_code_is_supported_without_an_omission_warning() {
+    let parsed = parse_document(
+        DocumentKind::Html,
+        "<pre><code>x &lt; y</code></pre>",
+        &Cancellation::default(),
+    )
+    .expect("canonical pre/code should render");
+    assert_eq!(
+        parsed.document.blocks,
+        vec![DocumentBlock::Code("x &lt; y".to_owned())]
+    );
+    assert!(parsed.warnings.is_empty());
 }
 
 #[test]

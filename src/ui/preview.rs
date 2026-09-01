@@ -987,12 +987,10 @@ fn rendered_document(document: &Document, warnings: &[String]) -> gtk::ScrolledW
                 table.add_css_class("preview-document-table");
                 table.set_accessible_role(gtk::AccessibleRole::Table);
                 let mut row = 0;
-                while let Some(DocumentBlock::TableRow { header, cells }) =
-                    document.blocks.get(index)
-                {
-                    for (column, markup) in cells.iter().enumerate() {
-                        let label = document_label(markup, "preview-document-table-cell");
-                        if *header {
+                while let Some(DocumentBlock::TableRow { cells }) = document.blocks.get(index) {
+                    for (column, cell) in cells.iter().enumerate() {
+                        let label = document_label(&cell.markup, "preview-document-table-cell");
+                        if cell.header {
                             label.add_css_class("header");
                             label.set_accessible_role(gtk::AccessibleRole::ColumnHeader);
                         } else {
