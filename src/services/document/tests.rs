@@ -316,6 +316,67 @@ fn html_paragraphs_inside_blockquotes_keep_quote_semantics() {
 }
 
 #[test]
+fn html_markup_limit_applies_while_links_are_reemitted() {
+    let limits = ParseLimits {
+        events: 2,
+        markup: 128,
+        ..ParseLimits::default()
+    };
+    let html = format!(
+        "<a href=\"https://example.test/{}\">{}</a>",
+        "x".repeat(64),
+        "<p>x</p>".repeat(100)
+    );
+    assert!(
+        parse_document_with_limits(DocumentKind::Html, &html, &Cancellation::default(), limits,)
+            .expect_err("repeated link markup must stop at the output limit")
+            .contains("markup limit")
+    );
+}
+
+#[test]
+fn html_closes_compact_table_rows_and_sections_without_losing_cells() {
+    assert_eq!(
+        parse_document(
+            DocumentKind::Html,
+            "<table><thead><tr><th>A<tbody><tr><td>B</table>",
+            &Cancellation::default(),
+        )
+        .expect("optional table end tags are valid")
+        .document
+        .blocks,
+        vec![
+            DocumentBlock::TableRow {
+                header: true,
+                cells: vec!["A".to_owned()],
+            },
+            DocumentBlock::TableRow {
+                header: false,
+                cells: vec!["B".to_owned()],
+            },
+        ]
+    );
+}
+
+#[test]
+fn html_th_cells_mark_rows_as_headers_without_thead() {
+    assert_eq!(
+        parse_document(
+            DocumentKind::Html,
+            "<table><tr><th>Name</th></tr></table>",
+            &Cancellation::default(),
+        )
+        .expect("th should retain header semantics without thead")
+        .document
+        .blocks,
+        vec![DocumentBlock::TableRow {
+            header: true,
+            cells: vec!["Name".to_owned()],
+        }]
+    );
+}
+
+#[test]
 fn parser_enforces_input_event_depth_widget_markup_time_and_cancellation_limits() {
     let cancellation = Cancellation::default();
     assert!(

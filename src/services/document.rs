@@ -461,15 +461,18 @@ struct HtmlState {
     skipped_depth: usize,
     quote_depth: usize,
     table_header: bool,
+    table_row_header: bool,
     table_row: Option<Vec<String>>,
     table_cell: Option<String>,
+    markup_remaining: usize,
+    markup_exceeded: bool,
     preformatted: bool,
     warned: bool,
     malformed: bool,
 }
 
 impl HtmlState {
-    fn new() -> Self {
+    fn new(markup_limit: usize) -> Self {
         Self {
             blocks: Vec::new(),
             active: None,
@@ -479,8 +482,11 @@ impl HtmlState {
             skipped_depth: 0,
             quote_depth: 0,
             table_header: false,
+            table_row_header: false,
             table_row: None,
             table_cell: None,
+            markup_remaining: markup_limit,
+            markup_exceeded: false,
             preformatted: false,
             warned: false,
             malformed: false,
@@ -546,20 +552,16 @@ impl HtmlState {
                     markup: String::new(),
                 });
             }
-            "em" | "i" => append_markup(&mut self.active, &mut self.table_cell, "<i>"),
-            "strong" | "b" => append_markup(&mut self.active, &mut self.table_cell, "<b>"),
-            "s" | "del" => append_markup(&mut self.active, &mut self.table_cell, "<s>"),
+            "em" | "i" => self.append_markup("<i>"),
+            "strong" | "b" => self.append_markup("<b>"),
+            "s" | "del" => self.append_markup("<s>"),
             "a" => {
                 self.ensure_text_target();
                 let destination = href.filter(|href| has_web_scheme(href)).map(str::to_owned);
                 if href.is_some() && destination.is_none() {
                     self.warned = true;
                 }
-                append_link_open(
-                    &mut self.active,
-                    &mut self.table_cell,
-                    destination.as_deref(),
-                );
+                self.append_link_open(destination.as_deref());
                 self.links.push(destination);
             }
             "pre" => {
@@ -568,7 +570,7 @@ impl HtmlState {
                 self.preformatted = true;
             }
             "code" if !self.preformatted => {
-                append_markup(&mut self.active, &mut self.table_cell, "<tt>");
+                self.append_markup("<tt>");
             }
             "hr" => {
                 self.finish_active();
@@ -576,19 +578,23 @@ impl HtmlState {
             }
             "br" => {
                 self.ensure_text_target();
-                append_markup(&mut self.active, &mut self.table_cell, "\n");
+                self.append_markup("\n");
             }
             "table" => self.finish_active(),
             "thead" => self.table_header = true,
-            "tr" => self.table_row = Some(Vec::new()),
+            "tr" => {
+                self.table_row_header = false;
+                self.table_row = Some(Vec::new());
+            }
             "th" | "td" => {
+                self.table_row_header |= name == "th";
                 self.table_cell = Some(String::new());
                 self.append_link_openings();
             }
             "main" | "article" | "section" | "header" | "footer" | "nav" | "aside" | "div" => {
                 self.finish_active();
             }
-            "html" | "body" | "span" | "tbody" => {}
+            "html" | "body" | "span" | "tbody" | "tfoot" => {}
             _ => self.warned = true,
         }
 
@@ -624,12 +630,12 @@ impl HtmlState {
                 }
                 self.lists.pop();
             }
-            "em" | "i" => append_markup(&mut self.active, &mut self.table_cell, "</i>"),
-            "strong" | "b" => append_markup(&mut self.active, &mut self.table_cell, "</b>"),
-            "s" | "del" => append_markup(&mut self.active, &mut self.table_cell, "</s>"),
+            "em" | "i" => self.append_markup("</i>"),
+            "strong" | "b" => self.append_markup("</b>"),
+            "s" | "del" => self.append_markup("</s>"),
             "a" => {
                 if let Some(link) = self.links.pop() {
-                    append_link_close(&mut self.active, &mut self.table_cell, link.is_some());
+                    self.append_link_close(link.is_some());
                 }
             }
             "pre" => {
@@ -637,13 +643,13 @@ impl HtmlState {
                 self.preformatted = false;
             }
             "code" if !self.preformatted => {
-                append_markup(&mut self.active, &mut self.table_cell, "</tt>");
+                self.append_markup("</tt>");
             }
             "thead" => self.table_header = false,
             "tr" => {
                 if let Some(cells) = self.table_row.take() {
                     self.blocks.push(DocumentBlock::TableRow {
-                        header: self.table_header,
+                        header: self.table_header || self.table_row_header,
                         cells,
                     });
                 }
@@ -666,7 +672,7 @@ impl HtmlState {
             return;
         }
         self.ensure_text_target();
-        append_escaped(&mut self.active, &mut self.table_cell, text);
+        self.append_escaped(text);
     }
 
     fn start_active(&mut self, active: ActiveBlock) {
@@ -693,13 +699,56 @@ impl HtmlState {
 
     fn append_link_openings(&mut self) {
         for link in self.links.clone() {
-            append_link_open(&mut self.active, &mut self.table_cell, link.as_deref());
+            self.append_link_open(link.as_deref());
+            if self.markup_exceeded {
+                break;
+            }
         }
     }
 
     fn append_link_closings(&mut self) {
-        for link in self.links.iter().rev() {
-            append_link_close(&mut self.active, &mut self.table_cell, link.is_some());
+        for index in (0..self.links.len()).rev() {
+            self.append_link_close(self.links[index].is_some());
+            if self.markup_exceeded {
+                break;
+            }
+        }
+    }
+
+    fn append_markup(&mut self, markup: &str) {
+        if self.markup_exceeded || markup.len() > self.markup_remaining {
+            self.markup_exceeded = true;
+            return;
+        }
+        self.markup_remaining -= markup.len();
+        append_markup(&mut self.active, &mut self.table_cell, markup);
+    }
+
+    fn append_escaped(&mut self, text: &str) {
+        self.append_markup(&glib::markup_escape_text(text));
+    }
+
+    fn append_link_open(&mut self, destination: Option<&str>) {
+        if let Some(destination) = destination {
+            self.append_markup("<a href=\"");
+            self.append_escaped(destination);
+            self.append_markup("\">");
+        } else {
+            self.append_markup("<u>");
+        }
+    }
+
+    fn append_link_close(&mut self, external: bool) {
+        if self.active.is_some() || self.table_cell.is_some() {
+            self.append_markup(if external { "</a>" } else { "</u>" });
+        }
+    }
+
+    fn check_markup(&self) -> Result<(), String> {
+        if self.markup_exceeded {
+            Err("Rendered preview exceeded the 4 MB markup limit".to_owned())
+        } else {
+            Ok(())
         }
     }
 
@@ -739,7 +788,7 @@ fn parse_html_bounded(
     limits: ParseLimits,
 ) -> Result<ParsedDocument, String> {
     let mut budget = ParseBudget::new(cancellation, limits);
-    let mut state = HtmlState::new();
+    let mut state = HtmlState::new(limits.markup);
     let mut emitter = DefaultEmitter::default();
     emitter.naively_switch_states(true);
     for token in Tokenizer::new_with_emitter(html, emitter) {
@@ -758,19 +807,25 @@ fn parse_html_bounded(
                     }
                 }
                 state.start(&name, href.as_deref(), tag.self_closing);
+                state.check_markup()?;
                 budget.nesting(state.stack.len())?;
             }
             Token::EndTag(tag) => {
                 let name = String::from_utf8_lossy(&tag.name).to_ascii_lowercase();
                 state.end(&name);
+                state.check_markup()?;
                 budget.nesting(state.stack.len())?;
             }
-            Token::String(text) => state.text(&String::from_utf8_lossy(&text.value)),
+            Token::String(text) => {
+                state.text(&String::from_utf8_lossy(&text.value));
+                state.check_markup()?;
+            }
             Token::Error(_) => state.malformed = true,
             Token::Comment(_) | Token::Doctype(_) => {}
         }
     }
     let state = state.finish();
+    state.check_markup()?;
     if state.malformed {
         return Err("Rendered preview is unavailable because the HTML is malformed".to_owned());
     }
@@ -945,30 +1000,11 @@ fn append_escaped(active: &mut Option<ActiveBlock>, cell: &mut Option<String>, t
     append_markup(active, cell, &glib::markup_escape_text(text));
 }
 
-fn append_link_open(
-    active: &mut Option<ActiveBlock>,
-    cell: &mut Option<String>,
-    destination: Option<&str>,
-) {
-    if let Some(destination) = destination {
-        append_markup(active, cell, "<a href=\"");
-        append_escaped(active, cell, destination);
-        append_markup(active, cell, "\">");
-    } else {
-        append_markup(active, cell, "<u>");
-    }
-}
-
-fn append_link_close(active: &mut Option<ActiveBlock>, cell: &mut Option<String>, external: bool) {
-    if active.is_some() || cell.is_some() {
-        append_markup(active, cell, if external { "</a>" } else { "</u>" });
-    }
-}
-
 fn html_start_implies_end(open: &str, incoming: &str) -> bool {
     (open == "li" && incoming == "li")
-        || (matches!(open, "th" | "td") && matches!(incoming, "th" | "td" | "tr"))
-        || (open == "tr" && incoming == "tr")
+        || (matches!(open, "th" | "td")
+            && matches!(incoming, "th" | "td" | "tr" | "thead" | "tbody" | "tfoot"))
+        || (open == "tr" && matches!(incoming, "tr" | "thead" | "tbody" | "tfoot"))
         || (matches!(open, "thead" | "tbody") && matches!(incoming, "thead" | "tbody" | "tfoot"))
         || (open == "p"
             && matches!(
