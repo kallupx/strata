@@ -34,6 +34,18 @@ enum DocumentView {
     Source,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DocumentTextPosition {
+    label: usize,
+    offset: usize,
+}
+
+struct DocumentSelectableLabel {
+    label: gtk::Label,
+    text: String,
+    chars: usize,
+}
+
 struct PreviewState {
     provider: Rc<dyn PreviewProvider>,
     revealer: gtk::Revealer,
@@ -43,6 +55,10 @@ struct PreviewState {
     modified: gtk::Label,
     content_type: gtk::Label,
     content: gtk::Box,
+    document_view_button: gtk::Button,
+    document_view_icon: gtk::Image,
+    document_view: Cell<DocumentView>,
+    document_stack: RefCell<Option<gtk::Stack>>,
     media: RefCell<Option<gtk::Video>>,
     split: RefCell<Option<gtk::Paned>>,
     occupied_width: RefCell<Option<Rc<dyn Fn() -> i32>>>,
@@ -87,6 +103,15 @@ impl PreviewDrawer {
             16,
         )));
         open.add_css_class("preview-header-action");
+        let document_view_icon = crate::assets::primary_icon(crate::assets::icons::FILE_CODE, 16);
+        let document_view_button = gtk::Button::builder()
+            .tooltip_text("View source")
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        document_view_button.set_child(Some(&document_view_icon));
+        document_view_button.add_css_class("preview-header-action");
+        document_view_button.update_property(&[gtk::accessible::Property::Label("View source")]);
         let close = gtk::Button::builder()
             .tooltip_text("Close preview (Space)")
             .valign(gtk::Align::Center)
@@ -99,6 +124,7 @@ impl PreviewDrawer {
         close.add_css_class("preview-header-action");
         header.append(&icon);
         header.append(&title);
+        header.append(&document_view_button);
         header.append(&open);
         header.append(&close);
         pane.append(&header);
@@ -134,6 +160,10 @@ impl PreviewDrawer {
             modified,
             content_type,
             content,
+            document_view_button: document_view_button.clone(),
+            document_view_icon,
+            document_view: Cell::new(DocumentView::Rendered),
+            document_stack: RefCell::new(None),
             media: RefCell::new(None),
             split: RefCell::new(None),
             occupied_width: RefCell::new(None),
@@ -146,6 +176,22 @@ impl PreviewDrawer {
             last_split_width: Cell::new(0),
             animating: Cell::new(false),
             animation_generation: Rc::new(Cell::new(0)),
+        });
+        let weak = Rc::downgrade(&state);
+        document_view_button.connect_clicked(move |_| {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            let next = match state.document_view.get() {
+                DocumentView::Rendered => DocumentView::Source,
+                DocumentView::Source => DocumentView::Rendered,
+            };
+            let Some(stack) = state.document_stack.borrow().as_ref().cloned() else {
+                return;
+            };
+            stack.set_visible_child_name(document_view_name(next));
+            state.document_view.set(next);
+            state.update_document_view_action();
         });
         let weak = Rc::downgrade(&state);
         open.connect_clicked(move |_| {
@@ -494,12 +540,6 @@ impl PreviewState {
             super::theme::ThemeManager::shared().render_documents_by_default(),
             document.is_some(),
         );
-        let selected = usize::from(initial == DocumentView::Source);
-        let (control, buttons) =
-            super::controls::segmented_control(&["Rendered", "Source"], selected);
-        control.add_css_class("preview-document-switcher");
-        buttons[0].set_sensitive(document.is_some());
-        self.content.append(&control);
 
         if let Some(reason) = fallback_reason {
             let notice = gtk::Label::new(Some(reason));
@@ -519,23 +559,11 @@ impl PreviewState {
             stack.add_named(&rendered_document(document, warnings), Some("rendered"));
         }
         stack.add_named(source, Some("source"));
-        stack.set_visible_child_name(match initial {
-            DocumentView::Rendered => "rendered",
-            DocumentView::Source => "source",
-        });
-
-        let rendered_stack = stack.clone();
-        buttons[0].connect_toggled(move |button| {
-            if button.is_active() {
-                rendered_stack.set_visible_child_name("rendered");
-            }
-        });
-        let source_stack = stack.clone();
-        buttons[1].connect_toggled(move |button| {
-            if button.is_active() {
-                source_stack.set_visible_child_name("source");
-            }
-        });
+        stack.set_visible_child_name(document_view_name(initial));
+        self.document_view.set(initial);
+        self.document_stack.replace(Some(stack.clone()));
+        self.document_view_button.set_visible(document.is_some());
+        self.update_document_view_action();
         self.content.append(&stack);
     }
 
@@ -806,12 +834,22 @@ impl PreviewState {
     }
 
     fn clear_content(&self) {
+        self.document_view_button.set_visible(false);
+        self.document_stack.borrow_mut().take();
         if let Some(video) = self.media.borrow_mut().take()
             && let Some(stream) = video.media_stream()
         {
             stream.set_playing(false);
         }
         clear_box(&self.content);
+    }
+
+    fn update_document_view_action(&self) {
+        let (label, icon) = document_view_action(self.document_view.get());
+        self.document_view_button.set_tooltip_text(Some(label));
+        self.document_view_button
+            .update_property(&[gtk::accessible::Property::Label(label)]);
+        crate::assets::set_primary_icon(&self.document_view_icon, icon);
     }
 
     fn show_loading(&self) {
@@ -887,6 +925,20 @@ fn initial_document_view(prefer_rendered: bool, rendered_available: bool) -> Doc
         DocumentView::Rendered
     } else {
         DocumentView::Source
+    }
+}
+
+fn document_view_name(view: DocumentView) -> &'static str {
+    match view {
+        DocumentView::Rendered => "rendered",
+        DocumentView::Source => "source",
+    }
+}
+
+fn document_view_action(view: DocumentView) -> (&'static str, &'static str) {
+    match view {
+        DocumentView::Rendered => ("View source", crate::assets::icons::FILE_CODE),
+        DocumentView::Source => ("View rendered", crate::assets::icons::DOCUMENTS),
     }
 }
 
@@ -993,6 +1045,8 @@ fn rendered_document(document: &Document, warnings: &[String]) -> gtk::ScrolledW
         }
     }
 
+    install_document_selection(&content);
+
     gtk::ScrolledWindow::builder()
         .child(&content)
         .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -1030,6 +1084,7 @@ fn rendered_list(blocks: &[DocumentBlock], index: &mut usize) -> gtk::Box {
                 row.set_accessible_role(gtk::AccessibleRole::ListItem);
                 let bullet = gtk::Label::new(Some(marker));
                 bullet.add_css_class("preview-document-list-marker");
+                bullet.set_selectable(true);
                 bullet.set_valign(gtk::Align::Start);
                 let body = gtk::Box::new(gtk::Orientation::Vertical, 5);
                 body.append(&document_label(markup, "preview-document-copy"));
@@ -1162,6 +1217,270 @@ fn document_label(markup: &str, class: &str) -> gtk::Label {
         glib::Propagation::Stop
     });
     label
+}
+
+fn install_document_selection(content: &gtk::Box) {
+    let root: gtk::Widget = content.clone().upcast();
+    let labels = Rc::new(selectable_document_labels(&root));
+    if labels.len() < 2 {
+        return;
+    }
+
+    let anchor = Rc::new(Cell::new(None::<DocumentTextPosition>));
+    let cursor = Rc::new(Cell::new(None::<DocumentTextPosition>));
+
+    let clear = gtk::GestureClick::new();
+    clear.set_button(1);
+    clear.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let labels_for_clear = labels.clone();
+    let anchor_for_clear = anchor.clone();
+    let cursor_for_clear = cursor.clone();
+    clear.connect_pressed(move |_, _, _, _| {
+        for item in labels_for_clear.iter() {
+            item.label.select_region(0, 0);
+        }
+        anchor_for_clear.set(None);
+        cursor_for_clear.set(None);
+    });
+    content.add_controller(clear.clone());
+
+    let origin = Rc::new(Cell::new((0.0, 0.0)));
+    let drag = gtk::GestureDrag::new();
+    drag.set_button(1);
+    drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let root_for_begin = root.clone();
+    let labels_for_begin = labels.clone();
+    let anchor_for_begin = anchor.clone();
+    let cursor_for_begin = cursor.clone();
+    let origin_for_begin = origin.clone();
+    drag.connect_drag_begin(move |gesture, x, y| {
+        let position = document_text_position(
+            &root_for_begin,
+            &labels_for_begin,
+            gtk::graphene::Point::new(x as f32, y as f32),
+            false,
+        );
+        if position.is_some() {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        }
+        origin_for_begin.set((x, y));
+        anchor_for_begin.set(position);
+        cursor_for_begin.set(position);
+    });
+    let root_for_update = root.clone();
+    let labels_for_update = labels.clone();
+    let anchor_for_update = anchor.clone();
+    let cursor_for_update = cursor.clone();
+    drag.connect_drag_update(move |_, offset_x, offset_y| {
+        let Some(anchor) = anchor_for_update.get() else {
+            return;
+        };
+        let (start_x, start_y) = origin.get();
+        let Some(position) = document_text_position(
+            &root_for_update,
+            &labels_for_update,
+            gtk::graphene::Point::new((start_x + offset_x) as f32, (start_y + offset_y) as f32),
+            true,
+        ) else {
+            return;
+        };
+        apply_document_selection(&labels_for_update, anchor, position);
+        cursor_for_update.set(Some(position));
+    });
+    let root_for_end = root.clone();
+    let labels_for_end = labels.clone();
+    let anchor_for_end = anchor.clone();
+    let cursor_for_end = cursor.clone();
+    drag.connect_drag_end(move |_, _, _| {
+        let (Some(anchor), Some(cursor)) = (anchor_for_end.get(), cursor_for_end.get()) else {
+            return;
+        };
+        let text = document_selection_text(&labels_for_end, anchor, cursor);
+        if !text.is_empty() {
+            root_for_end.primary_clipboard().set_text(&text);
+        }
+    });
+    drag.group_with(&clear);
+    content.add_controller(drag);
+
+    let copy = gtk::EventControllerKey::new();
+    copy.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let root_for_copy = root;
+    copy.connect_key_pressed(move |_, key, _, modifiers| {
+        if !key
+            .to_unicode()
+            .is_some_and(|character| character.eq_ignore_ascii_case(&'c'))
+            || !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+        {
+            return glib::Propagation::Proceed;
+        }
+        let (Some(anchor), Some(cursor)) = (anchor.get(), cursor.get()) else {
+            return glib::Propagation::Proceed;
+        };
+        let text = document_selection_text(&labels, anchor, cursor);
+        if text.is_empty() {
+            glib::Propagation::Proceed
+        } else {
+            root_for_copy.clipboard().set_text(&text);
+            glib::Propagation::Stop
+        }
+    });
+    content.add_controller(copy);
+}
+
+fn selectable_document_labels(root: &gtk::Widget) -> Vec<DocumentSelectableLabel> {
+    fn collect(widget: &gtk::Widget, labels: &mut Vec<DocumentSelectableLabel>) {
+        if let Some(label) = widget.downcast_ref::<gtk::Label>()
+            && label.is_selectable()
+        {
+            let text = label.text().to_string();
+            labels.push(DocumentSelectableLabel {
+                label: label.clone(),
+                chars: text.chars().count(),
+                text,
+            });
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            child = current.next_sibling();
+            collect(&current, labels);
+        }
+    }
+
+    let mut labels = Vec::new();
+    collect(root, &mut labels);
+    labels
+}
+
+fn document_text_position(
+    root: &gtk::Widget,
+    labels: &[DocumentSelectableLabel],
+    point: gtk::graphene::Point,
+    nearest: bool,
+) -> Option<DocumentTextPosition> {
+    let mut candidate = None;
+    let mut candidate_distance = f32::MAX;
+    for (index, item) in labels.iter().enumerate() {
+        let Some(bounds) = item.label.compute_bounds(root) else {
+            continue;
+        };
+        let distance = distance_to_rect(&point, &bounds);
+        if distance == 0.0 {
+            candidate = Some((index, bounds));
+            break;
+        }
+        if nearest && distance < candidate_distance {
+            candidate = Some((index, bounds));
+            candidate_distance = distance;
+        }
+    }
+    let (label, bounds) = candidate?;
+    let point = gtk::graphene::Point::new(
+        point.x().clamp(bounds.x(), bounds.x() + bounds.width()),
+        point.y().clamp(bounds.y(), bounds.y() + bounds.height()),
+    );
+    let local = root.compute_point(&labels[label].label, &point)?;
+    let (layout_x, layout_y) = labels[label].label.layout_offsets();
+    let (_, byte, trailing) = labels[label].label.layout().xy_to_index(
+        ((local.x() - layout_x as f32) * gtk::pango::SCALE as f32) as i32,
+        ((local.y() - layout_y as f32) * gtk::pango::SCALE as f32) as i32,
+    );
+    let mut byte = usize::try_from(byte.max(0))
+        .unwrap_or(0)
+        .min(labels[label].text.len());
+    while !labels[label].text.is_char_boundary(byte) {
+        byte = byte.saturating_sub(1);
+    }
+    Some(DocumentTextPosition {
+        label,
+        offset: labels[label].text[..byte]
+            .chars()
+            .count()
+            .saturating_add(usize::try_from(trailing.max(0)).unwrap_or(0))
+            .min(labels[label].chars),
+    })
+}
+
+fn distance_to_rect(point: &gtk::graphene::Point, rect: &gtk::graphene::Rect) -> f32 {
+    let dx = if point.x() < rect.x() {
+        rect.x() - point.x()
+    } else if point.x() > rect.x() + rect.width() {
+        point.x() - rect.x() - rect.width()
+    } else {
+        0.0
+    };
+    let dy = if point.y() < rect.y() {
+        rect.y() - point.y()
+    } else if point.y() > rect.y() + rect.height() {
+        point.y() - rect.y() - rect.height()
+    } else {
+        0.0
+    };
+    dx.mul_add(dx, dy * dy)
+}
+
+fn apply_document_selection(
+    labels: &[DocumentSelectableLabel],
+    anchor: DocumentTextPosition,
+    cursor: DocumentTextPosition,
+) {
+    for (index, item) in labels.iter().enumerate() {
+        let (start, end) =
+            document_selection_range(index, item.chars, anchor, cursor).unwrap_or((0, 0));
+        item.label.select_region(
+            i32::try_from(start).unwrap_or(i32::MAX),
+            i32::try_from(end).unwrap_or(i32::MAX),
+        );
+    }
+}
+
+fn document_selection_text(
+    labels: &[DocumentSelectableLabel],
+    anchor: DocumentTextPosition,
+    cursor: DocumentTextPosition,
+) -> String {
+    labels
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let (start, end) = document_selection_range(index, item.chars, anchor, cursor)?;
+            (start < end).then(|| {
+                item.text
+                    .chars()
+                    .skip(start)
+                    .take(end - start)
+                    .collect::<String>()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn document_selection_range(
+    label: usize,
+    length: usize,
+    anchor: DocumentTextPosition,
+    cursor: DocumentTextPosition,
+) -> Option<(usize, usize)> {
+    if anchor.label == cursor.label {
+        return (label == anchor.label).then(|| {
+            (
+                anchor.offset.min(cursor.offset),
+                anchor.offset.max(cursor.offset),
+            )
+        });
+    }
+    let (first, last) = if anchor.label < cursor.label {
+        (anchor, cursor)
+    } else {
+        (cursor, anchor)
+    };
+    match label {
+        _ if label < first.label || label > last.label => None,
+        _ if first.label == label => Some((first.offset, length)),
+        _ if last.label == label => Some((0, last.offset)),
+        _ => Some((0, length)),
+    }
 }
 
 fn copyable_command(command: &str) -> gtk::Overlay {

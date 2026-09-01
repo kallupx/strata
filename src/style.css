@@ -1483,10 +1483,6 @@ paned > separator {
   color: @theme_bg;
 }
 
-.preview-document-switcher {
-  margin: 10px 12px 8px;
-}
-
 .preview-document-fallback,
 .preview-document-warning {
   background: alpha(@theme_accent, 0.1);
@@ -1573,6 +1569,7 @@ paned > separator {
 
 .preview-document-heading selection,
 .preview-document-copy selection,
+.preview-document-list-marker selection,
 .preview-document-quote selection,
 .preview-document-code selection,
 .preview-document-table-cell selection {
