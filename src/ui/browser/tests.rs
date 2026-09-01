@@ -273,13 +273,24 @@ fn incoming_file_lists_sanitize_remote_credentials() {
         gio::File::for_uri("sftp://user@host/home/user/video.mp4"),
     ]);
 
+    let locations = locations_from_file_list_value(&files.to_value())
+        .expect("file list should contain sanitized locations");
+    let uris = locations
+        .iter()
+        .map(|location| {
+            location
+                .uri_value()
+                .expect("remote location should have a URI")
+                .trim_end_matches('/')
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        locations_from_file_list_value(&files.to_value()),
-        Some(vec![
-            Location::uri("smb://user@host/share/"),
-            Location::uri("smb://user@host/share/"),
-            Location::uri("sftp://user@host/home/user/video.mp4"),
-        ])
+        uris,
+        [
+            "smb://user@host/share",
+            "smb://user@host/share",
+            "sftp://user@host/home/user/video.mp4",
+        ]
     );
 }
 

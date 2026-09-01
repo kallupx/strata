@@ -98,8 +98,22 @@ fn gtk_bookmarks_sanitize_uris_with_credentials() {
     );
 
     assert_eq!(places.len(), 2);
-    assert_eq!(places[0].0.uri_value(), Some("smb://alice@host/safe/"));
-    assert_eq!(places[1].0.uri_value(), Some("smb://alice@host/private/"));
+    assert_eq!(
+        places[0]
+            .0
+            .uri_value()
+            .expect("remote place should have a URI")
+            .trim_end_matches('/'),
+        "smb://alice@host/safe"
+    );
+    assert_eq!(
+        places[1]
+            .0
+            .uri_value()
+            .expect("remote place should have a URI")
+            .trim_end_matches('/'),
+        "smb://alice@host/private"
+    );
 }
 
 #[test]

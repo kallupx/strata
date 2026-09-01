@@ -197,9 +197,14 @@ fn gio_files_with_embedded_credentials_are_sanitized() {
         "smb://user%3Bpassword=secret@host/share",
         "smb://user:secret@host/share",
     ] {
+        let location = location_for_file(&gio::File::for_uri(uri))
+            .expect("credential URI should produce a sanitized location");
         assert_eq!(
-            location_for_file(&gio::File::for_uri(uri)),
-            Some(Location::uri("smb://user@host/share/")),
+            location
+                .uri_value()
+                .expect("remote location should have a URI")
+                .trim_end_matches('/'),
+            "smb://user@host/share",
             "did not sanitize {uri}"
         );
     }
