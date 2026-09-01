@@ -577,7 +577,10 @@ impl ModeViews {
             }
             BrowserEvent::ColumnReloaded { depth } => {
                 for pane in self.panes_at(*depth) {
+                    pane.syncing_selection.set(true);
+                    pane.selection.unselect_all();
                     pane.model.splice(0, pane.model.n_items(), &[]);
+                    pane.syncing_selection.set(false);
                     pane.spinner.set_visible(true);
                     pane.spinner.start();
                     pane.stack.set_visible_child_name("loading");

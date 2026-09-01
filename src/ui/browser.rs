@@ -3538,7 +3538,10 @@ impl ViewState {
             }
             BrowserEvent::ColumnReloaded { depth } => {
                 if let Some(column) = self.columns.borrow().get(depth) {
+                    column.syncing_selection.set(true);
+                    column.selection.unselect_all();
                     column.model.splice(0, column.model.n_items(), &[]);
+                    column.syncing_selection.set(false);
                     column.entry_count.set(0);
                     set_filter_placeholder(column, 0);
                     column.spinner.set_visible(true);
