@@ -615,6 +615,14 @@ fn set_release_note_blocks(notes: &gtk::Box, blocks: &[DocumentBlock]) {
                 row.append(&copy);
                 notes.append(&row);
             }
+            DocumentBlock::ListContinuation { depth, markup } => {
+                let copy = release_notes_label();
+                copy.set_margin_start(
+                    i32::try_from(depth.saturating_add(1).saturating_mul(18)).unwrap_or(i32::MAX),
+                );
+                copy.set_markup(markup);
+                notes.append(&copy);
+            }
             DocumentBlock::Code(markup) => {
                 let label = release_notes_label();
                 label.add_css_class("release-notes-code");

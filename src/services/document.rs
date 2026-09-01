@@ -36,6 +36,10 @@ pub enum DocumentBlock {
         depth: usize,
         markup: String,
     },
+    ListContinuation {
+        depth: usize,
+        markup: String,
+    },
     Quote(String),
     Code(String),
     Rule,
@@ -95,6 +99,10 @@ enum ActiveBlock {
         depth: usize,
         markup: String,
     },
+    ListContinuation {
+        depth: usize,
+        markup: String,
+    },
     Quote(String),
     Code(String),
 }
@@ -105,6 +113,7 @@ impl ActiveBlock {
             Self::Heading { markup, .. }
             | Self::Paragraph(markup)
             | Self::ListItem { markup, .. }
+            | Self::ListContinuation { markup, .. }
             | Self::Quote(markup)
             | Self::Code(markup) => markup,
         }
@@ -115,6 +124,7 @@ impl ActiveBlock {
             Self::Heading { markup, .. }
             | Self::Paragraph(markup)
             | Self::ListItem { markup, .. }
+            | Self::ListContinuation { markup, .. }
             | Self::Quote(markup)
             | Self::Code(markup) => markup,
         }
@@ -253,6 +263,7 @@ fn parse_markdown_bounded(
     let mut active = None;
     let mut links = Vec::new();
     let mut lists = Vec::<Option<u64>>::new();
+    let mut list_parents = Vec::<Option<usize>>::new();
     let mut quote_depth = 0usize;
     let mut table_header = false;
     let mut table_row: Option<Vec<DocumentTableCell>> = None;
@@ -308,20 +319,43 @@ fn parse_markdown_bounded(
                 }
             }
             Event::Start(Tag::List(start)) => {
-                if matches!(active, Some(ActiveBlock::ListItem { .. })) {
+                let parent_depth = match &active {
+                    Some(
+                        ActiveBlock::ListItem { depth, .. }
+                        | ActiveBlock::ListContinuation { depth, .. },
+                    ) => Some(*depth),
+                    _ => None,
+                };
+                if parent_depth.is_some() {
                     finish_block(&mut active, &mut blocks);
                 }
-                if lists.is_empty() && matches!(blocks.last(), Some(DocumentBlock::ListItem { .. }))
+                if lists.is_empty()
+                    && matches!(
+                        blocks.last(),
+                        Some(
+                            DocumentBlock::ListItem { .. } | DocumentBlock::ListContinuation { .. }
+                        )
+                    )
                 {
                     blocks.push(DocumentBlock::ContainerBoundary);
                 }
                 lists.push(*start);
+                list_parents.push(parent_depth);
             }
             Event::End(TagEnd::List(_)) => {
-                if matches!(active, Some(ActiveBlock::ListItem { .. })) {
+                if matches!(
+                    active,
+                    Some(ActiveBlock::ListItem { .. } | ActiveBlock::ListContinuation { .. })
+                ) {
                     finish_block(&mut active, &mut blocks);
                 }
                 lists.pop();
+                if let Some(Some(depth)) = list_parents.pop() {
+                    active = Some(ActiveBlock::ListContinuation {
+                        depth,
+                        markup: String::new(),
+                    });
+                }
             }
             Event::Start(Tag::Item) => {
                 finish_block(&mut active, &mut blocks);
@@ -332,7 +366,10 @@ fn parse_markdown_bounded(
                 });
             }
             Event::End(TagEnd::Item) => {
-                if matches!(active, Some(ActiveBlock::ListItem { .. })) {
+                if matches!(
+                    active,
+                    Some(ActiveBlock::ListItem { .. } | ActiveBlock::ListContinuation { .. })
+                ) {
                     finish_block(&mut active, &mut blocks);
                 }
             }
@@ -408,7 +445,11 @@ fn parse_markdown_bounded(
             Event::Start(Tag::CodeBlock(_)) => {
                 if matches!(
                     active,
-                    Some(ActiveBlock::ListItem { .. } | ActiveBlock::Quote(_))
+                    Some(
+                        ActiveBlock::ListItem { .. }
+                            | ActiveBlock::ListContinuation { .. }
+                            | ActiveBlock::Quote(_)
+                    )
                 ) {
                     append_markup(&mut active, &mut table_cell, "<tt>");
                 } else {
@@ -469,8 +510,7 @@ struct HtmlState {
     blocks: Vec<DocumentBlock>,
     active: Option<ActiveBlock>,
     lists: Vec<Option<u64>>,
-    list_parents: Vec<Option<(ActiveBlock, usize)>>,
-    active_insert_at: Option<usize>,
+    list_parents: Vec<Option<usize>>,
     links: Vec<Option<String>>,
     stack: Vec<String>,
     skipped_depth: usize,
@@ -492,7 +532,6 @@ impl HtmlState {
             active: None,
             lists: Vec::new(),
             list_parents: Vec::new(),
-            active_insert_at: None,
             links: Vec::new(),
             stack: Vec::new(),
             skipped_depth: 0,
@@ -537,7 +576,10 @@ impl HtmlState {
                 });
             }
             "p" => {
-                if matches!(self.active, Some(ActiveBlock::ListItem { .. })) {
+                if matches!(
+                    self.active,
+                    Some(ActiveBlock::ListItem { .. } | ActiveBlock::ListContinuation { .. })
+                ) {
                     if self
                         .active
                         .as_ref()
@@ -560,25 +602,26 @@ impl HtmlState {
                 self.start_active(ActiveBlock::Quote(String::new()));
             }
             "ul" | "ol" => {
-                let parent = if matches!(self.active, Some(ActiveBlock::ListItem { .. })) {
-                    self.append_link_closings();
-                    self.active.take().map(|active| {
-                        (
-                            active,
-                            self.active_insert_at.take().unwrap_or(self.blocks.len()),
-                        )
-                    })
-                } else {
-                    self.finish_active();
-                    None
+                let parent_depth = match &self.active {
+                    Some(
+                        ActiveBlock::ListItem { depth, .. }
+                        | ActiveBlock::ListContinuation { depth, .. },
+                    ) => Some(*depth),
+                    _ => None,
                 };
+                self.finish_active();
                 if self.lists.is_empty()
-                    && matches!(self.blocks.last(), Some(DocumentBlock::ListItem { .. }))
+                    && matches!(
+                        self.blocks.last(),
+                        Some(
+                            DocumentBlock::ListItem { .. } | DocumentBlock::ListContinuation { .. }
+                        )
+                    )
                 {
                     self.blocks.push(DocumentBlock::ContainerBoundary);
                 }
                 self.lists.push((name == "ol").then_some(1));
-                self.list_parents.push(parent);
+                self.list_parents.push(parent_depth);
             }
             "li" => {
                 self.finish_active();
@@ -673,14 +716,18 @@ impl HtmlState {
                 self.quote_depth = self.quote_depth.saturating_sub(1);
             }
             "ul" | "ol" => {
-                if matches!(self.active, Some(ActiveBlock::ListItem { .. })) {
+                if matches!(
+                    self.active,
+                    Some(ActiveBlock::ListItem { .. } | ActiveBlock::ListContinuation { .. })
+                ) {
                     self.finish_active();
                 }
                 self.lists.pop();
-                if let Some(Some((active, insert_at))) = self.list_parents.pop() {
-                    self.active = Some(active);
-                    self.active_insert_at = Some(insert_at);
-                    self.append_link_openings();
+                if let Some(Some(depth)) = self.list_parents.pop() {
+                    self.start_active(ActiveBlock::ListContinuation {
+                        depth,
+                        markup: String::new(),
+                    });
                 }
             }
             "em" | "i" => self.append_markup("</i>"),
@@ -747,15 +794,7 @@ impl HtmlState {
     fn finish_active(&mut self) {
         if self.active.is_some() {
             self.append_link_closings();
-            if let Some(block) = take_block(&mut self.active) {
-                if let Some(index) = self.active_insert_at.take() {
-                    self.blocks.insert(index, block);
-                } else {
-                    self.blocks.push(block);
-                }
-            } else {
-                self.active_insert_at = None;
-            }
+            finish_block(&mut self.active, &mut self.blocks);
         }
     }
 
@@ -973,6 +1012,7 @@ fn block_has_balanced_markup(block: &DocumentBlock) -> bool {
         DocumentBlock::Heading { markup, .. }
         | DocumentBlock::Paragraph(markup)
         | DocumentBlock::ListItem { markup, .. }
+        | DocumentBlock::ListContinuation { markup, .. }
         | DocumentBlock::Quote(markup)
         | DocumentBlock::Code(markup) => has_balanced_markup(markup),
         DocumentBlock::TableRow { cells } => {
@@ -1014,6 +1054,7 @@ fn block_markup_bytes(block: &DocumentBlock) -> usize {
         DocumentBlock::Heading { markup, .. }
         | DocumentBlock::Paragraph(markup)
         | DocumentBlock::ListItem { markup, .. }
+        | DocumentBlock::ListContinuation { markup, .. }
         | DocumentBlock::Quote(markup)
         | DocumentBlock::Code(markup) => markup.len(),
         DocumentBlock::TableRow { cells } => cells.iter().map(|cell| cell.markup.len()).sum(),
@@ -1037,17 +1078,13 @@ fn next_list_marker(lists: &mut [Option<u64>]) -> String {
 }
 
 fn finish_block(active: &mut Option<ActiveBlock>, blocks: &mut Vec<DocumentBlock>) {
-    if let Some(block) = take_block(active) {
-        blocks.push(block);
-    }
-}
-
-fn take_block(active: &mut Option<ActiveBlock>) -> Option<DocumentBlock> {
-    let active = active.take()?;
+    let Some(active) = active.take() else {
+        return;
+    };
     if !has_visible_markup(active.markup()) {
-        return None;
+        return;
     }
-    Some(match active {
+    blocks.push(match active {
         ActiveBlock::Heading { level, markup } => DocumentBlock::Heading { level, markup },
         ActiveBlock::Paragraph(markup) => DocumentBlock::Paragraph(markup),
         ActiveBlock::ListItem {
@@ -1059,9 +1096,12 @@ fn take_block(active: &mut Option<ActiveBlock>) -> Option<DocumentBlock> {
             depth,
             markup,
         },
+        ActiveBlock::ListContinuation { depth, markup } => {
+            DocumentBlock::ListContinuation { depth, markup }
+        }
         ActiveBlock::Quote(markup) => DocumentBlock::Quote(markup),
         ActiveBlock::Code(markup) => DocumentBlock::Code(markup),
-    })
+    });
 }
 
 fn has_visible_markup(markup: &str) -> bool {

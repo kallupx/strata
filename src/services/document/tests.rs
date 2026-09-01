@@ -353,12 +353,46 @@ fn html_restores_parent_list_items_after_nested_lists() {
             DocumentBlock::ListItem {
                 marker: "•".to_owned(),
                 depth: 0,
-                markup: "outer\ntail".to_owned(),
+                markup: "outer".to_owned(),
             },
             DocumentBlock::ListItem {
                 marker: "•".to_owned(),
                 depth: 1,
                 markup: "inner".to_owned(),
+            },
+            DocumentBlock::ListContinuation {
+                depth: 0,
+                markup: "tail".to_owned(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn markdown_restores_parent_list_items_after_nested_lists() {
+    assert_eq!(
+        parse_document(
+            DocumentKind::Markdown,
+            "- outer\n  - inner\n\n  tail",
+            &Cancellation::default(),
+        )
+        .expect("nested Markdown lists should resume their parent item")
+        .document
+        .blocks,
+        vec![
+            DocumentBlock::ListItem {
+                marker: "•".to_owned(),
+                depth: 0,
+                markup: "outer".to_owned(),
+            },
+            DocumentBlock::ListItem {
+                marker: "•".to_owned(),
+                depth: 1,
+                markup: "inner".to_owned(),
+            },
+            DocumentBlock::ListContinuation {
+                depth: 0,
+                markup: "tail".to_owned(),
             },
         ]
     );

@@ -952,31 +952,7 @@ fn rendered_document(document: &Document, warnings: &[String]) -> gtk::ScrolledW
     while index < document.blocks.len() {
         match &document.blocks[index] {
             DocumentBlock::ListItem { .. } => {
-                let list = gtk::Box::new(gtk::Orientation::Vertical, 5);
-                list.add_css_class("preview-document-list");
-                list.set_accessible_role(gtk::AccessibleRole::List);
-                while let Some(DocumentBlock::ListItem {
-                    marker,
-                    depth,
-                    markup,
-                }) = document.blocks.get(index)
-                {
-                    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                    row.add_css_class("preview-document-list-item");
-                    row.set_accessible_role(gtk::AccessibleRole::ListItem);
-                    row.set_margin_start(
-                        i32::try_from(depth.saturating_mul(18)).unwrap_or(i32::MAX),
-                    );
-                    let bullet = gtk::Label::new(Some(marker));
-                    bullet.add_css_class("preview-document-list-marker");
-                    bullet.set_valign(gtk::Align::Start);
-                    let label = document_label(markup, "preview-document-copy");
-                    row.append(&bullet);
-                    row.append(&label);
-                    list.append(&row);
-                    index += 1;
-                }
-                content.append(&list);
+                content.append(&rendered_list(&document.blocks, &mut index));
             }
             DocumentBlock::TableRow { .. } => {
                 let table = gtk::Grid::builder()
@@ -1033,6 +1009,7 @@ fn rendered_document(document: &Document, warnings: &[String]) -> gtk::ScrolledW
                 index += 1;
             }
             DocumentBlock::ContainerBoundary => index += 1,
+            DocumentBlock::ListContinuation { .. } => index += 1,
         }
     }
 
@@ -1043,6 +1020,64 @@ fn rendered_document(document: &Document, warnings: &[String]) -> gtk::ScrolledW
         .hexpand(true)
         .vexpand(true)
         .build()
+}
+
+fn rendered_list(blocks: &[DocumentBlock], index: &mut usize) -> gtk::Box {
+    let root = document_list();
+    let mut lists = vec![root.clone()];
+    let mut bodies = Vec::<gtk::Box>::new();
+
+    loop {
+        match blocks.get(*index) {
+            Some(DocumentBlock::ListItem {
+                marker,
+                depth,
+                markup,
+            }) => {
+                lists.truncate(depth.saturating_add(1));
+                bodies.truncate(*depth);
+                while lists.len() <= *depth {
+                    let Some(parent) = bodies.get(lists.len().saturating_sub(1)) else {
+                        break;
+                    };
+                    let nested = document_list();
+                    parent.append(&nested);
+                    lists.push(nested);
+                }
+
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                row.add_css_class("preview-document-list-item");
+                row.set_accessible_role(gtk::AccessibleRole::ListItem);
+                let bullet = gtk::Label::new(Some(marker));
+                bullet.add_css_class("preview-document-list-marker");
+                bullet.set_valign(gtk::Align::Start);
+                let body = gtk::Box::new(gtk::Orientation::Vertical, 5);
+                body.append(&document_label(markup, "preview-document-copy"));
+                row.append(&bullet);
+                row.append(&body);
+                lists.last().unwrap_or(&root).append(&row);
+                bodies.push(body);
+                *index += 1;
+            }
+            Some(DocumentBlock::ListContinuation { depth, markup }) => {
+                let label = document_label(markup, "preview-document-copy");
+                bodies.get(*depth).unwrap_or(&root).append(&label);
+                lists.truncate(depth.saturating_add(1));
+                bodies.truncate(depth.saturating_add(1));
+                *index += 1;
+            }
+            _ => break,
+        }
+    }
+
+    root
+}
+
+fn document_list() -> gtk::Box {
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 5);
+    list.add_css_class("preview-document-list");
+    list.set_accessible_role(gtk::AccessibleRole::List);
+    list
 }
 
 fn document_label(markup: &str, class: &str) -> gtk::Label {
