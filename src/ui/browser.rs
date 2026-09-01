@@ -3753,6 +3753,7 @@ impl ViewState {
                 completed,
                 failed,
                 not_attempted,
+                affected_locations,
             } => {
                 let message = format!(
                     "{} completed, {} failed, and {} not attempted.\n\nCompleted changes were not reverted.",
@@ -3760,7 +3761,13 @@ impl ViewState {
                     item_count_label(failed),
                     item_count_label(not_attempted),
                 );
-                show_error_dialog(&self.overlay, "Operation cancelled", &message);
+                let browser = self.browser.clone();
+                show_error_dialog_after_close(
+                    &self.overlay,
+                    "Operation cancelled",
+                    &message,
+                    Rc::new(move || browser.refresh_after_cancellation(&affected_locations)),
+                );
             }
             BrowserEvent::NavigationRejected {
                 parent_depth,
@@ -7646,12 +7653,22 @@ pub(super) fn open_location(location: &Location, parent: &impl IsA<gtk::Widget>)
 }
 
 pub(super) fn show_error_dialog(parent: &impl IsA<gtk::Widget>, message: &str, detail: &str) {
+    show_error_dialog_after_close(parent, message, detail, Rc::new(|| {}));
+}
+
+fn show_error_dialog_after_close(
+    parent: &impl IsA<gtk::Widget>,
+    message: &str,
+    detail: &str,
+    on_close: Rc<dyn Fn()>,
+) {
     let Some(window_overlay) = parent
         .root()
         .and_downcast::<gtk::Window>()
         .and_then(|window| window.child())
         .and_downcast::<gtk::Overlay>()
     else {
+        on_close();
         return;
     };
     let blurred_root = window_overlay.child().and_downcast::<BlurBin>();
@@ -7683,8 +7700,14 @@ pub(super) fn show_error_dialog(parent: &impl IsA<gtk::Widget>, message: &str, d
     let close_layer = layer.clone();
     let close_overlay = window_overlay.clone();
     let close_root = blurred_root.clone();
+    let dismissed = Rc::new(Cell::new(false));
     let dismiss = move || {
+        if dismissed.replace(true) {
+            return;
+        }
         dismiss_modal_layer(&close_layer, &close_overlay, close_root.as_ref());
+        let on_close = on_close.clone();
+        glib::timeout_add_local_once(Duration::from_millis(250), move || on_close());
     };
     let dismiss = Rc::new(dismiss);
     let clicked_dismiss = dismiss.clone();

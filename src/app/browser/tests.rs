@@ -407,6 +407,18 @@ fn cancellation_refreshes_an_affected_remote_root_and_its_open_descendants() {
     });
 
     assert_eq!(browser.current_operation.get(), None);
+    assert_eq!(enumerate_calls.get(), 2);
+    let affected_locations = events
+        .borrow()
+        .iter()
+        .find_map(|event| match event {
+            BrowserEvent::OperationCancelled {
+                affected_locations, ..
+            } => Some(affected_locations.clone()),
+            _ => None,
+        })
+        .expect("cancellation event");
+    browser.refresh_after_cancellation(&affected_locations);
     assert_eq!(enumerate_calls.get(), 4);
     assert!(
         events
@@ -420,6 +432,7 @@ fn cancellation_refreshes_an_affected_remote_root_and_its_open_descendants() {
             completed: 1,
             failed: 1,
             not_attempted: 1,
+            ..
         }
     )));
 }

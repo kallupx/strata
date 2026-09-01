@@ -135,6 +135,7 @@ pub enum BrowserEvent {
         completed: usize,
         failed: usize,
         not_attempted: usize,
+        affected_locations: HashSet<Location>,
     },
     NavigationRejected {
         parent_depth: usize,
@@ -1178,11 +1179,11 @@ impl Browser {
                 OperationEvent::Cancelled { result, .. } => {
                     let mut affected_locations = refresh_locations.clone();
                     affected_locations.extend(result.affected_locations);
-                    browser.refresh_columns_at_or_below(&affected_locations);
                     browser.emit(BrowserEvent::OperationCancelled {
                         completed: result.completed.len(),
                         failed: result.failed.len(),
                         not_attempted: result.not_attempted.len(),
+                        affected_locations,
                     });
                 }
                 OperationEvent::Renamed { .. } => {
@@ -1436,6 +1437,10 @@ impl Browser {
         for depth in depths {
             self.refresh_column(depth);
         }
+    }
+
+    pub(crate) fn refresh_after_cancellation(self: &Rc<Self>, roots: &HashSet<Location>) {
+        self.refresh_columns_at_or_below(roots);
     }
 
     fn refresh_columns_at_or_below(self: &Rc<Self>, roots: &HashSet<Location>) {
