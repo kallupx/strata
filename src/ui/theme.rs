@@ -66,6 +66,8 @@ struct Preferences {
     single_click_previews: bool,
     #[serde(default)]
     search_open_files_directly: bool,
+    #[serde(default)]
+    reduce_motion: bool,
     #[serde(default = "default_browser_mode")]
     browser_mode: String,
     #[serde(default = "default_browser_density")]
@@ -86,6 +88,7 @@ impl Default for Preferences {
             folder_peeking: true,
             single_click_previews: true,
             search_open_files_directly: false,
+            reduce_motion: false,
             browser_mode: default_browser_mode(),
             browser_density: default_browser_density(),
             sort_key: default_sort_key(),
@@ -149,6 +152,7 @@ impl ThemeManager {
         } else if !settings_path().is_file() && omarchy_available {
             preferences.mode = "omarchy".to_owned();
         }
+        super::motion::set_reduce_motion(preferences.reduce_motion);
 
         let manager = Rc::new(Self {
             provider: gtk::CssProvider::new(),
@@ -205,6 +209,16 @@ impl ThemeManager {
 
     pub fn set_search_open_files_directly(&self, enabled: bool) {
         self.preferences.borrow_mut().search_open_files_directly = enabled;
+        self.save_preferences();
+    }
+
+    pub fn reduce_motion(&self) -> bool {
+        self.preferences.borrow().reduce_motion
+    }
+
+    pub fn set_reduce_motion(&self, reduced: bool) {
+        self.preferences.borrow_mut().reduce_motion = reduced;
+        super::motion::set_reduce_motion(reduced);
         self.save_preferences();
     }
 
