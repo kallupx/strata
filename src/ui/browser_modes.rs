@@ -8,6 +8,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashSet,
     rc::{Rc, Weak},
 };
 
@@ -104,7 +105,7 @@ pub struct ModeViews {
     browser: Rc<Browser>,
     single_click_previews: Rc<Cell<bool>>,
     transfer_handler: TransferHandlerSlot,
-    cut_locations: Rc<RefCell<Vec<Location>>>,
+    cut_locations: Rc<RefCell<HashSet<Location>>>,
     context_state: RefCell<Option<Weak<super::browser::ViewState>>>,
     active_rename: Rc<RefCell<Option<ActiveModeRename>>>,
     active_new_entry: Rc<RefCell<Option<ActiveModeNewEntry>>>,
@@ -162,7 +163,7 @@ impl ModeViews {
             browser,
             single_click_previews: Rc::new(Cell::new(true)),
             transfer_handler: Rc::new(RefCell::new(None)),
-            cut_locations: Rc::new(RefCell::new(Vec::new())),
+            cut_locations: Rc::new(RefCell::new(HashSet::new())),
             context_state: RefCell::new(None),
             active_rename: Rc::new(RefCell::new(None)),
             active_new_entry: Rc::new(RefCell::new(None)),
@@ -446,7 +447,8 @@ impl ModeViews {
     }
 
     pub fn set_cut_locations(&self, locations: &[Location]) {
-        self.cut_locations.replace(locations.to_vec());
+        self.cut_locations
+            .replace(locations.iter().cloned().collect());
         for pane in self.grid_panes.iter().chain(self.explorer_pane.iter()) {
             refresh_cut_pane(pane, &self.browser, locations);
         }
@@ -960,7 +962,7 @@ fn build_grid_pane(
     browser: Rc<Browser>,
     single_click_previews: Rc<Cell<bool>>,
     transfer_handler: TransferHandlerSlot,
-    cut_locations: Rc<RefCell<Vec<Location>>>,
+    cut_locations: Rc<RefCell<HashSet<Location>>>,
     options: GridOptions,
     depth: usize,
     title: &str,
@@ -1545,7 +1547,7 @@ fn build_explorer_pane(
     browser: Rc<Browser>,
     single_click_previews: Rc<Cell<bool>>,
     transfer_handler: TransferHandlerSlot,
-    cut_locations: Rc<RefCell<Vec<Location>>>,
+    cut_locations: Rc<RefCell<HashSet<Location>>>,
     active_new_entry: Rc<RefCell<Option<ActiveModeNewEntry>>>,
     depth: usize,
     title: &str,

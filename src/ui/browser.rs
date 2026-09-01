@@ -1233,6 +1233,7 @@ impl ViewState {
     fn refresh_cut_rows(&self) {
         let cut = self.cut_locations.borrow();
         self.mode_views.borrow().set_cut_locations(&cut);
+        let cut_lookup: HashSet<_> = cut.iter().collect();
         for (depth, column) in self.columns.borrow().iter().enumerate() {
             column.bound_rows.borrow_mut().retain(|bound| {
                 let (Some(item), Some(row)) = (bound.item.upgrade(), bound.row.upgrade()) else {
@@ -1244,7 +1245,7 @@ impl ViewState {
                     item.position(),
                 )
                 .and_then(|position| self.browser.entry_at(depth, position))
-                .is_some_and(|entry| cut.contains(&entry.location));
+                .is_some_and(|entry| cut_lookup.contains(&entry.location));
                 set_cut_path_style(&row, is_cut);
                 true
             });
@@ -3986,15 +3987,14 @@ impl ViewState {
                 return;
             }
             let filtered_positions = bitset_positions(&selection.selection());
-            let source_positions: Vec<_> = filtered_positions
+            let mapped_positions = source_positions_for_filtered(
+                &source_for_selection,
+                &filtered_for_selection,
+                &filtered_positions,
+            );
+            let source_positions: Vec<_> = mapped_positions
                 .iter()
-                .filter_map(|position| {
-                    source_position_for_filtered(
-                        &source_for_selection,
-                        &filtered_for_selection,
-                        *position,
-                    )
-                })
+                .map(|(_, source_position)| *source_position)
                 .collect();
             let changed_end = position.saturating_add(count);
             let focused = filtered_positions
@@ -4010,11 +4010,9 @@ impl ViewState {
                 .or_else(|| filtered_positions.last().copied());
             focused_filtered_changed.set(focused);
             let focused_source = focused.and_then(|position| {
-                source_position_for_filtered(
-                    &source_for_selection,
-                    &filtered_for_selection,
-                    position,
-                )
+                mapped_positions
+                    .iter()
+                    .find_map(|(filtered, source)| (*filtered == position).then_some(*source))
             });
             if let Some(browser) = weak_browser.upgrade() {
                 browser.set_selection(depth, &source_positions, focused_source);
@@ -5027,14 +5025,34 @@ fn source_position_for_filtered(
     filtered: &gtk::FilterListModel,
     filtered_position: u32,
 ) -> Option<usize> {
-    let item = filtered.item(filtered_position)?;
-    (0..source.n_items())
-        .find(|position| {
-            source
-                .item(*position)
-                .is_some_and(|candidate| candidate == item)
+    source_positions_for_filtered(source, filtered, &[filtered_position])
+        .first()
+        .map(|(_, source)| *source)
+}
+
+fn source_positions_for_filtered(
+    source: &gtk::StringList,
+    filtered: &gtk::FilterListModel,
+    filtered_positions: &[u32],
+) -> Vec<(u32, usize)> {
+    let mut source_position = 0;
+    filtered_positions
+        .iter()
+        .filter_map(|filtered_position| {
+            let item = filtered.item(*filtered_position)?;
+            while source_position < source.n_items() {
+                let candidate_position = source_position;
+                source_position += 1;
+                if source
+                    .item(candidate_position)
+                    .is_some_and(|candidate| candidate == item)
+                {
+                    return Some((*filtered_position, candidate_position as usize));
+                }
+            }
+            None
         })
-        .map(|position| position as usize)
+        .collect()
 }
 
 fn set_column_selection(column: &ColumnView, position: u32) {
