@@ -385,8 +385,13 @@ fn source_line_numbers_view(unit: &SourceUnit) -> gtk::TextView {
     view.set_focusable(false);
     view.set_accessible_role(gtk::AccessibleRole::Presentation);
     view.add_css_class("preview-source-lines");
+    view.set_left_margin(2);
+    view.set_right_margin(6);
     let (width, _) = view.create_pango_layout(Some(&text)).pixel_size();
-    view.set_size_request(width, -1);
+    view.set_size_request(
+        width.saturating_add(view.left_margin() + view.right_margin()),
+        -1,
+    );
     view
 }
 
@@ -1611,7 +1616,7 @@ fn push_source_line_chunks(units: &mut Vec<SourceUnit>, line: &str, first_line: 
 
 fn source_line_numbers(unit: &SourceUnit) -> String {
     if unit.continuation {
-        return "↳".to_owned();
+        return format!("{}↳", unit.first_line);
     }
     (unit.first_line..unit.first_line + unit.line_count.max(1))
         .map(|line| line.to_string())

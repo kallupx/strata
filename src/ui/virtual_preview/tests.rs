@@ -8,7 +8,8 @@ use super::{
     DocumentSelection, PreviewUnit, SelectionPoint, SourceUnit, VirtualPreviewState,
     bounded_text_prefix, code_block_copy_text, drag_threshold_crossed, highlighted_code_language,
     local_selection, matching_link, plain_text_view, rendered_document, selection_text,
-    source_line_numbers_view, source_units, styled_markup, use_virtual_source, vertical_distance,
+    source_line_numbers, source_line_numbers_view, source_units, styled_markup, use_virtual_source,
+    vertical_distance,
 };
 use crate::{
     services::{DocumentLayout, DocumentSpan, DocumentSpanStyle, DocumentUnit, DocumentUnitKind},
@@ -38,6 +39,8 @@ fn source_units_bound_normal_rows_and_isolate_pathological_lines() {
             .all(|unit| unit.display.len() <= super::PATHOLOGICAL_TEXT_UNIT_BYTES)
     );
     assert!(long[1].continuation);
+    assert_eq!(source_line_numbers(long[0]), "301");
+    assert_eq!(source_line_numbers(long[1]), "301↳");
     assert_eq!(units.iter().map(|unit| unit.line_count).sum::<usize>(), 302);
     assert_eq!(units.last().map(|unit| unit.first_line), Some(302));
     assert_eq!(
