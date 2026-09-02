@@ -5,6 +5,94 @@ window {
   font-size: 13px;
 }
 
+.chooser-details {
+  background: @theme_surface;
+  border-top: 1px solid alpha(@theme_border, 0.6);
+  color: @theme_text;
+  padding: 12px 16px;
+}
+
+.chooser-label {
+  color: @theme_dim_text;
+}
+
+.chooser-control {
+  background: @theme_bg;
+  border: 1px solid alpha(@theme_border, 0.8);
+  color: @theme_text;
+}
+
+.chooser-control:hover,
+.chooser-control:focus-within {
+  border-color: @theme_accent;
+}
+
+.chooser-check {
+  color: @theme_text;
+}
+
+.chooser-check check {
+  background: @theme_bg;
+  border-color: @theme_border;
+}
+
+.chooser-check check:checked {
+  background: @theme_accent;
+  border-color: @theme_accent;
+  color: @theme_bg;
+}
+
+.chooser-error {
+  color: @theme_danger;
+}
+
+.chooser-actions {
+  border-top: 1px solid alpha(@theme_border, 0.35);
+  padding-top: 10px;
+}
+
+.chooser-secondary,
+.chooser-accept {
+  border-radius: 5px;
+  min-height: 30px;
+  padding: 4px 14px;
+}
+
+.chooser-secondary {
+  background: alpha(@theme_muted, 0.65);
+  border: 1px solid @theme_border;
+  color: @theme_text;
+}
+
+.chooser-secondary:hover,
+.chooser-secondary:active {
+  background: @theme_muted;
+  border-color: @theme_accent;
+}
+
+.chooser-accept {
+  background: @theme_accent;
+  border: 1px solid @theme_accent;
+  color: @theme_bg;
+}
+
+.chooser-accept:hover,
+.chooser-accept:active {
+  background: alpha(@theme_accent, 0.82);
+}
+
+.chooser-secondary:focus-visible,
+.chooser-accept:focus-visible {
+  outline: 2px solid @theme_accent;
+}
+
+.chooser-secondary:disabled,
+.chooser-accept:disabled {
+  background: alpha(@theme_muted, 0.35);
+  border-color: alpha(@theme_border, 0.5);
+  color: @theme_dim_text;
+}
+
 button:focus-visible,
 entry:focus-visible,
 switch:focus-visible,

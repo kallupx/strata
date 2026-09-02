@@ -106,6 +106,7 @@ pub struct ModeViews {
     explorer_pane: Option<Pane>,
     browser: Rc<Browser>,
     single_click_previews: Rc<Cell<bool>>,
+    multiple_selection: Rc<Cell<bool>>,
     transfer_handler: TransferHandlerSlot,
     cut_locations: Rc<RefCell<HashSet<Location>>>,
     context_state: RefCell<Option<Weak<super::browser::ViewState>>>,
@@ -117,7 +118,11 @@ pub struct ModeViews {
 }
 
 impl ModeViews {
-    pub fn new(columns: &gtk::ScrolledWindow, browser: Rc<Browser>) -> Self {
+    pub fn new(
+        columns: &gtk::ScrolledWindow,
+        browser: Rc<Browser>,
+        multiple_selection: Rc<Cell<bool>>,
+    ) -> Self {
         let grid_root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         grid_root.add_css_class("mode-grid-columns");
         grid_root.set_halign(gtk::Align::Fill);
@@ -164,6 +169,7 @@ impl ModeViews {
             explorer_pane: None,
             browser,
             single_click_previews: Rc::new(Cell::new(true)),
+            multiple_selection,
             transfer_handler: Rc::new(RefCell::new(None)),
             cut_locations: Rc::new(RefCell::new(HashSet::new())),
             context_state: RefCell::new(None),
@@ -508,6 +514,7 @@ impl ModeViews {
                         peek_state: self.context_state.borrow().clone(),
                         thumbnail_size: self.grid_thumbnail_size.clone(),
                         active_new_entry: self.active_new_entry.clone(),
+                        multiple_selection: self.multiple_selection.clone(),
                     },
                     *depth,
                     &location.display_name(),
@@ -523,7 +530,10 @@ impl ModeViews {
                     self.single_click_previews.clone(),
                     self.transfer_handler.clone(),
                     self.cut_locations.clone(),
-                    self.active_new_entry.clone(),
+                    ExplorerOptions {
+                        active_new_entry: self.active_new_entry.clone(),
+                        multiple_selection: self.multiple_selection.clone(),
+                    },
                     *depth,
                     &location.display_name(),
                 );
@@ -747,6 +757,7 @@ impl ModeViews {
                 peek_state: self.context_state.borrow().clone(),
                 thumbnail_size: self.grid_thumbnail_size.clone(),
                 active_new_entry: self.active_new_entry.clone(),
+                multiple_selection: self.multiple_selection.clone(),
             },
             depth,
             &snapshot.location.display_name(),
@@ -771,7 +782,10 @@ impl ModeViews {
             self.single_click_previews.clone(),
             self.transfer_handler.clone(),
             self.cut_locations.clone(),
-            self.active_new_entry.clone(),
+            ExplorerOptions {
+                active_new_entry: self.active_new_entry.clone(),
+                multiple_selection: self.multiple_selection.clone(),
+            },
             depth,
             &snapshot.location.display_name(),
         );
@@ -794,6 +808,12 @@ struct GridOptions {
     peek_state: Option<Weak<super::browser::ViewState>>,
     thumbnail_size: Rc<Cell<i32>>,
     active_new_entry: Rc<RefCell<Option<ActiveModeNewEntry>>>,
+    multiple_selection: Rc<Cell<bool>>,
+}
+
+struct ExplorerOptions {
+    active_new_entry: Rc<RefCell<Option<ActiveModeNewEntry>>>,
+    multiple_selection: Rc<Cell<bool>>,
 }
 
 fn submit_mode_new_entry(
@@ -981,6 +1001,9 @@ fn build_grid_pane(
     title: &str,
 ) -> Pane {
     let controls = grid_controls(&browser, depth, options.thumbnail_size.get());
+    controls
+        .filter_button
+        .set_visible(transfer_handler.borrow().is_some());
     let thumbnail_size = options.thumbnail_size;
     let active_new_entry = options.active_new_entry;
     let (pane, content, model, stack, status, spinner, truncated_hint) = pane_base(
@@ -989,7 +1012,9 @@ fn build_grid_pane(
         Some(controls.leading.clone().upcast()),
         Some(controls.actions.clone().upcast()),
     );
-    if let Some(destination) = browser.location_at(depth) {
+    if transfer_handler.borrow().is_some()
+        && let Some(destination) = browser.location_at(depth)
+    {
         install_mode_directory_drop_target(&stack, destination, transfer_handler.clone());
     }
     content.append(&controls.filter_revealer);
@@ -1113,14 +1138,16 @@ fn build_grid_pane(
             filtered_for_setup.clone(),
             depth,
         );
-        install_explorer_drag_drop(
-            &card,
-            item,
-            browser_for_setup.clone(),
-            transfers_for_setup.clone(),
-            depth,
-            Some((source_for_setup.clone(), filtered_for_setup.clone())),
-        );
+        if transfers_for_setup.borrow().is_some() {
+            install_explorer_drag_drop(
+                &card,
+                item,
+                browser_for_setup.clone(),
+                transfers_for_setup.clone(),
+                depth,
+                Some((source_for_setup.clone(), filtered_for_setup.clone())),
+            );
+        }
         item.set_child(Some(&card));
         register_bound_mode_item(&bound_items_for_setup, item, &card);
     });
@@ -1243,6 +1270,7 @@ fn build_grid_pane(
         depth,
         model.clone(),
         Some(view_model.clone().upcast()),
+        options.multiple_selection,
     );
     let scroll = gtk::ScrolledWindow::builder()
         .child(&view)
@@ -1563,10 +1591,11 @@ fn build_explorer_pane(
     single_click_previews: Rc<Cell<bool>>,
     transfer_handler: TransferHandlerSlot,
     cut_locations: Rc<RefCell<HashSet<Location>>>,
-    active_new_entry: Rc<RefCell<Option<ActiveModeNewEntry>>>,
+    options: ExplorerOptions,
     depth: usize,
     title: &str,
 ) -> Pane {
+    let active_new_entry = options.active_new_entry;
     let navigation = explorer_navigation(&browser);
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     actions.add_css_class("grid-header-actions");
@@ -1579,6 +1608,7 @@ fn build_explorer_pane(
     actions.append(&empty_trash);
     let (filter_entry, filter_revealer, filter_button) =
         filter_controls("Filter explorer (Ctrl+F)");
+    filter_button.set_visible(transfer_handler.borrow().is_some());
     actions.append(&filter_button);
     let (shell, content, model, stack, status, spinner, truncated_hint) = pane_base(
         title,
@@ -1586,7 +1616,9 @@ fn build_explorer_pane(
         Some(navigation.upcast()),
         Some(actions.upcast()),
     );
-    if let Some(destination) = browser.location_at(depth) {
+    if transfer_handler.borrow().is_some()
+        && let Some(destination) = browser.location_at(depth)
+    {
         install_mode_directory_drop_target(&stack, destination, transfer_handler.clone());
     }
     content.append(&filter_revealer);
@@ -1713,14 +1745,16 @@ fn build_explorer_pane(
             selection_for_setup.clone(),
             selection_anchor.clone(),
         );
-        install_explorer_drag_drop(
-            &row,
-            item,
-            browser_for_setup.clone(),
-            transfers_for_setup.clone(),
-            depth,
-            Some((source_for_setup.clone(), view_model_for_setup.clone())),
-        );
+        if transfers_for_setup.borrow().is_some() {
+            install_explorer_drag_drop(
+                &row,
+                item,
+                browser_for_setup.clone(),
+                transfers_for_setup.clone(),
+                depth,
+                Some((source_for_setup.clone(), view_model_for_setup.clone())),
+            );
+        }
         item.set_child(Some(&row));
         register_bound_mode_item(&bound_items_for_setup, item, &row);
     });
@@ -1821,6 +1855,7 @@ fn build_explorer_pane(
         depth,
         model.clone(),
         Some(view_model_object.clone()),
+        options.multiple_selection,
     );
     let scroll = gtk::ScrolledWindow::builder()
         .child(&view)
@@ -2426,13 +2461,32 @@ fn connect_selection(
     depth: usize,
     source: gtk::StringList,
     filtered: Option<gio::ListModel>,
+    multiple: Rc<Cell<bool>>,
 ) {
     let syncing = syncing.clone();
-    selection.connect_selection_changed(move |selection, _, _| {
+    selection.connect_selection_changed(move |selection, position, count| {
         if syncing.get() {
             return;
         }
-        let positions = bitset_positions(&selection.selection())
+        let mut view_positions = bitset_positions(&selection.selection());
+        if !multiple.get() && view_positions.len() > 1 {
+            let changed_start = position as usize;
+            let changed_end = position.saturating_add(count) as usize;
+            if let Some(focused) = view_positions
+                .iter()
+                .rev()
+                .copied()
+                .find(|candidate| *candidate >= changed_start && *candidate < changed_end)
+                .or_else(|| view_positions.last().copied())
+            {
+                syncing.set(true);
+                selection.select_item(focused as u32, true);
+                syncing.set(false);
+                view_positions.clear();
+                view_positions.push(focused);
+            }
+        }
+        let positions = view_positions
             .into_iter()
             .filter_map(|position| {
                 source_position_for_view(&source, filtered.as_ref(), position as u32)

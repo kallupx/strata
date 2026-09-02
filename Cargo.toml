@@ -10,10 +10,15 @@ keywords = ["file-manager", "gtk4", "linux", "wayland"]
 categories = ["filesystem", "gui"]
 
 [dependencies]
+ashpd = { version = "=0.13.13", default-features = false, features = ["backend", "file_chooser", "async-io", "tracing"] }
+async-io = "2.6.0"
 cairo-rs = { version = "0.21.5", features = ["pdf", "png"] }
 flate2 = "1.1.10"
 fontconfig-sys = { package = "yeslogic-fontconfig-sys", version = "6.0.1" }
+futures-channel = "0.3.31"
+futures-executor = { version = "0.3.31", features = ["thread-pool"] }
 gdk-pixbuf = "0.21.5"
+gdk4-wayland = { version = "0.10.3", features = ["v4_12"] }
 gio = { version = "0.21.5", features = ["v2_72"] }
 glib = "0.21.5"
 gtk = { package = "gtk4", version = "0.10.3", features = ["v4_12"] }

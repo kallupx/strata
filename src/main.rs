@@ -6,6 +6,7 @@ mod assets;
 mod build_info;
 mod metrics;
 mod model;
+mod portal;
 mod sandbox;
 mod sandbox_helper;
 mod services;
@@ -41,6 +42,9 @@ fn main() -> gtk::glib::ExitCode {
         let _vfs = gio::Vfs::default();
         let _volumes = gio::VolumeMonitor::get();
         return gtk::glib::ExitCode::SUCCESS;
+    }
+    if arguments.get(1).is_some_and(|value| value == "--portal") {
+        return portal::run();
     }
 
     fall_back_if_gvfs_is_unresponsive();

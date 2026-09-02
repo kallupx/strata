@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+use std::{ffi::OsString, path::Path};
+
+use ashpd::desktop::file_chooser::FileFilter;
+
+use super::*;
+use crate::model::{EntryKind, MetadataValue};
+
+fn entry(name: &str, kind: EntryKind) -> FileEntry {
+    FileEntry {
+        location: Location::local(Path::new("/tmp").join(name)),
+        native_name: OsString::from(name),
+        display_name: name.to_owned(),
+        kind,
+        size: MetadataValue::Unknown,
+        modified_unix_seconds: MetadataValue::Unknown,
+    }
+}
+
+#[test]
+#[ignore = "requires a GTK display and exclusive main context"]
+fn native_filters_match_globs_and_mime_types_without_hiding_directories() {
+    gtk::init().expect("GTK display");
+    let filter = gtk::FileFilter::new();
+    filter.add_pattern("*.txt");
+    filter.add_mime_type("image/jpeg");
+
+    assert!(file_filter_matches(
+        &filter,
+        &entry("notes.txt", EntryKind::File)
+    ));
+    assert!(file_filter_matches(
+        &filter,
+        &entry("photo.jpg", EntryKind::File)
+    ));
+    assert!(!file_filter_matches(
+        &filter,
+        &entry("archive.zip", EntryKind::File)
+    ));
+    assert!(file_filter_matches(
+        &filter,
+        &entry("folder.zip", EntryKind::Directory)
+    ));
+}
+
+#[test]
+fn portal_filters_select_the_requested_filter_or_the_first_one() {
+    let images = FileFilter::new("Images").glob("*.png");
+    let text = FileFilter::new("Text").glob("*.txt");
+
+    let (filters, selected) = normalize_portal_filters(std::slice::from_ref(&images), None);
+    assert_eq!(selected, Some(0));
+    assert_eq!(filters[0], images);
+
+    let (filters, selected) = normalize_portal_filters(std::slice::from_ref(&images), Some(&text));
+    assert_eq!(selected, Some(1));
+    assert_eq!(filters[1], text);
+}
+
+#[test]
+fn chooser_locations_reject_remote_uris_before_io() {
+    let source = ChooserFileSource::new();
+    let error = source
+        .validate_location(&Location::uri("smb://server/share"))
+        .expect_err("remote locations are unavailable");
+    assert!(matches!(
+        error,
+        LocationValidationError::UnsupportedScheme(_)
+    ));
+    assert!(error.to_string().contains("local files and folders only"));
+}

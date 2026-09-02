@@ -150,7 +150,7 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
     content.set_resize_start_child(false);
     content.set_position(SIDEBAR_WIDTH);
     content.set_vexpand(true);
-    let sidebar = build_sidebar(browser.clone());
+    let sidebar = build_sidebar(browser.clone(), false);
     let weak_sidebar = Rc::downgrade(&sidebar.state);
     let pinned_places = sidebar.state.pinned_places.clone();
     browser.set_pin_handlers(
@@ -767,7 +767,7 @@ fn install_modal_focus_trap(window: &gtk::ApplicationWindow) {
     });
 }
 
-fn build_appearance_menu(
+pub(super) fn build_appearance_menu(
     view: &BrowserView,
     controller: &Rc<Browser>,
     preferences: Rc<super::theme::ThemeManager>,
@@ -980,10 +980,11 @@ struct SidebarState {
     place_order: RefCell<Vec<&'static str>>,
     pinned_places: Rc<RefCell<Vec<(Location, String)>>>,
     place_rows: RefCell<Vec<(Location, gtk::Button)>>,
+    local_only: bool,
 }
 
-struct SidebarView {
-    widget: gtk::Widget,
+pub(super) struct SidebarView {
+    pub(super) widget: gtk::Widget,
     state: Rc<SidebarState>,
     update_notice: gtk::Button,
     update_area: gtk::Box,
@@ -992,7 +993,7 @@ struct SidebarView {
 }
 
 impl SidebarView {
-    fn disconnect(&self) {
+    pub(super) fn disconnect(&self) {
         for handler in self.handlers.take() {
             self.state.volume_monitor.disconnect(handler);
         }
@@ -1011,12 +1012,14 @@ impl SidebarState {
             "Home",
             Location::local(home_directory()),
         );
-        self.append_trash_place();
-        self.append_place(
-            crate::assets::icons::NETWORK,
-            "Network",
-            Location::uri("network:///"),
-        );
+        if !self.local_only {
+            self.append_trash_place();
+            self.append_place(
+                crate::assets::icons::NETWORK,
+                "Network",
+                Location::uri("network:///"),
+            );
+        }
         self.append_separator();
 
         for place in self.place_order.borrow().clone() {
@@ -1024,7 +1027,11 @@ impl SidebarState {
                 && let Some(path) = glib::user_special_dir(directory)
                     .filter(|path| should_show_standard_place(place, path, &home_directory()))
             {
-                self.append_reorderable_place(place, icon, name, Location::local(path));
+                if self.local_only {
+                    self.append_place(icon, name, Location::local(path));
+                } else {
+                    self.append_reorderable_place(place, icon, name, Location::local(path));
+                }
             }
         }
 
@@ -1033,13 +1040,18 @@ impl SidebarState {
             .borrow()
             .iter()
             .filter(|(location, _)| !is_standard_place_location(location))
+            .filter(|(location, _)| !self.local_only || location.native_path().is_some())
             .cloned()
             .collect::<Vec<_>>();
         if !pinned.is_empty() {
             self.append_separator();
             self.append_heading("PINNED");
             for (location, name) in pinned {
-                self.append_pinned_place(&name, location);
+                if self.local_only {
+                    self.append_place(crate::assets::icons::FOLDER, &name, location);
+                } else {
+                    self.append_pinned_place(&name, location);
+                }
             }
         }
 
@@ -1052,6 +1064,9 @@ impl SidebarState {
             .filter_map(|mount| {
                 let name = mount.name().to_string();
                 let location = location_for_file(&mount.root())?;
+                if self.local_only && location.native_path().is_none() {
+                    return None;
+                }
                 Some((name, location, mount))
             })
             .collect();
@@ -1607,7 +1622,7 @@ fn navigate_to_gio_file(browser: &Rc<Browser>, file: &gio::File) {
     }
 }
 
-fn build_sidebar(view: BrowserView) -> SidebarView {
+pub(super) fn build_sidebar(view: BrowserView, local_only: bool) -> SidebarView {
     let widget = gtk::Box::new(gtk::Orientation::Vertical, 2);
     widget.add_css_class("sidebar");
     let scroller = gtk::ScrolledWindow::builder()
@@ -1662,6 +1677,7 @@ fn build_sidebar(view: BrowserView) -> SidebarView {
         ]),
         pinned_places: Rc::new(RefCell::new(load_pinned_places())),
         place_rows: RefCell::new(Vec::new()),
+        local_only,
     });
 
     let weak = Rc::downgrade(&state);
@@ -1788,7 +1804,7 @@ fn serialize_pinned_places(places: &[(Location, String)]) -> String {
     contents
 }
 
-fn home_directory() -> PathBuf {
+pub(crate) fn home_directory() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))
@@ -1797,7 +1813,7 @@ fn home_directory() -> PathBuf {
 #[cfg(test)]
 mod tests;
 
-fn load_styles() {
+pub(super) fn load_styles() {
     let provider = gtk::CssProvider::new();
     provider.load_from_string(include_str!("../style.css"));
 
