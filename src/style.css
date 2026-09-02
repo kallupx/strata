@@ -2253,7 +2253,7 @@ menubutton.column-header-action > button:focus-visible image {
 }
 
 .skeleton-row {
-  background: alpha(@theme_border, 0.12);
+  background: alpha(@theme_border, 0.28);
   border-radius: 4px;
   min-height: 10px;
 }

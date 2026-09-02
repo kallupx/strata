@@ -114,17 +114,22 @@ struct PeekView {
     spinner: gtk::Spinner,
 }
 
+pub(super) fn loading_skeleton() -> gtk::Box {
+    let skeleton = gtk::Box::new(gtk::Orientation::Vertical, 9);
+    skeleton.add_css_class("loading-skeleton");
+    for width in [168, 124, 192, 148, 176, 112] {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        row.add_css_class("skeleton-row");
+        row.set_size_request(width, 10);
+        row.set_halign(gtk::Align::Start);
+        skeleton.append(&row);
+    }
+    skeleton
+}
+
 impl LoadPresentation {
     fn new(content: &impl IsA<gtk::Widget>, retry: Option<gtk::Button>) -> Self {
-        let skeleton = gtk::Box::new(gtk::Orientation::Vertical, 9);
-        skeleton.add_css_class("loading-skeleton");
-        for width in [168, 124, 192, 148, 176, 112] {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            row.add_css_class("skeleton-row");
-            row.set_size_request(width, 10);
-            row.set_halign(gtk::Align::Start);
-            skeleton.append(&row);
-        }
+        let skeleton = loading_skeleton();
 
         let feedback = gtk::Box::new(gtk::Orientation::Vertical, 8);
         feedback.add_css_class("directory-feedback");

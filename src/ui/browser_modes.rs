@@ -1895,9 +1895,7 @@ fn pane_base(
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.set_hexpand(true);
     content.set_vexpand(true);
-    let loading = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    loading.set_valign(gtk::Align::Center);
-    loading.append(&gtk::Label::new(Some("Loading…")));
+    let loading = super::browser::loading_skeleton();
     let status = gtk::Label::new(Some("This directory is empty"));
     status.add_css_class("status-message");
     status.set_wrap(true);
