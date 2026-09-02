@@ -3461,7 +3461,7 @@ impl ViewState {
                     .map(|insertion| insertion.entries.len())
                     .sum();
                 if let Some(column) = self.columns.borrow().get(depth).cloned() {
-                    if entry_count > 0 {
+                    if entry_count > 0 && !column.spinner.is_spinning() {
                         column.presentation.show_content();
                     }
                     for insertion in insertions {

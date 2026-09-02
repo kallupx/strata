@@ -539,7 +539,9 @@ impl ModeViews {
                             .collect();
                         pane.model.splice(insertion.position as u32, 0, &values);
                     }
-                    show_count(pane);
+                    if !pane.spinner.is_spinning() {
+                        show_count(pane);
+                    }
                 }
             }
             BrowserEvent::EntriesReplaced { depth, entries } => {
