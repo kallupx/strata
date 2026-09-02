@@ -3,7 +3,8 @@
 use std::{fs, os::unix::fs::PermissionsExt as _, path::PathBuf};
 
 use super::{
-    SetupContext, disable_config, enable_config, install_at, secure_executable, uninstall_at,
+    SetupContext, disable_config, enable_config, install_at, secure_executable, trusted_owner,
+    uninstall_at,
 };
 
 const FILE_CHOOSER: &str = "org.freedesktop.impl.portal.FileChooser";
@@ -29,7 +30,7 @@ fn chooser_preference_preserves_explicit_fallbacks() {
 
 #[test]
 fn install_and_uninstall_restore_an_existing_user_configuration() {
-    let fixture = tempfile::tempdir().expect("fixture directory");
+    let fixture = fixture();
     let context = context(fixture.path());
     let config = context.portal_directory().join("portals.conf");
     fs::create_dir_all(config.parent().expect("config parent")).expect("config directory");
@@ -75,7 +76,7 @@ fn install_and_uninstall_restore_an_existing_user_configuration() {
 
 #[test]
 fn uninstall_keeps_later_configuration_edits() {
-    let fixture = tempfile::tempdir().expect("fixture directory");
+    let fixture = fixture();
     let context = context(fixture.path());
     let config = context.portal_directory().join("portals.conf");
     fs::create_dir_all(config.parent().expect("config parent")).expect("config directory");
@@ -97,7 +98,7 @@ fn uninstall_keeps_later_configuration_edits() {
 
 #[test]
 fn generated_override_is_removed_on_uninstall() {
-    let fixture = tempfile::tempdir().expect("fixture directory");
+    let fixture = fixture();
     let context = context(fixture.path());
     let system_config = context.search_roots[1].join("xdg-desktop-portal/hyprland-portals.conf");
     fs::create_dir_all(system_config.parent().expect("system config parent"))
@@ -118,7 +119,7 @@ fn generated_override_is_removed_on_uninstall() {
 
 #[test]
 fn portal_activation_rejects_replaceable_executables() {
-    let fixture = tempfile::tempdir().expect("fixture directory");
+    let fixture = fixture();
     let executable = executable(fixture.path());
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o775))
         .expect("group-writable executable");
@@ -131,6 +132,22 @@ fn portal_activation_rejects_replaceable_executables() {
     )
     .expect("world-writable executable directory");
     assert!(secure_executable(&executable).is_err());
+
+    fs::set_permissions(
+        executable.parent().expect("executable parent"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .expect("safe executable directory");
+    fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o777))
+        .expect("world-writable executable ancestor");
+    assert!(secure_executable(&executable).is_err());
+}
+
+#[test]
+fn portal_activation_accepts_only_the_effective_user_or_root_as_owners() {
+    assert!(trusted_owner(0, 1_000));
+    assert!(trusted_owner(1_000, 1_000));
+    assert!(!trusted_owner(1_001, 1_000));
 }
 
 fn context(root: &std::path::Path) -> SetupContext {
@@ -153,4 +170,11 @@ fn executable(root: &std::path::Path) -> PathBuf {
     fs::write(&path, b"binary").expect("executable file");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("executable permissions");
     path
+}
+
+fn fixture() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("strata-portal-")
+        .tempdir_in("target")
+        .expect("fixture directory")
 }

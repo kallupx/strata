@@ -5,7 +5,7 @@ mod tests;
 
 use std::{
     env, fs, io,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -211,27 +211,38 @@ fn install_at(context: &SetupContext, executable: &Path) -> Result<PathBuf, Stri
 }
 
 fn secure_executable(path: &Path) -> Result<PathBuf, String> {
+    secure_executable_for_user(path, rustix::process::geteuid().as_raw())
+}
+
+fn secure_executable_for_user(path: &Path, effective_user: u32) -> Result<PathBuf, String> {
     let path = fs::canonicalize(path)
         .map_err(|error| path_error("resolve the Strata executable", path, error))?;
-    let metadata = fs::metadata(&path)
-        .map_err(|error| path_error("inspect the Strata executable", &path, error))?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-        return Err("The Strata executable must be a regular executable file".to_owned());
-    }
-    if metadata.permissions().mode() & 0o022 != 0 {
-        return Err("The Strata executable must not be writable by other users".to_owned());
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| "The Strata executable has no containing directory".to_owned())?;
-    let parent_metadata = fs::metadata(parent)
-        .map_err(|error| path_error("inspect the Strata executable directory", parent, error))?;
-    if !parent_metadata.is_dir() || parent_metadata.permissions().mode() & 0o022 != 0 {
-        return Err(
-            "The Strata executable directory must not be writable by other users".to_owned(),
-        );
+    for (index, component) in path.ancestors().enumerate() {
+        let metadata = fs::metadata(component)
+            .map_err(|error| path_error("inspect the Strata executable path", component, error))?;
+        if index == 0 {
+            if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+                return Err("The Strata executable must be a regular executable file".to_owned());
+            }
+        } else if !metadata.is_dir() {
+            return Err("The Strata executable path must contain only directories".to_owned());
+        }
+        if !trusted_owner(metadata.uid(), effective_user) {
+            return Err(
+                "The Strata executable path must be owned by the current user or root".to_owned(),
+            );
+        }
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return Err(
+                "The Strata executable path must not be writable by other users".to_owned(),
+            );
+        }
     }
     Ok(path)
+}
+
+fn trusted_owner(owner: u32, effective_user: u32) -> bool {
+    owner == 0 || owner == effective_user
 }
 
 fn uninstall_at(context: &SetupContext) -> Result<bool, String> {
