@@ -112,25 +112,6 @@ struct VirtualPreviewState {
     pressed_link: RefCell<Option<String>>,
 }
 
-struct DocumentTextTags {
-    headings: [gtk::TextTag; 6],
-    quote: gtk::TextTag,
-    code: gtk::TextTag,
-    code_start: gtk::TextTag,
-    code_end: gtk::TextTag,
-    rule: gtk::TextTag,
-    lists: Vec<gtk::TextTag>,
-    list_children: Vec<gtk::TextTag>,
-    dim: gtk::TextTag,
-    accent: gtk::TextTag,
-    link: gtk::TextTag,
-    bold: gtk::TextTag,
-    italic: gtk::TextTag,
-    strikethrough: gtk::TextTag,
-    monospace: gtk::TextTag,
-    underline: gtk::TextTag,
-}
-
 pub(super) fn rendered_document(layout: DocumentLayout, warnings: Vec<String>) -> gtk::Box {
     let units = layout
         .units
@@ -210,9 +191,6 @@ fn virtual_preview(
         let Some(row) = item.child().and_downcast::<gtk::Box>() else {
             return;
         };
-        if !source {
-            clear_box(&row);
-        }
         let index = item.position() as usize;
         let Some(unit) = state_for_bind.units.get(index) else {
             return;
@@ -255,11 +233,6 @@ fn virtual_preview(
                     .upgrade()
                     .is_some_and(|bound_row| bound_row != row)
             });
-            if source {
-                clear_source_row(&row);
-            } else {
-                clear_box(&row);
-            }
         }
     });
 
@@ -316,6 +289,7 @@ fn bind_unit(
             kind: DocumentUnitKind::Gap,
             ..
         }) => {
+            clear_box(row);
             row.set_size_request(-1, 10);
             let bound = BoundRow::default();
             bound.root.set(Some(row));
@@ -328,8 +302,7 @@ fn bind_unit(
             row.set_margin_start(16 + list_indent(*list_depth));
             row.set_margin_end(16);
             row.set_margin_bottom(if index + 1 == unit_count { 20 } else { 10 });
-            let table = document_table(rows);
-            row.append(&table);
+            let table = bind_document_table_row(row, rows);
             let bound = BoundRow::default();
             bound.root.set(Some(row));
             bound.table.set(Some(&table));
@@ -345,18 +318,7 @@ fn bind_unit(
             } else {
                 10
             });
-            let view = document_text_view(unit);
-            if matches!(unit.kind, DocumentUnitKind::Code { .. }) {
-                let overlay = gtk::Overlay::new();
-                overlay.add_css_class("preview-code-overlay");
-                overlay.set_child(Some(&view));
-                if unit.first {
-                    overlay.add_overlay(&code_copy_button(units, index));
-                }
-                row.append(&overlay);
-            } else {
-                row.append(&view);
-            }
+            let view = bind_document_row(row, unit, units, index);
             let bound = BoundRow::default();
             bound.root.set(Some(row));
             bound.view.set(Some(&view));
@@ -364,6 +326,74 @@ fn bind_unit(
         }
         PreviewUnit::Source(unit) => bind_source_row(row, unit),
     }
+}
+
+fn bind_document_row(
+    row: &gtk::Box,
+    unit: &DocumentUnit,
+    units: Rc<Vec<PreviewUnit>>,
+    index: usize,
+) -> super::document_view::DocumentTextView {
+    let is_code = matches!(unit.kind, DocumentUnitKind::Code { .. });
+    let view = if let Some(view) = reusable_document_view(row, is_code, unit) {
+        bind_document_text_view(&view, unit);
+        view
+    } else {
+        clear_box(row);
+        let view = document_text_view(unit);
+        if is_code {
+            let overlay = gtk::Overlay::new();
+            overlay.add_css_class("preview-code-overlay");
+            overlay.set_child(Some(&view));
+            row.append(&overlay);
+        } else {
+            row.append(&view);
+        }
+        view
+    };
+
+    if is_code && let Some(overlay) = row.first_child().and_downcast::<gtk::Overlay>() {
+        if let Some(button) = overlay
+            .last_child()
+            .filter(|child| child.has_css_class("preview-code-copy"))
+        {
+            overlay.remove_overlay(&button);
+        }
+        if unit.first {
+            overlay.add_overlay(&code_copy_button(units, index));
+        }
+    }
+    view
+}
+
+fn reusable_document_view(
+    row: &gtk::Box,
+    is_code: bool,
+    unit: &DocumentUnit,
+) -> Option<super::document_view::DocumentTextView> {
+    let child = row.first_child()?;
+    let view = if is_code {
+        child
+            .downcast::<gtk::Overlay>()
+            .ok()?
+            .child()?
+            .downcast::<super::document_view::DocumentTextView>()
+            .ok()?
+    } else {
+        child
+            .downcast::<super::document_view::DocumentTextView>()
+            .ok()?
+    };
+    let highlighted = view.buffer().is::<sourceview5::Buffer>();
+    (highlighted == document_uses_source_buffer(unit)).then_some(view)
+}
+
+fn document_uses_source_buffer(unit: &DocumentUnit) -> bool {
+    highlighted_code_language(unit).is_some_and(|language| {
+        sourceview5::LanguageManager::default()
+            .language(language)
+            .is_some()
+    })
 }
 
 fn bind_source_row(row: &gtk::Box, unit: &SourceUnit) -> BoundRow {
@@ -405,15 +435,6 @@ fn source_row_views(
         .downcast::<super::document_view::DocumentTextView>()
         .ok()?;
     Some((numbers, view))
-}
-
-fn clear_source_row(row: &gtk::Box) {
-    let Some((numbers, view)) = source_row_views(row) else {
-        return;
-    };
-    numbers.buffer().set_text("");
-    view.buffer().set_text("");
-    view.set_selection_range(None);
 }
 
 fn source_line_numbers_view(unit: &SourceUnit) -> gtk::TextView {
@@ -476,52 +497,65 @@ fn plain_text_view(text: &str, source: bool) -> super::document_view::DocumentTe
 }
 
 fn document_text_view(unit: &DocumentUnit) -> super::document_view::DocumentTextView {
-    let source_buffer = highlighted_code_language(unit).and_then(|language| {
-        let language = sourceview5::LanguageManager::default().language(language)?;
+    let buffer = if document_uses_source_buffer(unit) {
         let buffer = sourceview5::Buffer::new(None);
-        buffer.set_language(Some(&language));
-        buffer.set_highlight_syntax(true);
         super::theme::register_source_buffer(&buffer);
-        buffer.set_text(&normalize_preview_text(&unit.text));
-        buffer.ensure_highlight(&buffer.start_iter(), &buffer.end_iter());
-        Some(buffer)
-    });
-    let buffer = source_buffer.map_or_else(
-        || {
-            let buffer = gtk::TextBuffer::new(None);
-            buffer.set_text(&normalize_preview_text(&unit.text));
-            buffer
-        },
-        |buffer| buffer.upcast::<gtk::TextBuffer>(),
-    );
-    let tags = document_text_tags(&buffer);
-    apply_document_unit_tags(&buffer, &tags, unit);
+        buffer.upcast::<gtk::TextBuffer>()
+    } else {
+        gtk::TextBuffer::new(None)
+    };
+    ensure_document_text_tags(&buffer);
     super::theme::register_document_buffer(&buffer);
-
-    let is_code = matches!(unit.kind, DocumentUnitKind::Code { .. });
-    let code = is_code.then(|| super::document_view::DocumentCodeBlock {
-        start: 0,
-        end: buffer.char_count(),
-        first: unit.first,
-        last: unit.last,
-    });
-    let view = super::document_view::DocumentTextView::new(&buffer, code.into_iter().collect());
+    let view = super::document_view::DocumentTextView::new(&buffer, Vec::new());
     view.set_editable(false);
     view.set_cursor_visible(false);
     view.set_accepts_tab(false);
-    view.set_wrap_mode(if is_code || !unit.wrap {
-        gtk::WrapMode::None
-    } else {
-        gtk::WrapMode::WordChar
-    });
     view.set_left_margin(16);
     view.set_right_margin(16);
     view.set_can_target(false);
     view.set_focusable(false);
     view.add_css_class("preview-document");
-    set_document_accessibility(&view, unit);
     super::theme::register_document_view(&view);
+    bind_document_text_view(&view, unit);
     view
+}
+
+fn bind_document_text_view(view: &super::document_view::DocumentTextView, unit: &DocumentUnit) {
+    let buffer = view.buffer();
+    let text = normalize_preview_text(&unit.text);
+    if let Ok(source_buffer) = buffer.clone().downcast::<sourceview5::Buffer>() {
+        let language = highlighted_code_language(unit)
+            .and_then(|language| sourceview5::LanguageManager::default().language(language));
+        source_buffer.set_highlight_syntax(language.is_some());
+        source_buffer.set_language(language.as_ref());
+        source_buffer.set_text(&text);
+        if language.is_some() {
+            source_buffer.ensure_highlight(&source_buffer.start_iter(), &source_buffer.end_iter());
+        }
+    } else {
+        buffer.set_text(&text);
+    }
+    apply_document_unit_tags(&buffer, unit);
+
+    let is_code = matches!(unit.kind, DocumentUnitKind::Code { .. });
+    view.set_code_blocks(
+        is_code
+            .then(|| super::document_view::DocumentCodeBlock {
+                start: 0,
+                end: buffer.char_count(),
+                first: unit.first,
+                last: unit.last,
+            })
+            .into_iter()
+            .collect(),
+    );
+    view.set_selection_range(None);
+    view.set_wrap_mode(if is_code || !unit.wrap {
+        gtk::WrapMode::None
+    } else {
+        gtk::WrapMode::WordChar
+    });
+    set_document_accessibility(view, unit);
 }
 
 fn highlighted_code_language(unit: &DocumentUnit) -> Option<&'static str> {
@@ -611,64 +645,70 @@ fn code_block_copy_text(units: &[PreviewUnit], index: usize) -> Option<String> {
     None
 }
 
-fn apply_document_unit_tags(
-    buffer: &gtk::TextBuffer,
-    tags: &DocumentTextTags,
-    unit: &DocumentUnit,
-) {
+fn apply_document_unit_tags(buffer: &gtk::TextBuffer, unit: &DocumentUnit) {
     let start = buffer.start_iter();
     let end = buffer.end_iter();
-    let apply = |tag: &gtk::TextTag| buffer.apply_tag(tag, &start, &end);
+    let apply = |name: &str| buffer.apply_tag(&document_tag(buffer, name), &start, &end);
     match &unit.kind {
         DocumentUnitKind::Heading(level) => {
-            apply(&tags.headings[usize::from(*level).saturating_sub(1).min(5)]);
-            apply(&tags.accent);
+            apply(&format!(
+                "document-heading-{}",
+                usize::from(*level).clamp(1, 6)
+            ));
+            apply("document-accent");
         }
         DocumentUnitKind::ListItem { depth } => {
-            apply(if unit.first {
-                document_list_tag(tags, *depth)
+            apply(&if unit.first {
+                format!("document-list-{}", depth.min(&32))
             } else {
-                document_list_child_tag(tags, *depth)
+                format!("document-list-child-{}", depth.min(&32))
             });
         }
         DocumentUnitKind::ListChild { depth, kind } => {
-            apply(document_list_child_tag(tags, *depth));
+            apply(&format!("document-list-child-{}", depth.min(&32)));
             match kind {
                 DocumentListChildKind::Heading(level) => {
-                    apply(&tags.headings[usize::from(*level).saturating_sub(1).min(5)]);
-                    apply(&tags.accent);
+                    apply(&format!(
+                        "document-heading-{}",
+                        usize::from(*level).clamp(1, 6)
+                    ));
+                    apply("document-accent");
                 }
                 DocumentListChildKind::Quote => {
-                    apply(&tags.quote);
-                    apply(&tags.dim);
+                    apply("document-quote");
+                    apply("document-dim");
                 }
                 DocumentListChildKind::Paragraph => {}
                 DocumentListChildKind::Code(_) => unreachable!(),
             }
         }
         DocumentUnitKind::Quote => {
-            apply(&tags.quote);
-            apply(&tags.dim);
+            apply("document-quote");
+            apply("document-dim");
         }
         DocumentUnitKind::Code { list_depth, .. } => {
-            apply(&tags.code);
+            apply("document-code");
             if let Some(depth) = list_depth {
-                apply(document_list_child_tag(tags, *depth));
+                apply(&format!("document-list-child-{}", depth.min(&32)));
             }
             if unit.first && buffer.char_count() > 0 {
-                buffer.apply_tag(&tags.code_start, &start, &buffer.iter_at_offset(1));
+                buffer.apply_tag(
+                    &document_tag(buffer, "document-code-start"),
+                    &start,
+                    &buffer.iter_at_offset(1),
+                );
             }
             if unit.last && buffer.char_count() > 0 {
                 let mut last = end;
                 last.set_line_offset(0);
-                buffer.apply_tag(&tags.code_end, &last, &end);
+                buffer.apply_tag(&document_tag(buffer, "document-code-end"), &last, &end);
             }
         }
         DocumentUnitKind::Rule { list_depth } => {
-            apply(&tags.rule);
-            apply(&tags.dim);
+            apply("document-rule");
+            apply("document-dim");
             if let Some(depth) = list_depth {
-                apply(document_list_child_tag(tags, *depth));
+                apply(&format!("document-list-child-{}", depth.min(&32)));
             }
         }
         DocumentUnitKind::Paragraph | DocumentUnitKind::Table { .. } | DocumentUnitKind::Gap => {}
@@ -677,23 +717,34 @@ fn apply_document_unit_tags(
     for span in &unit.spans {
         let start = buffer.iter_at_offset(i32::try_from(span.range.start).unwrap_or(i32::MAX));
         let end = buffer.iter_at_offset(i32::try_from(span.range.end).unwrap_or(i32::MAX));
-        let tag = match span.style {
-            DocumentSpanStyle::Accent => &tags.accent,
-            DocumentSpanStyle::Bold => &tags.bold,
-            DocumentSpanStyle::Italic => &tags.italic,
-            DocumentSpanStyle::Strikethrough => &tags.strikethrough,
-            DocumentSpanStyle::Monospace => &tags.monospace,
-            DocumentSpanStyle::Underline => &tags.underline,
-            DocumentSpanStyle::Link(_) => &tags.link,
-        };
-        buffer.apply_tag(tag, &start, &end);
+        let tag = document_tag(
+            buffer,
+            match span.style {
+                DocumentSpanStyle::Accent => "document-accent",
+                DocumentSpanStyle::Bold => "document-bold",
+                DocumentSpanStyle::Italic => "document-italic",
+                DocumentSpanStyle::Strikethrough => "document-strikethrough",
+                DocumentSpanStyle::Monospace => "document-monospace",
+                DocumentSpanStyle::Underline => "document-underline",
+                DocumentSpanStyle::Link(_) => "document-link",
+            },
+        );
+        buffer.apply_tag(&tag, &start, &end);
         if matches!(span.style, DocumentSpanStyle::Link(_)) {
-            buffer.apply_tag(&tags.accent, &start, &end);
+            buffer.apply_tag(&document_tag(buffer, "document-accent"), &start, &end);
         }
     }
 }
 
+fn document_tag(buffer: &gtk::TextBuffer, name: &str) -> gtk::TextTag {
+    buffer
+        .tag_table()
+        .lookup(name)
+        .unwrap_or_else(|| panic!("missing document text tag {name}"))
+}
+
 fn set_document_accessibility(view: &super::document_view::DocumentTextView, unit: &DocumentUnit) {
+    view.reset_property(gtk::AccessibleProperty::Level);
     match unit.kind {
         DocumentUnitKind::Heading(level)
         | DocumentUnitKind::ListChild {
@@ -733,20 +784,24 @@ fn list_indent(depth: Option<usize>) -> i32 {
     depth.map_or(0, |depth| 20 + depth.min(32) as i32 * 18)
 }
 
-fn document_text_tags(buffer: &gtk::TextBuffer) -> DocumentTextTags {
+fn ensure_document_text_tags(buffer: &gtk::TextBuffer) {
+    let table = buffer.tag_table();
+    if table.lookup("document-heading-1").is_some() {
+        return;
+    }
     let add = |tag: gtk::TextTag| {
-        assert!(buffer.tag_table().add(&tag));
+        assert!(table.add(&tag));
         tag
     };
     let scales = [1.6, 1.35, 1.18, 1.04, 1.04, 1.04];
-    let headings = std::array::from_fn(|index| {
+    for (index, scale) in scales.into_iter().enumerate() {
         add(gtk::TextTag::builder()
             .name(format!("document-heading-{}", index + 1))
             .weight(700)
-            .scale(scales[index])
-            .build())
-    });
-    let quote = add(gtk::TextTag::builder()
+            .scale(scale)
+            .build());
+    }
+    add(gtk::TextTag::builder()
         .name("document-quote")
         .style(gtk::pango::Style::Italic)
         .left_margin(12)
@@ -754,7 +809,7 @@ fn document_text_tags(buffer: &gtk::TextBuffer) -> DocumentTextTags {
         .line_height(1.2)
         .background_full_height(true)
         .build());
-    let code = add(gtk::TextTag::builder()
+    add(gtk::TextTag::builder()
         .name("document-code")
         .family("monospace")
         .indent(10)
@@ -762,75 +817,54 @@ fn document_text_tags(buffer: &gtk::TextBuffer) -> DocumentTextTags {
         .line_height(1.15)
         .wrap_mode(gtk::WrapMode::None)
         .build());
-    let code_start = add(gtk::TextTag::builder()
+    add(gtk::TextTag::builder()
         .name("document-code-start")
         .pixels_above_lines(super::document_view::CODE_TOP_SPACE)
         .build());
-    let code_end = add(gtk::TextTag::builder()
+    add(gtk::TextTag::builder()
         .name("document-code-end")
         .pixels_below_lines(super::document_view::CODE_BOTTOM_SPACE)
         .build());
-    let rule = add(gtk::TextTag::builder().name("document-rule").build());
-    let lists = (0..=32)
-        .map(|depth| {
-            add(gtk::TextTag::builder()
-                .name(format!("document-list-{depth}"))
-                .left_margin(20 + depth * 18)
-                .indent(-18)
-                .build())
-        })
-        .collect();
-    let list_children = (0..=32)
-        .map(|depth| {
-            add(gtk::TextTag::builder()
-                .name(format!("document-list-child-{depth}"))
-                .left_margin(20 + depth * 18)
-                .build())
-        })
-        .collect();
-    let dim = add(gtk::TextTag::builder().name("document-dim").build());
-    let accent = add(gtk::TextTag::builder().name("document-accent").build());
-    let link = add(gtk::TextTag::builder()
+    add(gtk::TextTag::builder().name("document-rule").build());
+    for depth in 0..=32 {
+        add(gtk::TextTag::builder()
+            .name(format!("document-list-{depth}"))
+            .left_margin(20 + depth * 18)
+            .indent(-18)
+            .build());
+        add(gtk::TextTag::builder()
+            .name(format!("document-list-child-{depth}"))
+            .left_margin(20 + depth * 18)
+            .build());
+    }
+    add(gtk::TextTag::builder().name("document-dim").build());
+    add(gtk::TextTag::builder().name("document-accent").build());
+    add(gtk::TextTag::builder()
         .name("document-link")
         .underline(gtk::pango::Underline::Single)
         .build());
-    let bold = add(gtk::TextTag::builder().weight(700).build());
-    let italic = add(gtk::TextTag::builder()
+    add(gtk::TextTag::builder()
+        .name("document-bold")
+        .weight(700)
+        .build());
+    add(gtk::TextTag::builder()
+        .name("document-italic")
         .style(gtk::pango::Style::Italic)
         .build());
-    let strikethrough = add(gtk::TextTag::builder().strikethrough(true).build());
-    let monospace = add(gtk::TextTag::builder().family("monospace").build());
-    let underline = add(gtk::TextTag::builder()
+    add(gtk::TextTag::builder()
+        .name("document-strikethrough")
+        .strikethrough(true)
+        .build());
+    add(gtk::TextTag::builder()
+        .name("document-monospace")
+        .family("monospace")
+        .build());
+    add(gtk::TextTag::builder()
+        .name("document-underline")
         .underline(gtk::pango::Underline::Single)
         .build());
     add(gtk::TextTag::builder().name("document-link-hover").build());
     add(gtk::TextTag::builder().name("document-selection").build());
-    DocumentTextTags {
-        headings,
-        quote,
-        code,
-        code_start,
-        code_end,
-        rule,
-        lists,
-        list_children,
-        dim,
-        accent,
-        link,
-        bold,
-        italic,
-        strikethrough,
-        monospace,
-        underline,
-    }
-}
-
-fn document_list_tag(tags: &DocumentTextTags, depth: usize) -> &gtk::TextTag {
-    &tags.lists[depth.min(tags.lists.len().saturating_sub(1))]
-}
-
-fn document_list_child_tag(tags: &DocumentTextTags, depth: usize) -> &gtk::TextTag {
-    &tags.list_children[depth.min(tags.list_children.len().saturating_sub(1))]
 }
 
 fn document_table_widget() -> gtk::Grid {
@@ -847,13 +881,34 @@ fn document_table_widget() -> gtk::Grid {
     table
 }
 
-fn document_table(rows: &[Vec<DocumentTableCellLayout>]) -> gtk::Grid {
-    let table = document_table_widget();
+fn bind_document_table_row(row: &gtk::Box, rows: &[Vec<DocumentTableCellLayout>]) -> gtk::Grid {
+    let table = row
+        .first_child()
+        .and_then(|child| child.downcast::<gtk::Grid>().ok())
+        .unwrap_or_else(|| {
+            clear_box(row);
+            let table = document_table_widget();
+            row.append(&table);
+            table
+        });
+    bind_document_table(&table, rows);
+    table
+}
+
+fn bind_document_table(table: &gtk::Grid, rows: &[Vec<DocumentTableCellLayout>]) {
+    let mut labels = Vec::new();
+    let mut child = table.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        table.remove(&widget);
+        if let Ok(label) = widget.downcast::<gtk::Label>() {
+            labels.push(label);
+        }
+    }
     for (row, cells) in rows.iter().enumerate() {
         for (column, cell) in cells.iter().enumerate() {
-            let label = gtk::Label::new(None);
-            label.add_css_class("preview-document-table-cell");
-            label.set_use_markup(true);
+            let label = labels.pop().unwrap_or_else(document_table_cell);
+            label.set_tooltip_text(None);
             if cell.text.len() > TABLE_CELL_DISPLAY_BYTES {
                 label.set_text(&format!(
                     "{}…",
@@ -865,27 +920,34 @@ fn document_table(rows: &[Vec<DocumentTableCellLayout>]) -> gtk::Grid {
             } else {
                 label.set_markup(&styled_markup(&cell.text, &cell.spans));
             }
-            label.set_wrap(true);
-            label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-            label.set_xalign(0.0);
-            label.set_yalign(0.0);
-            label.set_hexpand(true);
-            label.connect_activate_link(|label, uri| {
-                if has_web_scheme(uri) {
-                    super::browser::open_location(&Location::uri(uri), label);
-                }
-                glib::Propagation::Stop
-            });
             if cell.header {
                 label.add_css_class("header");
                 label.set_accessible_role(gtk::AccessibleRole::ColumnHeader);
             } else {
+                label.remove_css_class("header");
                 label.set_accessible_role(gtk::AccessibleRole::Cell);
             }
             table.attach(&label, column as i32, row as i32, 1, 1);
         }
     }
-    table
+}
+
+fn document_table_cell() -> gtk::Label {
+    let label = gtk::Label::new(None);
+    label.add_css_class("preview-document-table-cell");
+    label.set_use_markup(true);
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    label.set_xalign(0.0);
+    label.set_yalign(0.0);
+    label.set_hexpand(true);
+    label.connect_activate_link(|label, uri| {
+        if has_web_scheme(uri) {
+            super::browser::open_location(&Location::uri(uri), label);
+        }
+        glib::Propagation::Stop
+    });
+    label
 }
 
 fn styled_markup(text: &str, spans: &[DocumentSpan]) -> String {

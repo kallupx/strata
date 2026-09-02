@@ -6,13 +6,17 @@ use gtk::prelude::*;
 
 use super::{
     DocumentSelection, PreviewUnit, SelectionPoint, SourceUnit, VirtualPreviewState,
-    bind_source_row, bounded_text_prefix, code_block_copy_text, drag_threshold_crossed,
-    highlighted_code_language, local_selection, matching_link, plain_text_view, rendered_document,
-    selection_text, source_document, source_line_numbers, source_line_numbers_view, source_units,
-    styled_markup, use_virtual_source, vertical_distance,
+    bind_document_row, bind_document_table_row, bind_source_row, bounded_text_prefix,
+    code_block_copy_text, drag_threshold_crossed, highlighted_code_language, local_selection,
+    matching_link, plain_text_view, rendered_document, selection_text, source_document,
+    source_line_numbers, source_line_numbers_view, source_units, styled_markup, use_virtual_source,
+    vertical_distance,
 };
 use crate::{
-    services::{DocumentLayout, DocumentSpan, DocumentSpanStyle, DocumentUnit, DocumentUnitKind},
+    services::{
+        DocumentLayout, DocumentSpan, DocumentSpanStyle, DocumentTableCellLayout, DocumentUnit,
+        DocumentUnitKind,
+    },
     test_support::ASYNC_MAIN_CONTEXT_DEFAULT,
 };
 
@@ -344,6 +348,97 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
         first: true,
         last: true,
     };
+    let mut styled = unit("second");
+    styled.kind = DocumentUnitKind::Heading(2);
+    styled.spans.push(DocumentSpan {
+        range: 0..6,
+        style: DocumentSpanStyle::Bold,
+    });
+    let units = Rc::new(vec![
+        PreviewUnit::Document(unit("first")),
+        PreviewUnit::Document(styled),
+        PreviewUnit::Document(unit("third")),
+    ]);
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let first_view = bind_document_row(&row, document(&units[0]), units.clone(), 0);
+    let first_buffer = first_view.buffer();
+    let second_view = bind_document_row(&row, document(&units[1]), units.clone(), 1);
+    assert_eq!(first_view, second_view);
+    assert_eq!(first_buffer, second_view.buffer());
+    assert_eq!(
+        second_view.buffer().text(
+            &second_view.buffer().start_iter(),
+            &second_view.buffer().end_iter(),
+            false
+        ),
+        "second"
+    );
+    let tag_names = second_view
+        .buffer()
+        .iter_at_offset(1)
+        .tags()
+        .into_iter()
+        .filter_map(|tag| tag.name())
+        .collect::<Vec<_>>();
+    assert!(tag_names.iter().any(|name| name == "document-heading-2"));
+    assert!(tag_names.iter().any(|name| name == "document-bold"));
+    assert_eq!(second_view.accessible_role(), gtk::AccessibleRole::Heading);
+    let third_view = bind_document_row(&row, document(&units[2]), units.clone(), 2);
+    assert_eq!(second_view, third_view);
+    assert_eq!(third_view.accessible_role(), gtk::AccessibleRole::Generic);
+    let third_tag_names = third_view
+        .buffer()
+        .iter_at_offset(1)
+        .tags()
+        .into_iter()
+        .filter_map(|tag| tag.name())
+        .collect::<Vec<_>>();
+    assert!(
+        !third_tag_names
+            .iter()
+            .any(|name| name == "document-heading-2" || name == "document-bold")
+    );
+
+    let table_row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let table = bind_document_table_row(
+        &table_row,
+        &[vec![DocumentTableCellLayout {
+            header: true,
+            text: "Header".to_owned(),
+            spans: Vec::new(),
+        }]],
+    );
+    let label = table
+        .first_child()
+        .and_downcast::<gtk::Label>()
+        .expect("table should contain a label");
+    let rebound_table = bind_document_table_row(
+        &table_row,
+        &[vec![DocumentTableCellLayout {
+            header: false,
+            text: "Cell".to_owned(),
+            spans: Vec::new(),
+        }]],
+    );
+    assert_eq!(table, rebound_table);
+    assert_eq!(
+        label,
+        rebound_table
+            .first_child()
+            .expect("rebound table should retain its label")
+    );
+    assert_eq!(label.text(), "Cell");
+    assert!(!label.has_css_class("header"));
+    drop((
+        first_view,
+        second_view,
+        third_view,
+        row,
+        table,
+        label,
+        table_row,
+    ));
+
     let root = rendered_document(
         DocumentLayout {
             units: vec![unit("first"), unit("second")],
