@@ -51,6 +51,7 @@ Strata combines spatial Miller-column navigation with familiar Grid and Explorer
 - **Remote locations:** browse GIO/GVfs locations such as authenticated SMB shares from the location field.
 - **Adaptive appearance:** compact or airy density, six bundled themes, custom themes, and live Omarchy Quattro theme following.
 - **Updates in the app:** opt-in automatic checks, release notes, verified downloads, and in-place installation for release binaries.
+- **System file chooser:** optionally serve local file and folder requests from portal-aware applications; see [portal setup](docs/portal-file-chooser.md).
 
 ## Installation
 

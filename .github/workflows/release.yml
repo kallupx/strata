@@ -170,6 +170,9 @@ jobs:
           install -m 755 "target/$TARGET/release/strata" "dist/$package/strata"
           printf '%s\n' "$SOURCE_SHA" > "dist/$package/SOURCE_COMMIT"
           cp README.md LICENSE THIRD_PARTY_LICENSES.md "dist/$package/"
+          mkdir -p "dist/$package/docs" "dist/$package/portal"
+          cp docs/portal-file-chooser.md "dist/$package/docs/"
+          cp data/portal/* "dist/$package/portal/"
           tar -C dist -czf "dist/$package.tar.gz" "$package"
           (cd dist && sha256sum "$package.tar.gz" > "$package.tar.gz.sha256")
 
