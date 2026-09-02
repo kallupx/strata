@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use gtk::{gio, glib, prelude::*};
+use gtk::{glib, prelude::*};
 use sourceview5::prelude::*;
 
 use crate::{
@@ -169,8 +169,9 @@ fn virtual_preview(
         hovered: Cell::new(None),
         pressed_link: RefCell::new(None),
     });
-    let model = gio::ListStore::new::<glib::BoxedAnyObject>();
+    let model = gtk::StringList::new(&vec![""; state.units.len()]);
     let selection = gtk::NoSelection::new(Some(model.clone()));
+    let document_tags = (!source).then(document_tag_table);
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
@@ -184,6 +185,7 @@ fn virtual_preview(
     });
 
     let state_for_bind = state.clone();
+    let document_tags_for_bind = document_tags.clone();
     factory.connect_bind(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
@@ -201,6 +203,7 @@ fn virtual_preview(
             index,
             state_for_bind.units.len(),
             state_for_bind.units.clone(),
+            document_tags_for_bind.as_ref(),
         );
         let mut bound_rows = state_for_bind.bound.borrow_mut();
         bound_rows.retain(|_, bound| {
@@ -247,11 +250,6 @@ fn virtual_preview(
     list.set_focusable(true);
     list.set_hexpand(true);
     list.set_vexpand(true);
-    let items = (0..state.units.len())
-        .map(glib::BoxedAnyObject::new)
-        .collect::<Vec<_>>();
-    model.splice(0, 0, &items);
-
     let scroll = gtk::ScrolledWindow::builder()
         .child(&list)
         .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -277,6 +275,7 @@ fn bind_unit(
     index: usize,
     unit_count: usize,
     units: Rc<Vec<PreviewUnit>>,
+    document_tags: Option<&gtk::TextTagTable>,
 ) -> BoundRow {
     row.set_margin_top(if index == 0 { 12 } else { 0 });
     row.set_margin_bottom(if index + 1 == unit_count { 20 } else { 0 });
@@ -318,7 +317,13 @@ fn bind_unit(
             } else {
                 10
             });
-            let view = bind_document_row(row, unit, units, index);
+            let view = bind_document_row(
+                row,
+                unit,
+                units,
+                index,
+                document_tags.expect("rendered previews should share document text tags"),
+            );
             let bound = BoundRow::default();
             bound.root.set(Some(row));
             bound.view.set(Some(&view));
@@ -333,6 +338,7 @@ fn bind_document_row(
     unit: &DocumentUnit,
     units: Rc<Vec<PreviewUnit>>,
     index: usize,
+    document_tags: &gtk::TextTagTable,
 ) -> super::document_view::DocumentTextView {
     let is_code = matches!(unit.kind, DocumentUnitKind::Code { .. });
     let view = if let Some(view) = reusable_document_view(row, is_code, unit) {
@@ -340,7 +346,7 @@ fn bind_document_row(
         view
     } else {
         clear_box(row);
-        let view = document_text_view(unit);
+        let view = document_text_view(unit, document_tags);
         if is_code {
             let overlay = gtk::Overlay::new();
             overlay.add_css_class("preview-code-overlay");
@@ -496,15 +502,17 @@ fn plain_text_view(text: &str, source: bool) -> super::document_view::DocumentTe
     view
 }
 
-fn document_text_view(unit: &DocumentUnit) -> super::document_view::DocumentTextView {
+fn document_text_view(
+    unit: &DocumentUnit,
+    document_tags: &gtk::TextTagTable,
+) -> super::document_view::DocumentTextView {
     let buffer = if document_uses_source_buffer(unit) {
-        let buffer = sourceview5::Buffer::new(None);
+        let buffer = sourceview5::Buffer::new(Some(document_tags));
         super::theme::register_source_buffer(&buffer);
         buffer.upcast::<gtk::TextBuffer>()
     } else {
-        gtk::TextBuffer::new(None)
+        gtk::TextBuffer::new(Some(document_tags))
     };
-    ensure_document_text_tags(&buffer);
     super::theme::register_document_buffer(&buffer);
     let view = super::document_view::DocumentTextView::new(&buffer, Vec::new());
     view.set_editable(false);
@@ -865,6 +873,13 @@ fn ensure_document_text_tags(buffer: &gtk::TextBuffer) {
         .build());
     add(gtk::TextTag::builder().name("document-link-hover").build());
     add(gtk::TextTag::builder().name("document-selection").build());
+}
+
+fn document_tag_table() -> gtk::TextTagTable {
+    let table = gtk::TextTagTable::new();
+    let buffer = gtk::TextBuffer::new(Some(&table));
+    ensure_document_text_tags(&buffer);
+    table
 }
 
 fn document_table_widget() -> gtk::Grid {

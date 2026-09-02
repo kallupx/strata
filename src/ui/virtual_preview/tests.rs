@@ -7,10 +7,10 @@ use gtk::prelude::*;
 use super::{
     DocumentSelection, PreviewUnit, SelectionPoint, SourceUnit, VirtualPreviewState,
     bind_document_row, bind_document_table_row, bind_source_row, bounded_text_prefix,
-    code_block_copy_text, drag_threshold_crossed, highlighted_code_language, local_selection,
-    matching_link, plain_text_view, rendered_document, selection_text, source_document,
-    source_line_numbers, source_line_numbers_view, source_units, styled_markup, use_virtual_source,
-    vertical_distance,
+    code_block_copy_text, document_tag_table, drag_threshold_crossed, highlighted_code_language,
+    local_selection, matching_link, plain_text_view, rendered_document, selection_text,
+    source_document, source_line_numbers, source_line_numbers_view, source_units, styled_markup,
+    use_virtual_source, vertical_distance,
 };
 use crate::{
     services::{
@@ -359,10 +359,12 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
         PreviewUnit::Document(styled),
         PreviewUnit::Document(unit("third")),
     ]);
+    let document_tags = document_tag_table();
     let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let first_view = bind_document_row(&row, document(&units[0]), units.clone(), 0);
+    let first_view = bind_document_row(&row, document(&units[0]), units.clone(), 0, &document_tags);
     let first_buffer = first_view.buffer();
-    let second_view = bind_document_row(&row, document(&units[1]), units.clone(), 1);
+    let second_view =
+        bind_document_row(&row, document(&units[1]), units.clone(), 1, &document_tags);
     assert_eq!(first_view, second_view);
     assert_eq!(first_buffer, second_view.buffer());
     assert_eq!(
@@ -383,7 +385,7 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
     assert!(tag_names.iter().any(|name| name == "document-heading-2"));
     assert!(tag_names.iter().any(|name| name == "document-bold"));
     assert_eq!(second_view.accessible_role(), gtk::AccessibleRole::Heading);
-    let third_view = bind_document_row(&row, document(&units[2]), units.clone(), 2);
+    let third_view = bind_document_row(&row, document(&units[2]), units.clone(), 2, &document_tags);
     assert_eq!(second_view, third_view);
     assert_eq!(third_view.accessible_role(), gtk::AccessibleRole::Generic);
     let third_tag_names = third_view
@@ -397,6 +399,18 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
         !third_tag_names
             .iter()
             .any(|name| name == "document-heading-2" || name == "document-bold")
+    );
+    let other_row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let other_view = bind_document_row(
+        &other_row,
+        document(&units[0]),
+        units.clone(),
+        0,
+        &document_tags,
+    );
+    assert_eq!(
+        third_view.buffer().tag_table(),
+        other_view.buffer().tag_table()
     );
 
     let table_row = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -434,6 +448,8 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
         second_view,
         third_view,
         row,
+        other_view,
+        other_row,
         table,
         label,
         table_row,
