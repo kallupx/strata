@@ -726,13 +726,16 @@ fn is_open_terminal_shortcut(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierTy
         && matches!(key, gtk::gdk::Key::t | gtk::gdk::Key::T)
 }
 
-fn is_sidebar_focus_shortcut(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> bool {
+pub(super) fn is_sidebar_focus_shortcut(
+    key: gtk::gdk::Key,
+    modifiers: gtk::gdk::ModifierType,
+) -> bool {
     modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::SHIFT_MASK)
         && !modifiers.contains(gtk::gdk::ModifierType::ALT_MASK)
         && matches!(key, gtk::gdk::Key::b | gtk::gdk::Key::B)
 }
 
-fn vim_focus_direction(key: gtk::gdk::Key) -> Option<gtk::DirectionType> {
+pub(super) fn vim_focus_direction(key: gtk::gdk::Key) -> Option<gtk::DirectionType> {
     match key {
         gtk::gdk::Key::h => Some(gtk::DirectionType::Left),
         gtk::gdk::Key::j => Some(gtk::DirectionType::Down),
@@ -972,7 +975,7 @@ fn append_menu_heading(container: &gtk::Box, text: &str) {
     container.append(&heading);
 }
 
-struct SidebarState {
+pub(super) struct SidebarState {
     widget: gtk::Box,
     view: BrowserView,
     browser: Rc<Browser>,
@@ -985,7 +988,7 @@ struct SidebarState {
 
 pub(super) struct SidebarView {
     pub(super) widget: gtk::Widget,
-    state: Rc<SidebarState>,
+    pub(super) state: Rc<SidebarState>,
     update_notice: gtk::Button,
     update_area: gtk::Box,
     update_label: gtk::Label,
@@ -1124,7 +1127,7 @@ impl SidebarState {
         }
     }
 
-    fn focus_active_place(&self) -> bool {
+    pub(super) fn focus_active_place(&self) -> bool {
         let rows = self.place_rows.borrow();
         rows.iter()
             .find(|(_, row)| row.has_css_class("active"))

@@ -40,7 +40,10 @@ use super::{
     controls::{form_check_button, form_entry, form_label},
     preview::PreviewDrawer,
     theme::ThemeManager,
-    window::{build_appearance_menu, build_sidebar},
+    window::{
+        SidebarView, build_appearance_menu, build_sidebar, home_directory,
+        is_sidebar_focus_shortcut, vim_focus_direction,
+    },
 };
 
 type Completion = Box<dyn FnOnce(ashpd::backend::Result<SelectedFiles>)>;
@@ -728,12 +731,12 @@ pub(crate) fn present_chooser(
         }
         glib::Propagation::Proceed
     });
+    install_shortcuts(&window, &state, &sidebar, &sidebar_toggle, &preview);
     let browser_for_destroy = browser.clone();
     window.connect_destroy(move |_| {
         browser_for_destroy.clear_observer();
         sidebar.disconnect();
     });
-    install_shortcuts(&window, &state, &sidebar_toggle, &preview);
 
     let weak_window = glib::WeakRef::new();
     weak_window.set(Some(&window));
@@ -879,23 +882,40 @@ fn apply_external_parent(window: &gtk::Window, parent: Option<&WindowIdentifierT
 fn install_shortcuts(
     window: &gtk::Window,
     state: &Rc<ChooserState>,
-    sidebar: &gtk::ToggleButton,
+    sidebar: &SidebarView,
+    sidebar_toggle: &gtk::ToggleButton,
     preview: &PreviewDrawer,
 ) {
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     let weak = Rc::downgrade(state);
-    let sidebar = sidebar.clone();
+    let sidebar_state = sidebar.state.clone();
+    let sidebar_widget = sidebar.widget.clone();
+    let sidebar_toggle = sidebar_toggle.clone();
     let preview = preview.clone();
+    let dialog_parent = window.clone();
+    let focus_before_sidebar = Rc::new(RefCell::new(None::<gtk::Widget>));
     keys.connect_key_pressed(move |_, key, _, modifiers| {
         let Some(state) = weak.upgrade() else {
             return glib::Propagation::Proceed;
         };
+        let browser = state.view.browser();
         let control = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
         let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+        let focused = gtk::prelude::RootExt::focus(&dialog_parent);
+        let sidebar_has_focus = focused.as_ref().is_some_and(|focused| {
+            focused == &sidebar_widget || focused.is_ancestor(&sidebar_widget)
+        });
         if key == gtk::gdk::Key::Escape {
             if state.view.cancel_new_entry() {
+                return glib::Propagation::Stop;
+            }
+            if state.view.dismiss_focused_filter() {
+                return glib::Propagation::Stop;
+            }
+            if state.view.location_has_focus() {
+                state.view.cancel_location_edit();
                 return glib::Propagation::Stop;
             }
             if preview.is_open() {
@@ -905,29 +925,57 @@ fn install_shortcuts(
             state.cancel();
             return glib::Propagation::Stop;
         }
-        if key == gtk::gdk::Key::space && !control && !alt && state.view.item_view_has_focus() {
-            preview.toggle(chooser_preview_target(state.view.browser().focused_entry()));
+        if state.view.new_entry_is_active() {
+            return glib::Propagation::Proceed;
+        }
+        if control
+            && !shift
+            && !alt
+            && matches!(key, gtk::gdk::Key::f | gtk::gdk::Key::F)
+            && state.view.show_filter()
+        {
             return glib::Propagation::Stop;
         }
         if control && matches!(key, gtk::gdk::Key::l | gtk::gdk::Key::L) {
             state.view.begin_location_edit();
             return glib::Propagation::Stop;
         }
-        if control && matches!(key, gtk::gdk::Key::h | gtk::gdk::Key::H) {
-            state.view.browser().toggle_hidden();
+        if is_sidebar_focus_shortcut(key, modifiers) {
+            if sidebar_has_focus {
+                let restored = focus_before_sidebar
+                    .borrow_mut()
+                    .take()
+                    .is_some_and(|widget| widget.grab_focus());
+                if !restored {
+                    browser.focus_active();
+                }
+            } else {
+                focus_before_sidebar.replace(focused.clone());
+                if !sidebar_toggle.is_active() {
+                    sidebar_toggle.set_active(true);
+                }
+                let sidebar = sidebar_state.clone();
+                glib::idle_add_local_once(move || {
+                    sidebar.focus_active_place();
+                });
+            }
             return glib::Propagation::Stop;
+        }
+        if control && !shift && matches!(key, gtk::gdk::Key::b | gtk::gdk::Key::B) {
+            sidebar_toggle.set_active(!sidebar_toggle.is_active());
+            return glib::Propagation::Stop;
+        }
+        if state.view.location_has_focus() {
+            return glib::Propagation::Proceed;
         }
         if control && shift && matches!(key, gtk::gdk::Key::n | gtk::gdk::Key::N) {
             state.view.create_new_folder();
             return glib::Propagation::Stop;
         }
-        if control && !shift && matches!(key, gtk::gdk::Key::b | gtk::gdk::Key::B) {
-            sidebar.set_active(!sidebar.is_active());
-            return glib::Propagation::Stop;
-        }
         if control
             && !shift
             && key == gtk::gdk::Key::a
+            && !state.view.filter_has_focus()
             && matches!(
                 &state.request.kind,
                 ChooserKind::Open { multiple: true, .. }
@@ -936,7 +984,129 @@ fn install_shortcuts(
             state.view.select_all();
             return glib::Propagation::Stop;
         }
-        glib::Propagation::Proceed
+        if control && matches!(key, gtk::gdk::Key::h | gtk::gdk::Key::H) {
+            browser.toggle_hidden();
+            return glib::Propagation::Stop;
+        }
+        let column_popover = focused
+            .as_ref()
+            .and_then(|focused| focused.ancestor(gtk::Popover::static_type()))
+            .and_downcast::<gtk::Popover>()
+            .filter(|popover| popover.has_css_class("column-popover"));
+        if let Some(popover) = column_popover
+            && !control
+            && !alt
+            && let Some(direction) = vim_focus_direction(key)
+        {
+            popover.child_focus(direction);
+            return glib::Propagation::Stop;
+        }
+        let mut header_left_boundary = false;
+        if state.view.header_actions_have_focus() && !control && !alt {
+            match key {
+                gtk::gdk::Key::h | gtk::gdk::Key::Left => {
+                    if state.view.move_header_focus(gtk::DirectionType::Left) {
+                        return glib::Propagation::Stop;
+                    }
+                    header_left_boundary = true;
+                }
+                gtk::gdk::Key::l | gtk::gdk::Key::Right => {
+                    state.view.move_header_focus(gtk::DirectionType::Right);
+                    return glib::Propagation::Stop;
+                }
+                gtk::gdk::Key::j | gtk::gdk::Key::Down => {
+                    state.view.focus_items_from_header();
+                    return glib::Propagation::Stop;
+                }
+                _ => {}
+            }
+        }
+        if sidebar_has_focus
+            && !control
+            && !alt
+            && let Some(direction) = vim_focus_direction(key)
+        {
+            if direction == gtk::DirectionType::Right {
+                focus_before_sidebar.borrow_mut().take();
+                browser.focus_active();
+            } else {
+                sidebar_widget.child_focus(direction);
+            }
+            return glib::Propagation::Stop;
+        }
+        if key == gtk::gdk::Key::BackSpace
+            && !control
+            && !alt
+            && state.view.dismiss_empty_focused_filter()
+        {
+            return glib::Propagation::Stop;
+        }
+        if !control && !alt && !state.view.item_view_has_focus() && !header_left_boundary {
+            return glib::Propagation::Proceed;
+        }
+        if key == gtk::gdk::Key::space && !control && !alt {
+            preview.toggle(chooser_preview_target(browser.focused_entry()));
+            return glib::Propagation::Stop;
+        }
+        if key == gtk::gdk::Key::BackSpace && !control && !alt {
+            state.view.navigate_up();
+            return glib::Propagation::Stop;
+        }
+        if shift
+            && matches!(
+                &state.request.kind,
+                ChooserKind::Open { multiple: true, .. }
+            )
+            && key == gtk::gdk::Key::Up
+        {
+            browser.extend_selection(-1);
+            return glib::Propagation::Stop;
+        }
+        if shift
+            && matches!(
+                &state.request.kind,
+                ChooserKind::Open { multiple: true, .. }
+            )
+            && key == gtk::gdk::Key::Down
+        {
+            browser.extend_selection(1);
+            return glib::Propagation::Stop;
+        }
+        if !shift
+            && matches!(key, gtk::gdk::Key::k | gtk::gdk::Key::Up)
+            && state.view.focus_header_from_top_item()
+        {
+            return glib::Propagation::Stop;
+        }
+
+        match (key, alt) {
+            (gtk::gdk::Key::Left, true) => browser.back(),
+            (gtk::gdk::Key::Right, true) => browser.forward(),
+            (gtk::gdk::Key::Up, true) => browser.parent(),
+            (gtk::gdk::Key::Home, true) => {
+                browser.navigate(Location::local(home_directory()));
+            }
+            (gtk::gdk::Key::j | gtk::gdk::Key::Down, false) => browser.move_selection(1),
+            (gtk::gdk::Key::k | gtk::gdk::Key::Up, false) => browser.move_selection(-1),
+            (gtk::gdk::Key::h | gtk::gdk::Key::Left, false)
+                if !control
+                    && state.view.first_column_has_focus()
+                    && sidebar_toggle.is_active() =>
+            {
+                focus_before_sidebar.replace(focused.clone());
+                sidebar_state.focus_active_place();
+            }
+            (gtk::gdk::Key::h | gtk::gdk::Key::Left, false) => state.view.navigate_left(),
+            (
+                gtk::gdk::Key::l
+                | gtk::gdk::Key::Right
+                | gtk::gdk::Key::Return
+                | gtk::gdk::Key::KP_Enter,
+                false,
+            ) => state.view.activate_focused(),
+            _ => return glib::Propagation::Proceed,
+        }
+        glib::Propagation::Stop
     });
     window.add_controller(keys);
 }
