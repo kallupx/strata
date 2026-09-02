@@ -2,11 +2,76 @@
 
 use std::path::Path;
 
+use crate::services::{BuildKind, ReleaseMetadata};
+
 use super::{
-    PinStatus, is_sidebar_focus_shortcut, is_smb_location, is_standard_place_location,
-    parse_pinned_places, pin_status, remove_pinned_place, reorder_places,
-    should_show_standard_place, vim_focus_direction,
+    MouseHistoryAction, PinStatus, is_open_terminal_shortcut, is_sidebar_focus_shortcut,
+    is_smb_location, is_standard_place_location, mouse_history_action, parse_pinned_places,
+    pin_status, remove_pinned_place, reorder_places, serialize_pinned_places,
+    should_show_standard_place, sidebar_update_label, vim_focus_direction,
 };
+
+fn release(version: &str, kind: BuildKind) -> ReleaseMetadata {
+    ReleaseMetadata {
+        version: version.to_owned(),
+        url: "https://example.test/release".to_owned(),
+        notes: String::new(),
+        note_blocks: Vec::new(),
+        kind,
+        tag: format!("v{version}"),
+        published_at: None,
+        commit: None,
+    }
+}
+
+#[test]
+fn sidebar_update_label_stays_plain_for_a_stable_release() {
+    assert_eq!(
+        sidebar_update_label(&release("0.6.0", BuildKind::Stable)),
+        "v0.6.0 available"
+    );
+}
+
+#[test]
+fn sidebar_update_label_names_the_build_kind_for_a_prerelease() {
+    assert_eq!(
+        sidebar_update_label(&release("0.6.0-rc.1", BuildKind::Rc)),
+        "v0.6.0-rc.1 (Release candidate) available"
+    );
+    assert_eq!(
+        sidebar_update_label(&release("0.6.0-nightly.20260901", BuildKind::Nightly)),
+        "v0.6.0-nightly.20260901 (Nightly) available"
+    );
+}
+
+#[test]
+fn mouse_history_buttons_map_to_navigation_actions() {
+    assert_eq!(mouse_history_action(8), Some(MouseHistoryAction::Back));
+    assert_eq!(mouse_history_action(9), Some(MouseHistoryAction::Forward));
+    for button in [1, 2, 3, 4, 5, 6, 7, 10] {
+        assert_eq!(mouse_history_action(button), None);
+    }
+}
+
+#[test]
+fn open_terminal_shortcut_requires_only_control() {
+    let control = gtk::gdk::ModifierType::CONTROL_MASK;
+    let shift = gtk::gdk::ModifierType::SHIFT_MASK;
+    let alt = gtk::gdk::ModifierType::ALT_MASK;
+
+    assert!(is_open_terminal_shortcut(gtk::gdk::Key::t, control));
+    assert!(is_open_terminal_shortcut(gtk::gdk::Key::T, control));
+    assert!(!is_open_terminal_shortcut(
+        gtk::gdk::Key::t,
+        gtk::gdk::ModifierType::empty()
+    ));
+    assert!(!is_open_terminal_shortcut(
+        gtk::gdk::Key::t,
+        control | shift
+    ));
+    assert!(!is_open_terminal_shortcut(gtk::gdk::Key::t, control | alt));
+    assert!(!is_open_terminal_shortcut(gtk::gdk::Key::F4, control));
+}
 
 #[test]
 fn sidebar_focus_shortcut_requires_control_and_shift() {
@@ -89,6 +154,61 @@ fn gtk_bookmarks_become_native_and_remote_pinned_places() {
     );
     assert_eq!(places[1].1, "Remote");
     assert_eq!(places.len(), 2);
+}
+
+#[test]
+fn gtk_bookmarks_sanitize_uris_with_credentials() {
+    let places = parse_pinned_places(
+        "smb://alice@host/safe Safe\nsmb://alice:secret@host/private Password\nsmb://alice%3Asecret@host/private Encoded password delimiter\nsmb://alice;password=secret@host/private Auth\nsmb://alice%3Bpassword=secret@host/private Encoded auth delimiter\nsmb://alice;password=sec%72et@host/private Encoded value\nsmb://alice%ZZ@host/private Invalid\n",
+    );
+
+    assert_eq!(places.len(), 2);
+    assert_eq!(
+        places[0]
+            .0
+            .uri_value()
+            .expect("remote place should have a URI")
+            .trim_end_matches('/'),
+        "smb://alice@host/safe"
+    );
+    assert_eq!(
+        places[1]
+            .0
+            .uri_value()
+            .expect("remote place should have a URI")
+            .trim_end_matches('/'),
+        "smb://alice@host/private"
+    );
+}
+
+#[test]
+fn gtk_bookmark_serialization_sanitizes_uris_with_credentials() {
+    let places = vec![
+        (
+            crate::model::Location::uri("smb://alice@host/safe"),
+            "Safe".to_owned(),
+        ),
+        (
+            crate::model::Location::uri("smb://alice:secret@host/private"),
+            "Password".to_owned(),
+        ),
+        (
+            crate::model::Location::uri("smb://alice;password=secret@host/private"),
+            "Auth".to_owned(),
+        ),
+        (
+            crate::model::Location::uri("smb://alice%3Asecret@host/private"),
+            "Encoded".to_owned(),
+        ),
+    ];
+
+    assert_eq!(
+        serialize_pinned_places(&places),
+        "smb://alice@host/safe Safe\n\
+         smb://alice@host/private Password\n\
+         smb://alice@host/private Auth\n\
+         smb://alice@host/private Encoded\n"
+    );
 }
 
 #[test]

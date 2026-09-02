@@ -26,6 +26,7 @@ const TRANSITION: Duration = Duration::from_millis(260);
 const PDF_PAGE_GAP: i32 = 6;
 const PDF_MIN_ZOOM: f64 = 1.0;
 const PDF_MAX_ZOOM: f64 = 4.0;
+const MEDIA_PLUGIN_INSTALL_COMMAND: &str = "sudo pacman -S --needed gst-plugins-good gst-libav";
 
 struct PreviewState {
     provider: Rc<dyn PreviewProvider>,
@@ -439,20 +440,35 @@ impl PreviewState {
                 let media = gtk::MediaFile::for_input_stream(&stream);
                 let video = gtk::Video::for_media_stream(Some(&media));
                 video.add_css_class("preview-media");
-                video.set_autoplay(false);
-                video.set_loop(false);
+                let is_gif = preview.content_type == "image/gif";
+                video.set_autoplay(is_gif);
+                video.set_loop(is_gif);
                 video.set_hexpand(true);
                 video.set_vexpand(true);
                 self.media.replace(Some(video.clone()));
+                let weak = Rc::downgrade(self);
+                media.connect_error_notify(move |media| {
+                    let Some(error) = media.error() else {
+                        return;
+                    };
+                    if let Some(state) = weak.upgrade() {
+                        state.show_media_error(&error);
+                    }
+                });
                 self.content.append(&video);
-                let notice = gtk::Label::new(Some(
-                    "Preview limited to the first 30 seconds. Open the file to play the full video.",
-                ));
-                notice.add_css_class("preview-note");
-                notice.set_justify(gtk::Justification::Center);
-                notice.set_wrap(true);
-                notice.set_xalign(0.5);
-                self.content.append(&notice);
+                if let Some(error) = media.error() {
+                    self.show_media_error(&error);
+                }
+                if !is_gif {
+                    let notice = gtk::Label::new(Some(
+                        "Preview limited to the first 30 seconds. Open the file to play the full video.",
+                    ));
+                    notice.add_css_class("preview-note");
+                    notice.set_justify(gtk::Justification::Center);
+                    notice.set_wrap(true);
+                    notice.set_xalign(0.5);
+                    self.content.append(&notice);
+                }
             }
             PreviewContent::Image | PreviewContent::Media => {
                 self.show_message(
@@ -758,13 +774,40 @@ impl PreviewState {
         self.content.append(&spinner);
     }
 
+    fn show_media_error(&self, error: &glib::Error) {
+        let message = error.message();
+        let (title, detail, command) = media_error_feedback(message);
+        self.show_message_with_icon(
+            title,
+            &detail,
+            Some(crate::assets::icons::TRIANGLE_ALERT),
+            command,
+        );
+    }
+
     fn show_message(&self, title: &str, detail: &str) {
+        self.show_message_with_icon(title, detail, None, None);
+    }
+
+    fn show_message_with_icon(
+        &self,
+        title: &str,
+        detail: &str,
+        icon: Option<&str>,
+        command: Option<&str>,
+    ) {
         self.clear_content();
         let box_ = gtk::Box::new(gtk::Orientation::Vertical, 7);
         box_.add_css_class("preview-feedback");
         box_.set_halign(gtk::Align::Center);
         box_.set_valign(gtk::Align::Center);
         box_.set_vexpand(true);
+        if let Some(icon) = icon {
+            let icon = crate::assets::primary_icon(icon, 34);
+            icon.add_css_class("preview-feedback-icon");
+            icon.set_halign(gtk::Align::Center);
+            box_.append(&icon);
+        }
         let heading = gtk::Label::new(Some(title));
         heading.add_css_class("preview-feedback-title");
         let detail = gtk::Label::new(Some(detail));
@@ -773,8 +816,84 @@ impl PreviewState {
         detail.set_wrap(true);
         box_.append(&heading);
         box_.append(&detail);
+        if let Some(command) = command {
+            box_.append(&copyable_command(command));
+        }
         self.content.append(&box_);
     }
+}
+
+fn copyable_command(command: &str) -> gtk::Overlay {
+    let overlay = gtk::Overlay::new();
+    overlay.add_css_class("preview-command");
+    overlay.set_hexpand(true);
+
+    let field = gtk::Entry::new();
+    field.add_css_class("form-control");
+    field.add_css_class("preview-command-entry");
+    field.set_text(command);
+    field.set_editable(false);
+    field.set_hexpand(true);
+    overlay.set_child(Some(&field));
+
+    let copy = gtk::Button::builder()
+        .tooltip_text("Copy install command")
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Center)
+        .build();
+    copy.add_css_class("preview-command-copy");
+    copy.set_has_frame(false);
+    copy.set_cursor_from_name(Some("pointer"));
+    let copy_icon = crate::assets::primary_icon(crate::assets::icons::COPY, 16);
+    copy.set_child(Some(&copy_icon));
+    let copied_command = command.to_owned();
+    let feedback_generation = Rc::new(Cell::new(0_u64));
+    copy.connect_clicked(move |button| {
+        if let Some(display) = gtk::gdk::Display::default() {
+            display.clipboard().set_text(&copied_command);
+        }
+        let generation = feedback_generation.get().saturating_add(1);
+        feedback_generation.set(generation);
+        crate::assets::set_primary_icon(&copy_icon, crate::assets::icons::CHECK);
+        button.set_tooltip_text(Some("Install command copied"));
+        let button = button.clone();
+        let copy_icon = copy_icon.clone();
+        let feedback_generation = feedback_generation.clone();
+        glib::timeout_add_local_once(Duration::from_secs(2), move || {
+            if feedback_generation.get() == generation {
+                crate::assets::set_primary_icon(&copy_icon, crate::assets::icons::COPY);
+                button.set_tooltip_text(Some("Copy install command"));
+            }
+        });
+    });
+    overlay.add_overlay(&copy);
+    overlay
+}
+
+fn media_error_feedback(message: &str) -> (&'static str, String, Option<&'static str>) {
+    let normalized = message.to_ascii_lowercase();
+    if [
+        "gstreamer",
+        "plug-in",
+        "plugin",
+        "missing decoder",
+        "no decoder",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        return (
+            "Additional media support required",
+            "On Arch or Omarchy, install the required GStreamer plugins, then restart Strata."
+                .to_owned(),
+            Some(MEDIA_PLUGIN_INSTALL_COMMAND),
+        );
+    }
+    (
+        "Preview unavailable",
+        format!("Unable to play this media preview: {message}"),
+        None,
+    )
 }
 
 fn metadata_value(label: &str) -> (gtk::Box, gtk::Label) {

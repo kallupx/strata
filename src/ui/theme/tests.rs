@@ -7,8 +7,11 @@ use super::{
     configured_video_preview_backend, is_omarchy_theme_event, merge_builtin_and_custom_themes,
     slugify, sort_preferences, title_case_slug, tokens_from_quattro, validate_tokens,
 };
-use crate::model::{SortDirection, SortKey, ViewPreferences};
-use crate::sandbox::MediaPreviewBackend;
+use crate::{
+    model::{SortDirection, SortKey, ViewPreferences},
+    sandbox::MediaPreviewBackend,
+    services::Channel,
+};
 
 #[test]
 fn bundled_catalog_is_valid_unique_and_alphabetical() {
@@ -172,13 +175,14 @@ theme = "azure-glow"
         MediaPreviewBackend::Automatic
     );
     assert!(!preferences.search_open_files_directly);
+    assert!(!preferences.reduce_motion);
     assert_eq!(preferences.browser_mode, "columns");
     assert_eq!(preferences.browser_density, "compact");
     assert_eq!(sort_preferences(&preferences), ViewPreferences::default());
 }
 
 #[test]
-fn sorting_preferences_round_trip_all_supported_values() {
+fn view_preferences_round_trip_all_supported_sorting_values() {
     for (key, stored_key) in [
         (SortKey::Name, "name"),
         (SortKey::Size, "size"),
@@ -190,6 +194,8 @@ fn sorting_preferences_round_trip_all_supported_values() {
             (SortDirection::Descending, "descending"),
         ] {
             let preferences = Preferences {
+                show_hidden: true,
+                folders_first: false,
                 sort_key: stored_key.to_owned(),
                 sort_direction: stored_direction.to_owned(),
                 ..Preferences::default()
@@ -197,8 +203,15 @@ fn sorting_preferences_round_trip_all_supported_values() {
             let serialized = toml::to_string(&preferences).expect("preferences should serialize");
             let restored: Preferences =
                 toml::from_str(&serialized).expect("preferences should deserialize");
-            assert_eq!(sort_preferences(&restored).sort_key, key);
-            assert_eq!(sort_preferences(&restored).sort_direction, direction);
+            assert_eq!(
+                sort_preferences(&restored),
+                ViewPreferences {
+                    show_hidden: true,
+                    folders_first: false,
+                    sort_key: key,
+                    sort_direction: direction,
+                }
+            );
         }
     }
 }
@@ -207,40 +220,106 @@ fn sorting_preferences_round_trip_all_supported_values() {
 fn invalid_sorting_preferences_fall_back_as_a_pair() {
     for (key, direction) in [("unknown", "descending"), ("size", "sideways")] {
         let preferences = Preferences {
+            show_hidden: true,
+            folders_first: false,
             sort_key: key.to_owned(),
             sort_direction: direction.to_owned(),
             ..Preferences::default()
         };
-        assert_eq!(sort_preferences(&preferences), ViewPreferences::default());
+        assert_eq!(
+            sort_preferences(&preferences),
+            ViewPreferences {
+                show_hidden: true,
+                folders_first: false,
+                ..ViewPreferences::default()
+            }
+        );
     }
 }
 
 #[test]
-fn folder_peeking_can_be_disabled_in_preferences() {
-    let preferences: Preferences = toml::from_str(
-        r#"
-mode = "theme"
-theme = "azure-glow"
-folder_peeking = false
-"#,
-    )
-    .expect("preferences should be valid");
+fn general_preferences_round_trip() {
+    let preferences = Preferences {
+        folder_peeking: false,
+        single_click_previews: false,
+        search_open_files_directly: true,
+        reduce_motion: true,
+        ..Preferences::default()
+    };
 
-    assert!(!preferences.folder_peeking);
+    let serialized = toml::to_string(&preferences).expect("preferences should serialize");
+    let restored: Preferences =
+        toml::from_str(&serialized).expect("preferences should deserialize");
+
+    assert!(!restored.folder_peeking);
+    assert!(!restored.single_click_previews);
+    assert!(restored.search_open_files_directly);
+    assert!(restored.reduce_motion);
 }
 
 #[test]
-fn single_click_previews_can_be_disabled_in_preferences() {
+fn release_channel_defaults_to_stable() {
+    let preferences = Preferences::default();
+    assert_eq!(preferences.release_channel, "stable");
+    assert_eq!(
+        Channel::parse(&preferences.release_channel),
+        Channel::Stable
+    );
+}
+
+#[test]
+fn preview_release_channel_round_trips_through_toml() {
+    let preferences = Preferences {
+        release_channel: "preview".to_owned(),
+        ..Preferences::default()
+    };
+    let serialized = toml::to_string(&preferences).expect("preferences should serialize");
+    let restored: Preferences =
+        toml::from_str(&serialized).expect("preferences should deserialize");
+    assert_eq!(restored.release_channel, "preview");
+    assert_eq!(Channel::parse(&restored.release_channel), Channel::Preview);
+}
+
+#[test]
+fn nightly_release_channel_round_trips_through_toml() {
+    let preferences = Preferences {
+        release_channel: "nightly".to_owned(),
+        ..Preferences::default()
+    };
+    let serialized = toml::to_string(&preferences).expect("preferences should serialize");
+    let restored: Preferences =
+        toml::from_str(&serialized).expect("preferences should deserialize");
+    assert_eq!(restored.release_channel, "nightly");
+    assert_eq!(Channel::parse(&restored.release_channel), Channel::Nightly);
+}
+
+#[test]
+fn unknown_release_channel_value_parses_to_stable() {
+    let preferences = Preferences {
+        release_channel: "experimental".to_owned(),
+        ..Preferences::default()
+    };
+    assert_eq!(
+        Channel::parse(&preferences.release_channel),
+        Channel::Stable
+    );
+}
+
+#[test]
+fn legacy_preferences_without_release_channel_default_to_stable() {
     let preferences: Preferences = toml::from_str(
         r#"
 mode = "theme"
 theme = "azure-glow"
-single_click_previews = false
 "#,
     )
-    .expect("preferences should be valid");
+    .expect("legacy preferences without release_channel should remain valid");
 
-    assert!(!preferences.single_click_previews);
+    assert_eq!(preferences.release_channel, "stable");
+    assert_eq!(
+        Channel::parse(&preferences.release_channel),
+        Channel::Stable
+    );
 }
 
 #[test]

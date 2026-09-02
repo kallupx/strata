@@ -11,7 +11,8 @@ use std::{
 use super::{
     Cancellation, MAX_RASTER_INPUT_BYTES, MEDIA_WALL_TIME_LIMIT, MediaPreviewBackend,
     ParseOperation, PrivateOutput, WALL_TIME_LIMIT, gpu_devices, parse, polaris_gpu_available_at,
-    sandbox_command, spawn_renderer, valid_output, wait_for_renderer,
+    sandbox_command, sandbox_input_path, spawn_renderer, valid_output, wait_for_renderer,
+    wait_for_renderer_output,
 };
 
 fn limit_from(arguments: &[String], flag: &str) -> u64 {
@@ -81,11 +82,13 @@ fn sandbox_exposes_only_runtime_input_and_private_output() {
 
     assert!(joined.contains("--unshare-all"));
     assert!(joined.contains("--clearenv"));
-    assert!(joined.contains("--ro-bind /home/alice/Downloads/untrusted.pdf /input"));
+    assert!(joined.contains("--ro-bind /home/alice/Downloads/untrusted.pdf /input.pdf"));
     assert!(joined.contains("--bind /tmp/private-output /output"));
     assert!(joined.contains("--as=2147483648"));
     assert!(joined.contains("--cpu=10"));
     assert!(joined.contains("--fsize=536870912"));
+    assert!(joined.contains("--setenv MALLOC_ARENA_MAX 1"));
+    assert!(joined.contains("--size 536870912 --tmpfs /tmp"));
     // RLIMIT_NPROC counts every process owned by the host user, not just the
     // sandbox, and can prevent legitimate media decoders from starting.
     assert!(!joined.contains("--nproc"));
@@ -94,7 +97,7 @@ fn sandbox_exposes_only_runtime_input_and_private_output() {
 }
 
 #[test]
-fn media_previews_use_a_longer_wall_timeout_instead_of_a_cpu_limit() {
+fn media_previews_use_bounded_streaming_instead_of_driver_wide_resource_limits() {
     let operation = ParseOperation::PreviewMedia;
     let command = sandbox_command(
         Path::new("/tmp/strata"),
@@ -108,10 +111,32 @@ fn media_previews_use_a_longer_wall_timeout_instead_of_a_cpu_limit() {
 
     assert_eq!(operation.wall_time_limit(), MEDIA_WALL_TIME_LIMIT);
     assert!(MEDIA_WALL_TIME_LIMIT > WALL_TIME_LIMIT);
-    assert!(
-        command
-            .get_args()
-            .all(|argument| !argument.to_string_lossy().starts_with("--cpu="))
+    let joined = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(!joined.contains("/usr/bin/prlimit"));
+    assert!(!joined.contains("--as="));
+    assert!(!joined.contains("--cpu="));
+    assert!(!joined.contains("--fsize="));
+    assert!(!joined.contains("MALLOC_ARENA_MAX"));
+    assert!(joined.contains("--size 536870912 --tmpfs /tmp"));
+    assert!(!joined.contains("--bind /tmp/private-output /output"));
+    assert!(joined.contains("preview-media /input.mkv /dev/stdout"));
+}
+
+#[test]
+fn sandbox_input_keeps_a_safe_filename_extension() {
+    assert_eq!(
+        sandbox_input_path(Path::new("/photos/DSC01986.ARW")),
+        "/input.ARW"
+    );
+    assert_eq!(sandbox_input_path(Path::new("/tmp/no-extension")), "/input");
+    assert_eq!(sandbox_input_path(Path::new("/tmp/photo.ar-w")), "/input");
+    assert_eq!(
+        sandbox_input_path(Path::new("/tmp/toolongextension.abcdefghij")),
+        "/input"
     );
 }
 
@@ -278,7 +303,8 @@ fn media_sandbox_exposes_only_supplied_gpu_devices_and_sysfs() {
     }
     assert!(joined.contains("--ro-bind /sys /sys"));
     assert!(!joined.contains("--cpu=10"));
-    assert!(joined.contains("/output/result.media"));
+    assert!(!joined.contains("--bind /tmp/private-output /output"));
+    assert!(joined.contains("preview-media /input.mkv /dev/stdout"));
 }
 
 #[test]
@@ -436,6 +462,37 @@ fn running_thumbnail_process_trees_are_stopped_on_timeout_and_cancellation() {
     assert_eq!(error, "Preview cancelled");
     assert!(cancelled.try_wait().expect("inspect renderer").is_some());
     assert_process_marker_stopped(&cancellation_marker);
+}
+
+#[test]
+fn streamed_media_output_is_bounded_before_it_reaches_the_application() {
+    let mut exact_command = Command::new("sh");
+    exact_command.args(["-c", "printf 1234"]);
+    exact_command.stdout(std::process::Stdio::piped());
+    let mut exact = spawn_renderer(&mut exact_command).expect("start exact renderer");
+    let (status, output) = wait_for_renderer_output(
+        &mut exact,
+        &Cancellation::default(),
+        Duration::from_secs(1),
+        4,
+    )
+    .expect("read output at limit");
+    assert!(status.success());
+    assert_eq!(output, b"1234");
+
+    let mut oversized_command = Command::new("sh");
+    oversized_command.args(["-c", "head -c 1025 /dev/zero"]);
+    oversized_command.stdout(std::process::Stdio::piped());
+    let mut oversized = spawn_renderer(&mut oversized_command).expect("start oversized renderer");
+    let error = wait_for_renderer_output(
+        &mut oversized,
+        &Cancellation::default(),
+        Duration::from_secs(1),
+        1_024,
+    )
+    .expect_err("reject oversized output");
+    assert_eq!(error, "Preview provider output exceeded its limit");
+    assert!(oversized.try_wait().expect("inspect renderer").is_some());
 }
 
 fn process_tree_command(marker: &Path) -> Command {

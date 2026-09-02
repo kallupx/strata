@@ -4,7 +4,8 @@ use std::{
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -16,6 +17,9 @@ use crate::sandbox::{MAX_OUTPUT_BYTES, MediaPreviewBackend, gpu_devices, numbere
 
 const HARDWARE_ATTEMPT_TIME_LIMIT: Duration = Duration::from_secs(8);
 const HARDWARE_TOTAL_TIME_LIMIT: Duration = Duration::from_secs(12);
+const MEDIA_TOTAL_TIME_LIMIT: Duration = Duration::from_secs(28);
+const MAX_MEDIA_ALLOCATION_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_MEDIA_DECODE_PIXELS: u64 = 50_000_000;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,15 +46,12 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), String> {
         "thumbnail-raw" => (render_raw(input, value.clamp(16, 256))?, None),
         "thumbnail-pdf" => (render_pdf_thumbnail(input, value.clamp(16, 256))?, None),
         "thumbnail-video" => (render_media(input, value.clamp(16, 256))?, None),
-        "preview-image" => (render_pixbuf(input, 1400)?, None),
+        "preview-image" => (render_raw(input, 1400)?, None),
         "preview-pdf" => {
             let (png, page, pages) = render_pdf_page(input, value)?;
             (png, Some(format!("{page} {pages}")))
         }
-        "preview-media" => {
-            render_media_preview(input, output, media_backend)?;
-            return Ok(());
-        }
+        "preview-media" => (render_media_preview(input, media_backend)?, None),
         _ => return Err("Unknown preview helper operation".to_owned()),
     };
     fs::write(output, png).map_err(|error| error.to_string())?;
@@ -94,42 +95,80 @@ fn render_imagemagick(path: &Path, size: i32) -> Result<Vec<u8>, String> {
     Err("No RAW image renderer succeeded".to_owned())
 }
 
+// LibRaw's dcraw_emu does not support `-e`; `-c` is a threshold, not stdout.
 fn render_dcraw(path: &Path, size: i32) -> Result<Vec<u8>, String> {
-    for executable in ["dcraw_emu", "dcraw"] {
-        let output = bounded_output(
-            Command::new(executable).args(["-e", "-c"]).arg(path),
-            MAX_OUTPUT_BYTES,
-        );
-        let Ok(output) = output else {
+    let classic = bounded_output(
+        Command::new("dcraw").args(["-e", "-c"]).arg(path),
+        MAX_OUTPUT_BYTES,
+    );
+    if let Ok(output) = classic
+        && output.status.success()
+        && !output.stdout.is_empty()
+        && let Ok(png) = scale_embedded_thumbnail(&output.stdout, size)
+    {
+        return Ok(png);
+    }
+    render_simple_dcraw(path, size)
+}
+
+fn render_simple_dcraw(path: &Path, size: i32) -> Result<Vec<u8>, String> {
+    use std::os::unix::fs::symlink;
+
+    // Writes `<file>.thumb.jpg` next to the input, which is a read-only bind.
+    let staging = Path::new("/tmp/raw-thumb");
+    let _ = fs::remove_file(staging);
+    symlink(path, staging).map_err(|error| error.to_string())?;
+    let status = Command::new("simple_dcraw")
+        .arg("-e")
+        .arg(staging)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| error.to_string())?;
+    if !status.success() {
+        return Err("simple_dcraw failed".to_owned());
+    }
+    for thumb in ["/tmp/raw-thumb.thumb.jpg", "/tmp/raw-thumb.thumb.ppm"] {
+        let Ok(file) = fs::File::open(thumb) else {
             continue;
         };
-        if !output.status.success() || output.stdout.is_empty() {
+        let Ok(data) = read_limited(file, MAX_OUTPUT_BYTES) else {
+            continue;
+        };
+        if data.is_empty() {
             continue;
         }
-        let loader = gdk_pixbuf::PixbufLoader::new();
-        if loader.write(&output.stdout).is_err() || loader.close().is_err() {
-            continue;
-        }
-        let Some(pixbuf) = loader.pixbuf() else {
-            continue;
-        };
-        let width = pixbuf.width().max(1);
-        let height = pixbuf.height().max(1);
-        let scale = (f64::from(size) / f64::from(width))
-            .min(f64::from(size) / f64::from(height))
-            .min(1.0);
-        let Some(scaled) = pixbuf.scale_simple(
-            (f64::from(width) * scale).round().max(1.0) as i32,
-            (f64::from(height) * scale).round().max(1.0) as i32,
-            gdk_pixbuf::InterpType::Bilinear,
-        ) else {
-            continue;
-        };
-        if let Ok(png) = scaled.save_to_bufferv("png", &[]) {
+        if let Ok(png) = scale_embedded_thumbnail(&data, size) {
             return Ok(png);
         }
     }
-    Err("No embedded RAW thumbnail could be decoded".to_owned())
+    Err("simple_dcraw produced no thumbnail".to_owned())
+}
+
+fn scale_embedded_thumbnail(data: &[u8], size: i32) -> Result<Vec<u8>, String> {
+    let loader = gdk_pixbuf::PixbufLoader::new();
+    loader
+        .write(data)
+        .and_then(|()| loader.close())
+        .map_err(|error| error.to_string())?;
+    let pixbuf = loader
+        .pixbuf()
+        .ok_or_else(|| "Unable to decode embedded RAW thumbnail".to_owned())?;
+    let width = pixbuf.width().max(1);
+    let height = pixbuf.height().max(1);
+    let scale = (f64::from(size) / f64::from(width))
+        .min(f64::from(size) / f64::from(height))
+        .min(1.0);
+    pixbuf
+        .scale_simple(
+            (f64::from(width) * scale).round().max(1.0) as i32,
+            (f64::from(height) * scale).round().max(1.0) as i32,
+            gdk_pixbuf::InterpType::Bilinear,
+        )
+        .ok_or_else(|| "Unable to scale embedded RAW thumbnail".to_owned())?
+        .save_to_bufferv("png", &[])
+        .map_err(|error| error.to_string())
 }
 
 fn render_pdf_thumbnail(path: &Path, size: i32) -> Result<Vec<u8>, String> {
@@ -207,20 +246,27 @@ fn bounded_surface_dimensions(
     (width, height, scale)
 }
 
-fn render_media_preview(
-    path: &Path,
-    output: &Path,
-    policy: MediaPreviewBackend,
-) -> Result<(), String> {
+fn render_media_preview(path: &Path, policy: MediaPreviewBackend) -> Result<Vec<u8>, String> {
     let backends = media_backends(&gpu_devices(Path::new("/dev"), policy), policy);
+    let started = Instant::now();
     let hardware_started = Instant::now();
     run_media_backends(&backends, |backend| {
-        let mut command = media_command(backend, path, output);
-        if *backend == MediaBackend::Software {
-            return command.status().map(|status| status.success());
-        }
-        let remaining = HARDWARE_TOTAL_TIME_LIMIT.saturating_sub(hardware_started.elapsed());
-        run_command_with_timeout(&mut command, HARDWARE_ATTEMPT_TIME_LIMIT.min(remaining))
+        let total_remaining = MEDIA_TOTAL_TIME_LIMIT.saturating_sub(started.elapsed());
+        let timeout = if *backend == MediaBackend::Software {
+            total_remaining
+        } else {
+            let hardware_remaining =
+                HARDWARE_TOTAL_TIME_LIMIT.saturating_sub(hardware_started.elapsed());
+            HARDWARE_ATTEMPT_TIME_LIMIT
+                .min(hardware_remaining)
+                .min(total_remaining)
+        };
+        let mut command = media_command(backend, path);
+        bounded_output_with_timeout(&mut command, MAX_OUTPUT_BYTES, timeout).map(|result| {
+            result.and_then(|output| {
+                (output.status.success() && !output.stdout.is_empty()).then_some(output.stdout)
+            })
+        })
     })
 }
 
@@ -261,9 +307,13 @@ fn media_backends(devices: &[PathBuf], policy: MediaPreviewBackend) -> Vec<Media
     backends
 }
 
-fn media_command(backend: &MediaBackend, path: &Path, output: &Path) -> Command {
+fn media_command(backend: &MediaBackend, path: &Path) -> Command {
     let mut command = Command::new("ffmpeg");
-    command.args(["-nostdin", "-v", "error"]);
+    command
+        .args(["-nostdin", "-v", "error", "-max_alloc"])
+        .arg(MAX_MEDIA_ALLOCATION_BYTES.to_string())
+        .arg("-max_pixels")
+        .arg(MAX_MEDIA_DECODE_PIXELS.to_string());
     match backend {
         MediaBackend::VaApi(device) => {
             command
@@ -328,9 +378,11 @@ fn media_command(backend: &MediaBackend, path: &Path, output: &Path) -> Command 
         MediaBackend::Software => {
             command.args([
                 "-vf",
-                "scale=w=1280:h=1280:force_original_aspect_ratio=decrease",
+                "scale=w=1280:h=1280:force_original_aspect_ratio=decrease,format=yuv420p",
                 "-c:v",
                 "libvpx",
+                "-auto-alt-ref",
+                "0",
                 "-threads",
                 "2",
                 "-deadline",
@@ -344,24 +396,119 @@ fn media_command(backend: &MediaBackend, path: &Path, output: &Path) -> Command 
     command.args(["-b:v", "2M", "-maxrate", "3M", "-bufsize", "4M"]);
     match backend {
         MediaBackend::Software => command.args(["-c:a", "libopus", "-b:a", "96k", "-f", "webm"]),
-        MediaBackend::VaApi(_) | MediaBackend::Vulkan(_) => {
-            command.args(["-c:a", "aac", "-b:a", "96k", "-f", "mp4"])
-        }
+        MediaBackend::VaApi(_) | MediaBackend::Vulkan(_) => command.args([
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-movflags",
+            "+frag_keyframe+empty_moov",
+            "-f",
+            "mp4",
+        ]),
     };
-    command.arg("-y").arg(output);
+    command.arg("pipe:1");
     command
 }
 
-fn run_media_backends<E>(
+fn run_media_backends<T, E>(
     backends: &[MediaBackend],
-    mut run: impl FnMut(&MediaBackend) -> Result<bool, E>,
-) -> Result<(), String> {
+    mut run: impl FnMut(&MediaBackend) -> Result<Option<T>, E>,
+) -> Result<T, String> {
     for backend in backends {
-        if run(backend).is_ok_and(|success| success) {
-            return Ok(());
+        if let Ok(Some(output)) = run(backend) {
+            return Ok(output);
         }
     }
     Err("Unable to normalize media preview".to_owned())
+}
+
+fn bounded_output_with_timeout(
+    command: &mut Command,
+    max_bytes: u64,
+    timeout: Duration,
+) -> io::Result<Option<Output>> {
+    if timeout.is_zero() {
+        return Ok(None);
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("Unable to capture provider output"))?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let reader = thread::spawn(move || {
+        let mut data = Vec::new();
+        let result = stdout
+            .take(max_bytes.saturating_add(1))
+            .read_to_end(&mut data)
+            .map(|_| data);
+        let _sent = sender.send(result);
+    });
+    let deadline = Instant::now() + timeout;
+    let mut status = None;
+    let mut output = None;
+    loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(current) => status = current,
+                Err(error) => {
+                    stop_child(&mut child);
+                    let _joined = reader.join();
+                    return Err(error);
+                }
+            }
+        }
+        if output.is_none() {
+            match receiver.try_recv() {
+                Ok(Ok(data)) if data.len() as u64 > max_bytes => {
+                    stop_child(&mut child);
+                    let _joined = reader.join();
+                    return Err(io::Error::other(
+                        "Preview provider output exceeded its limit",
+                    ));
+                }
+                Ok(Ok(data)) => output = Some(data),
+                Ok(Err(error)) => {
+                    stop_child(&mut child);
+                    let _joined = reader.join();
+                    return Err(error);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    stop_child(&mut child);
+                    let _joined = reader.join();
+                    return Err(io::Error::other("Unable to read provider output"));
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(status) = status
+            && let Some(stdout) = output.take()
+        {
+            let _joined = reader.join();
+            return Ok(Some(Output {
+                status,
+                stdout,
+                stderr: Vec::new(),
+            }));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            stop_child(&mut child);
+            let _joined = reader.join();
+            return Ok(None);
+        }
+        thread::sleep(PROCESS_POLL_INTERVAL.min(remaining));
+    }
+}
+
+fn stop_child(child: &mut Child) {
+    let _killed = child.kill();
+    let _waited = child.wait();
 }
 
 pub(crate) fn run_command_with_timeout(
@@ -379,8 +526,7 @@ pub(crate) fn run_command_with_timeout(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_child(&mut child);
             return Ok(false);
         }
         thread::sleep(PROCESS_POLL_INTERVAL.min(remaining));
@@ -405,31 +551,38 @@ fn render_media(path: &Path, size: i32) -> Result<Vec<u8>, String> {
     }
 }
 
+fn read_limited(reader: impl Read, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut data)?;
+    if data.len() as u64 > max_bytes {
+        return Err(io::Error::other(
+            "Preview provider output exceeded its limit",
+        ));
+    }
+    Ok(data)
+}
+
 fn bounded_output(command: &mut Command, max_bytes: u64) -> io::Result<Output> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    let mut stdout = Vec::new();
     let read = child
         .stdout
         .take()
-        .ok_or_else(|| io::Error::other("Unable to capture provider output"))?
-        .take(max_bytes.saturating_add(1))
-        .read_to_end(&mut stdout);
-    if let Err(error) = read {
-        let _killed = child.kill();
-        let _waited = child.wait();
-        return Err(error);
-    }
-    if stdout.len() as u64 > max_bytes {
-        let _killed = child.kill();
-        let _waited = child.wait();
-        return Err(io::Error::other(
-            "Preview provider output exceeded its limit",
-        ));
-    }
+        .ok_or_else(|| io::Error::other("Unable to capture provider output"))
+        .and_then(|stdout| read_limited(stdout, max_bytes));
+    let stdout = match read {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            let _killed = child.kill();
+            let _waited = child.wait();
+            return Err(error);
+        }
+    };
     let status = child.wait()?;
     Ok(Output {
         status,

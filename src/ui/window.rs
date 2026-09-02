@@ -14,6 +14,7 @@ use crate::{
     adapters::{LocalFileSource, LocalOperationProvider, LocalPreviewProvider, location_for_file},
     app::{Browser, BrowserEvent},
     model::{EntryKind, FileEntry, Location, MetadataValue},
+    services::{BuildKind, ReleaseMetadata, sanitize_uri_credentials},
 };
 
 use super::{
@@ -28,6 +29,20 @@ use super::{
 const SIDEBAR_WIDTH: i32 = 208;
 const MIN_SIDEBAR_WIDTH: i32 = 176;
 const SIDEBAR_TRANSITION: Duration = Duration::from_millis(300);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MouseHistoryAction {
+    Back,
+    Forward,
+}
+
+fn mouse_history_action(button: u32) -> Option<MouseHistoryAction> {
+    match button {
+        8 => Some(MouseHistoryAction::Back),
+        9 => Some(MouseHistoryAction::Forward),
+        _ => None,
+    }
+}
 
 pub fn present(application: &gtk::Application) {
     present_location(application, None);
@@ -74,6 +89,9 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
                 }
             }
         }
+        BrowserEvent::FocusChanged { position: None, .. } if preview_for_selection.is_open() => {
+            preview_for_selection.close();
+        }
         _ => {}
     });
 
@@ -93,20 +111,23 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
     let search_button = gtk::Button::builder()
         .tooltip_text("Search (Ctrl+K)")
         .build();
-    search_button.set_child(Some(&crate::assets::text_icon(
+    search_button.set_child(Some(&crate::assets::primary_icon(
         crate::assets::icons::SEARCH,
         20,
     )));
     search_button.add_css_class("header-action");
     let appearance = build_appearance_menu(&browser, &controller, theme_manager.clone());
     let settings = gtk::Button::builder().tooltip_text("Settings").build();
-    settings.set_child(Some(&crate::assets::text_icon(
+    settings.set_child(Some(&crate::assets::primary_icon(
         crate::assets::icons::SETTINGS,
         20,
     )));
     settings.add_css_class("header-action");
     let close_window = gtk::Button::builder().tooltip_text("Close window").build();
-    close_window.set_child(Some(&crate::assets::text_icon(crate::assets::icons::X, 20)));
+    close_window.set_child(Some(&crate::assets::primary_icon(
+        crate::assets::icons::X,
+        20,
+    )));
     close_window.add_css_class("header-action");
     let closing_window = window.clone();
     close_window.connect_clicked(move |_| closing_window.close());
@@ -189,6 +210,23 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
     );
     root.append(&preview_split);
 
+    let mouse_history = gtk::GestureClick::new();
+    mouse_history.set_button(0);
+    mouse_history.set_propagation_phase(gtk::PropagationPhase::Bubble);
+    let weak_controller = Rc::downgrade(&controller);
+    mouse_history.connect_pressed(move |gesture, _, _, _| {
+        let Some(browser) = weak_controller.upgrade() else {
+            return;
+        };
+        match mouse_history_action(gesture.current_button()) {
+            Some(MouseHistoryAction::Back) if browser.can_go_back() => browser.back(),
+            Some(MouseHistoryAction::Forward) if browser.can_go_forward() => browser.forward(),
+            _ => return,
+        }
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    root.add_controller(mouse_history);
+
     let window_overlay = gtk::Overlay::new();
     let blurred_root = BlurBin::new(&root);
     window_overlay.set_child(Some(&blurred_root));
@@ -264,25 +302,49 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
     window.add_action(&search_action);
     application.set_accels_for_action("win.search", &["<Control>k"]);
 
+    let terminal_view = browser.clone();
+    let terminal_action = gio::SimpleAction::new("open-terminal", None);
+    terminal_action.connect_activate(move |_, _| {
+        terminal_view.open_terminal();
+    });
+    window.add_action(&terminal_action);
+    application.set_accels_for_action("win.open-terminal", &["<Primary>t"]);
+
     let update_button = sidebar.update_notice.clone();
     let update_area = sidebar.update_area.clone();
     let update_label = sidebar.update_label.clone();
     let available_update = Rc::new(RefCell::new(
         None::<(crate::services::ReleaseMetadata, String)>,
     ));
+    // Process-wide, not per-window: shared across the settings page's
+    // update/rollback rows, this dialog, and every other open window, so at
+    // most one install ever runs at a time -- see
+    // `settings::install_guard`.
+    let install_guard = super::settings::install_guard();
     let available_for_click = available_update.clone();
     let update_parent = window.clone().upcast::<gtk::Window>();
+    let install_guard_for_dialog = install_guard.clone();
     update_button.connect_clicked(move |_| {
         let Some((release, download_url)) = available_for_click.borrow().clone() else {
             return;
         };
-        super::settings::show_update_dialog(&update_parent, &release, download_url);
+        super::settings::show_update_dialog(
+            &update_parent,
+            &release,
+            download_url,
+            install_guard_for_dialog.clone(),
+        );
     });
     let available_for_notice = available_update.clone();
     let update_notice: super::settings::UpdateNoticeHandler = Rc::new(move |release| {
         if let Some((release, download_url)) = release {
             update_button.set_tooltip_text(Some(&format!("Install Strata v{}", release.version)));
-            update_label.set_text(&format!("v{} available", release.version));
+            update_label.set_text(&sidebar_update_label(&release));
+            if release.kind == BuildKind::Stable {
+                update_button.remove_css_class("preview");
+            } else {
+                update_button.add_css_class("preview");
+            }
             *available_for_notice.borrow_mut() = Some((release, download_url));
             update_area.set_visible(true);
         } else {
@@ -296,6 +358,7 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
         &blurred_root,
         theme_manager,
         update_notice,
+        install_guard,
     );
     window_overlay.add_overlay(&settings_layer);
     let shown_settings = settings_layer.clone();
@@ -555,6 +618,10 @@ fn install_keyboard_navigation(
             browser.toggle_hidden();
             return glib::Propagation::Stop;
         }
+        if is_open_terminal_shortcut(key, modifiers) {
+            view.open_terminal();
+            return glib::Propagation::Stop;
+        }
         let column_popover = focused
             .as_ref()
             .and_then(|focused| focused.ancestor(gtk::Popover::static_type()))
@@ -608,11 +675,11 @@ fn install_keyboard_navigation(
         {
             return glib::Propagation::Stop;
         }
-        if !control && !alt && !view.item_view_has_focus() && !header_left_boundary {
-            return glib::Propagation::Proceed;
-        }
         if key == gtk::gdk::Key::Delete && !view.filter_has_focus() && view.confirm_delete(shift) {
             return glib::Propagation::Stop;
+        }
+        if !control && !alt && !view.item_view_has_focus() && !header_left_boundary {
+            return glib::Propagation::Proceed;
         }
         if key == gtk::gdk::Key::space && !alt && !control {
             preview.toggle(browser.focused_entry());
@@ -672,6 +739,13 @@ fn install_keyboard_navigation(
     window.add_controller(keys);
 }
 
+fn is_open_terminal_shortcut(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> bool {
+    modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+        && !modifiers
+            .intersects(gtk::gdk::ModifierType::SHIFT_MASK | gtk::gdk::ModifierType::ALT_MASK)
+        && matches!(key, gtk::gdk::Key::t | gtk::gdk::Key::T)
+}
+
 fn is_sidebar_focus_shortcut(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> bool {
     modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::SHIFT_MASK)
         && !modifiers.contains(gtk::gdk::ModifierType::ALT_MASK)
@@ -720,6 +794,17 @@ fn build_appearance_menu(
 ) -> gtk::MenuButton {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.add_css_class("appearance-menu");
+    let popover = gtk::Popover::builder()
+        .has_arrow(false)
+        .halign(gtk::Align::End)
+        .position(gtk::PositionType::Bottom)
+        .build();
+    popover.add_css_class("appearance-popover");
+    let button = gtk::MenuButton::builder()
+        .tooltip_text("Appearance")
+        .popover(&popover)
+        .build();
+    let popover_weak = popover.downgrade();
     append_menu_heading(&content, "VIEW");
     let current_mode = view.view_mode();
     let (list, list_check, _) = appearance_option(
@@ -750,12 +835,16 @@ fn build_appearance_menu(
         let grid_check = grid_check.clone();
         let explorer_check = explorer_check.clone();
         let preferences = preferences.clone();
+        let popover_weak = popover_weak.clone();
         button.connect_clicked(move |_| {
             view.set_view_mode(mode);
             preferences.set_browser_mode(mode);
             list_check.set_visible(mode == BrowserMode::Columns);
             grid_check.set_visible(mode == BrowserMode::Grid);
             explorer_check.set_visible(mode == BrowserMode::Explorer);
+            if let Some(popover) = popover_weak.upgrade() {
+                popover.popdown();
+            }
         });
     }
     content.append(&list);
@@ -765,6 +854,7 @@ fn build_appearance_menu(
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     append_menu_heading(&content, "DENSITY");
     let current_density = preferences.browser_density();
+    let hidden_files_shown = preferences.sort_preferences().show_hidden;
     let (compact, compact_check, _) = appearance_option(
         crate::assets::icons::ROWS,
         "Compact",
@@ -782,64 +872,75 @@ fn build_appearance_menu(
         let compact_check = compact_check.clone();
         let airy_check = airy_check.clone();
         let preferences = preferences.clone();
+        let popover_weak = popover_weak.clone();
         compact.connect_clicked(move |_| {
             view.set_density(BrowserDensity::Compact);
             preferences.set_browser_density(BrowserDensity::Compact);
             compact_check.set_visible(true);
             airy_check.set_visible(false);
+            if let Some(popover) = popover_weak.upgrade() {
+                popover.popdown();
+            }
         });
     }
     {
         let view = view.clone();
+        let popover_weak = popover_weak.clone();
         airy.connect_clicked(move |_| {
             view.set_density(BrowserDensity::Airy);
             preferences.set_browser_density(BrowserDensity::Airy);
             compact_check.set_visible(false);
             airy_check.set_visible(true);
+            if let Some(popover) = popover_weak.upgrade() {
+                popover.popdown();
+            }
         });
     }
     content.append(&compact);
     content.append(&airy);
 
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    let (hidden, hidden_check, hidden_icon) =
-        appearance_option(crate::assets::icons::EYE_OFF, "Hidden files", false, true);
-    let hidden_state = Rc::new(Cell::new(false));
-    let weak_controller = Rc::downgrade(controller);
-    hidden.connect_clicked(move |_| {
-        let shown = !hidden_state.get();
-        hidden_state.set(shown);
-        hidden_check.set_visible(shown);
+    let (hidden, hidden_check, hidden_icon) = appearance_option(
+        if hidden_files_shown {
+            crate::assets::icons::EYE
+        } else {
+            crate::assets::icons::EYE_OFF
+        },
+        "Hidden files",
+        hidden_files_shown,
+        true,
+    );
+    let observed_hidden_check = hidden_check.clone();
+    let observed_hidden_icon = hidden_icon.clone();
+    controller.observe_preferences(move |preferences| {
+        observed_hidden_check.set_visible(preferences.show_hidden);
         crate::assets::set_primary_icon(
-            &hidden_icon,
-            if shown {
+            &observed_hidden_icon,
+            if preferences.show_hidden {
                 crate::assets::icons::EYE
             } else {
                 crate::assets::icons::EYE_OFF
             },
         );
+    });
+    let weak_controller = Rc::downgrade(controller);
+    let popover_weak = popover_weak.clone();
+    hidden.connect_clicked(move |_| {
         if let Some(controller) = weak_controller.upgrade() {
             controller.toggle_hidden();
+        }
+        if let Some(popover) = popover_weak.upgrade() {
+            popover.popdown();
         }
     });
     content.append(&hidden);
 
-    let popover = gtk::Popover::builder()
-        .child(&content)
-        .has_arrow(false)
-        .halign(gtk::Align::End)
-        .position(gtk::PositionType::Bottom)
-        .build();
-    popover.add_css_class("appearance-popover");
-    let button = gtk::MenuButton::builder()
-        .tooltip_text("Appearance")
-        .popover(&popover)
-        .build();
-    let icon = crate::assets::text_icon(crate::assets::icons::LIST, 20);
+    popover.set_child(Some(&content));
+    let icon = crate::assets::primary_icon(crate::assets::icons::LIST, 20);
     button.set_child(Some(&icon));
     button.add_css_class("header-action");
     button.connect_active_notify(move |button| {
-        crate::assets::set_text_icon(
+        crate::assets::set_primary_icon(
             &icon,
             if button.is_active() {
                 crate::assets::icons::LIST_ACTIVE
@@ -968,10 +1069,10 @@ impl SidebarState {
             .mounts()
             .into_iter()
             .filter(|mount| !mount.is_shadowed() && mount.volume().is_none())
-            .map(|mount| {
+            .filter_map(|mount| {
                 let name = mount.name().to_string();
-                let location = location_for_file(&mount.root());
-                (name, location, mount)
+                let location = location_for_file(&mount.root())?;
+                Some((name, location, mount))
             })
             .collect();
         if !volumes.is_empty() || !mounts.is_empty() {
@@ -1190,8 +1291,9 @@ impl SidebarState {
         let name = volume.name().to_string();
         let row = sidebar_button(crate::assets::icons::HARD_DRIVE, &name);
         row.set_tooltip_text(Some(&name));
-        if let Some(mount) = volume.get_mount() {
-            let location = location_for_file(&mount.root());
+        if let Some(mount) = volume.get_mount()
+            && let Some(location) = location_for_file(&mount.root())
+        {
             self.place_rows.borrow_mut().push((location, row.clone()));
         }
         let weak_browser = Rc::downgrade(&self.browser);
@@ -1520,7 +1622,25 @@ fn sidebar_button(icon: &str, name: &str) -> gtk::Button {
 }
 
 fn navigate_to_gio_file(browser: &Rc<Browser>, file: &gio::File) {
-    browser.navigate(location_for_file(file));
+    if let Some(location) = location_for_file(file) {
+        browser.navigate(location);
+    }
+}
+
+/// The sidebar update-notice pill's label text: `v{version} available` for a
+/// stable offer, or `v{version} ({label}) available` for a prerelease --
+/// e.g. `v0.5.0-rc.1 (Release candidate) available` -- so a preview build
+/// offer is never mistaken for an ordinary stable update at a glance.
+///
+/// No channel guard belongs here: `check_for_updates` is already
+/// channel-filtered upstream, so a Stable user's `release` can never carry
+/// a prerelease kind in the first place.
+fn sidebar_update_label(release: &ReleaseMetadata) -> String {
+    if release.kind == BuildKind::Stable {
+        format!("v{} available", release.version)
+    } else {
+        format!("v{} ({}) available", release.version, release.kind.label())
+    }
 }
 
 fn build_sidebar(view: BrowserView) -> SidebarView {
@@ -1656,7 +1776,9 @@ fn parse_pinned_places(contents: &str) -> Vec<(Location, String)> {
             continue;
         }
         let file = gio::File::for_uri(uri);
-        let location = location_for_file(&file);
+        let Some(location) = location_for_file(&file) else {
+            continue;
+        };
         if places
             .iter()
             .any(|(existing, _): &(Location, String)| existing == &location)
@@ -1680,6 +1802,11 @@ fn save_pinned_places(places: &[(Location, String)]) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
+    let contents = serialize_pinned_places(places);
+    let _result = crate::storage::atomic_write(&path, contents.as_bytes());
+}
+
+fn serialize_pinned_places(places: &[(Location, String)]) -> String {
     let mut contents = String::new();
     for (location, name) in places {
         let uri = location
@@ -1687,12 +1814,14 @@ fn save_pinned_places(places: &[(Location, String)]) {
             .map(gio::File::for_path)
             .map(|file| file.uri().to_string())
             .or_else(|| location.uri_value().map(str::to_owned));
-        if let Some(uri) = uri {
-            let label = name.replace(['\n', '\r'], " ");
-            contents.push_str(&format!("{uri} {label}\n"));
-        }
+        let Some(uri) = uri.and_then(|uri| sanitize_uri_credentials(&uri).ok().map(|(uri, _)| uri))
+        else {
+            continue;
+        };
+        let label = name.replace(['\n', '\r'], " ");
+        contents.push_str(&format!("{uri} {label}\n"));
     }
-    let _result = crate::storage::atomic_write(&path, contents.as_bytes());
+    contents
 }
 
 fn home_directory() -> PathBuf {

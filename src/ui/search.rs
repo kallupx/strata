@@ -110,7 +110,7 @@ impl SearchDialog {
         let navigation = gtk::Label::new(Some("↑↓  navigate"));
         let open = gtk::Box::new(gtk::Orientation::Horizontal, 5);
         open.set_valign(gtk::Align::Center);
-        open.append(&crate::assets::text_icon(
+        open.append(&crate::assets::primary_icon(
             crate::assets::icons::CORNER_DOWN_LEFT,
             13,
         ));

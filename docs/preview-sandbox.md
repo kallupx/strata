@@ -8,7 +8,7 @@ The following providers run in a short-lived helper process:
 
 - GDK Pixbuf image and camera RAW loaders;
 - Poppler PDF thumbnail and page rendering;
-- ImageMagick and `dcraw`/`dcraw_emu` RAW fallbacks; and
+- ImageMagick and `dcraw`/`simple_dcraw` RAW fallbacks; and
 - `ffmpegthumbnailer` media thumbnails.
 
 Image previews are normalized to PNG by the helper. Video previews are limited to the first 30 seconds, at most 1280 pixels on either axis, and at most 30 frames per second. Hardware acceleration is enabled by default except when an unset preference is paired with an AMD Polaris GPU; those systems start with software previews but can opt in from General settings. Automatic mode tries VA-API, then Vulkan, then the software VP8 fallback. A selected VA-API or Vulkan backend falls directly back to software if it fails. Hardware paths produce H.264/AAC MP4 with both dimensions aligned to 16 pixels; the software path produces unchanged VP8/Opus WebM output. This keeps GStreamer from parsing the selected untrusted file directly. Plain-text previews remain in-process and are limited to 1 MB; they do not invoke a native format parser.

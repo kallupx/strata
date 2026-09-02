@@ -8,6 +8,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashSet,
     rc::{Rc, Weak},
 };
 
@@ -82,14 +83,17 @@ struct Pane {
     model: gtk::StringList,
     selection: gtk::MultiSelection,
     filtered_model: Option<gio::ListModel>,
+    filter_model: Option<gtk::FilterListModel>,
     syncing_selection: Rc<Cell<bool>>,
     stack: gtk::Stack,
     status: gtk::Label,
     spinner: gtk::Spinner,
+    truncated_hint: gtk::Image,
     view: gtk::Widget,
     bound_items: Rc<RefCell<Vec<BoundModeItem>>>,
     filter_entry: Option<gtk::Entry>,
     filter_button: Option<gtk::ToggleButton>,
+    empty_trash_button: Option<gtk::Button>,
     new_entry_placeholder: Option<gtk::StringList>,
     new_entry_is_directory: Option<Rc<Cell<bool>>>,
 }
@@ -103,7 +107,7 @@ pub struct ModeViews {
     browser: Rc<Browser>,
     single_click_previews: Rc<Cell<bool>>,
     transfer_handler: TransferHandlerSlot,
-    cut_locations: Rc<RefCell<Vec<Location>>>,
+    cut_locations: Rc<RefCell<HashSet<Location>>>,
     context_state: RefCell<Option<Weak<super::browser::ViewState>>>,
     active_rename: Rc<RefCell<Option<ActiveModeRename>>>,
     active_new_entry: Rc<RefCell<Option<ActiveModeNewEntry>>>,
@@ -161,7 +165,7 @@ impl ModeViews {
             browser,
             single_click_previews: Rc::new(Cell::new(true)),
             transfer_handler: Rc::new(RefCell::new(None)),
-            cut_locations: Rc::new(RefCell::new(Vec::new())),
+            cut_locations: Rc::new(RefCell::new(HashSet::new())),
             context_state: RefCell::new(None),
             active_rename: Rc::new(RefCell::new(None)),
             active_new_entry: Rc::new(RefCell::new(None)),
@@ -445,7 +449,8 @@ impl ModeViews {
     }
 
     pub fn set_cut_locations(&self, locations: &[Location]) {
-        self.cut_locations.replace(locations.to_vec());
+        self.cut_locations
+            .replace(locations.iter().cloned().collect());
         for pane in self.grid_panes.iter().chain(self.explorer_pane.iter()) {
             refresh_cut_pane(pane, &self.browser, locations);
         }
@@ -536,7 +541,9 @@ impl ModeViews {
                             .collect();
                         pane.model.splice(insertion.position as u32, 0, &values);
                     }
-                    show_count(pane);
+                    if !pane.spinner.is_spinning() {
+                        show_count(pane);
+                    }
                 }
             }
             BrowserEvent::EntriesReplaced { depth, entries } => {
@@ -574,21 +581,30 @@ impl ModeViews {
             }
             BrowserEvent::ColumnReloaded { depth } => {
                 for pane in self.panes_at(*depth) {
+                    pane.syncing_selection.set(true);
+                    pane.selection.set_model(None::<&gio::ListModel>);
+                    if let Some(filtered) = pane.filter_model.as_ref() {
+                        filtered.set_model(None::<&gio::ListModel>);
+                    }
                     pane.model.splice(0, pane.model.n_items(), &[]);
+                    pane.truncated_hint.set_visible(false);
                     pane.spinner.set_visible(true);
                     pane.spinner.start();
                     pane.stack.set_visible_child_name("loading");
                 }
             }
-            BrowserEvent::LoadFinished { depth } => {
+            BrowserEvent::LoadFinished { depth, truncated } => {
                 for pane in self.panes_at(*depth) {
+                    reconnect_pane_model(pane);
                     pane.spinner.stop();
                     pane.spinner.set_visible(false);
+                    pane.truncated_hint.set_visible(*truncated);
                     show_count(pane);
                 }
             }
             BrowserEvent::LoadFailed { depth, message } => {
                 for pane in self.panes_at(*depth) {
+                    reconnect_pane_model(pane);
                     pane.spinner.stop();
                     pane.status
                         .set_label(&format!("Unable to read this directory\n{message}"));
@@ -837,6 +853,7 @@ struct GridControls {
     filter_button: gtk::ToggleButton,
     thumbnail_scale: gtk::Scale,
     thumbnail_value: gtk::Label,
+    empty_trash_button: Option<gtk::Button>,
 }
 
 fn filter_controls(tooltip: &str) -> (gtk::Entry, gtk::Revealer, gtk::ToggleButton) {
@@ -858,7 +875,7 @@ fn filter_controls(tooltip: &str) -> (gtk::Entry, gtk::Revealer, gtk::ToggleButt
         .child(&row)
         .build();
     let button = gtk::ToggleButton::builder().tooltip_text(tooltip).build();
-    button.set_child(Some(&crate::assets::text_icon(
+    button.set_child(Some(&crate::assets::primary_icon(
         crate::assets::icons::FUNNEL,
         16,
     )));
@@ -923,14 +940,16 @@ fn grid_controls(browser: &Rc<Browser>, depth: usize, thumbnail_size: i32) -> Gr
         .build();
     thumbnail_menu.add_css_class("column-header-action");
     thumbnail_menu.add_css_class("grid-thumbnail-menu");
-    thumbnail_menu.set_child(Some(&crate::assets::text_icon(
+    thumbnail_menu.set_child(Some(&crate::assets::primary_icon(
         crate::assets::icons::PICTURES,
         16,
     )));
     let empty_trash = super::browser::empty_trash_button(browser);
-    if let Some(location) = browser.location_at(depth) {
-        empty_trash.set_visible(super::browser::is_trash_root(&location));
-    }
+    let is_trash = browser
+        .location_at(depth)
+        .is_some_and(|location| super::browser::is_trash_root(&location));
+    empty_trash.set_visible(is_trash);
+    empty_trash.set_sensitive(false);
     actions.append(&empty_trash);
     actions.append(&thumbnail_menu);
     actions.append(&super::browser::column_sort_direction_toggle(
@@ -948,6 +967,7 @@ fn grid_controls(browser: &Rc<Browser>, depth: usize, thumbnail_size: i32) -> Gr
         filter_button,
         thumbnail_scale,
         thumbnail_value,
+        empty_trash_button: is_trash.then_some(empty_trash),
     }
 }
 
@@ -955,7 +975,7 @@ fn build_grid_pane(
     browser: Rc<Browser>,
     single_click_previews: Rc<Cell<bool>>,
     transfer_handler: TransferHandlerSlot,
-    cut_locations: Rc<RefCell<Vec<Location>>>,
+    cut_locations: Rc<RefCell<HashSet<Location>>>,
     options: GridOptions,
     depth: usize,
     title: &str,
@@ -963,7 +983,7 @@ fn build_grid_pane(
     let controls = grid_controls(&browser, depth, options.thumbnail_size.get());
     let thumbnail_size = options.thumbnail_size;
     let active_new_entry = options.active_new_entry;
-    let (pane, content, model, stack, status, spinner) = pane_base(
+    let (pane, content, model, stack, status, spinner, truncated_hint) = pane_base(
         title,
         "grid-pane",
         Some(controls.leading.clone().upcast()),
@@ -1242,14 +1262,17 @@ fn build_grid_pane(
         model,
         selection,
         filtered_model: Some(view_model.upcast()),
+        filter_model: Some(filtered_model),
         syncing_selection,
         stack,
         status,
         spinner,
+        truncated_hint,
         view: view.upcast(),
         bound_items,
         filter_entry: Some(controls.filter_entry),
         filter_button: Some(controls.filter_button),
+        empty_trash_button: controls.empty_trash_button,
         new_entry_placeholder: Some(new_entry_placeholder),
         new_entry_is_directory: Some(new_entry_is_directory),
     }
@@ -1348,7 +1371,7 @@ fn explorer_headings(
         let label = gtk::Label::new(Some(text));
         label.set_xalign(0.0);
         label.set_hexpand(true);
-        let arrow = crate::assets::text_icon(
+        let arrow = crate::assets::primary_icon(
             if preferences.sort_direction == SortDirection::Ascending {
                 crate::assets::icons::ARROW_UP
             } else {
@@ -1379,7 +1402,7 @@ fn explorer_headings(
             for (arrow_key, arrow) in arrows_for_click.borrow().iter() {
                 arrow.set_visible(*arrow_key == key);
                 if *arrow_key == key {
-                    crate::assets::set_text_icon(
+                    crate::assets::set_primary_icon(
                         arrow,
                         if direction == SortDirection::Ascending {
                             crate::assets::icons::ARROW_UP
@@ -1522,7 +1545,7 @@ fn explorer_navigation(browser: &Rc<Browser>) -> gtk::Box {
             .tooltip_text(tooltip)
             .sensitive(available)
             .build();
-        button.set_child(Some(&crate::assets::text_icon(icon, 16)));
+        button.set_child(Some(&crate::assets::primary_icon(icon, 16)));
         button.add_css_class("explorer-navigation-button");
         let weak_browser = Rc::downgrade(browser);
         button.connect_clicked(move |_| {
@@ -1539,7 +1562,7 @@ fn build_explorer_pane(
     browser: Rc<Browser>,
     single_click_previews: Rc<Cell<bool>>,
     transfer_handler: TransferHandlerSlot,
-    cut_locations: Rc<RefCell<Vec<Location>>>,
+    cut_locations: Rc<RefCell<HashSet<Location>>>,
     active_new_entry: Rc<RefCell<Option<ActiveModeNewEntry>>>,
     depth: usize,
     title: &str,
@@ -1548,14 +1571,16 @@ fn build_explorer_pane(
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     actions.add_css_class("grid-header-actions");
     let empty_trash = super::browser::empty_trash_button(&browser);
-    if let Some(location) = browser.location_at(depth) {
-        empty_trash.set_visible(super::browser::is_trash_root(&location));
-    }
+    let is_trash = browser
+        .location_at(depth)
+        .is_some_and(|location| super::browser::is_trash_root(&location));
+    empty_trash.set_visible(is_trash);
+    empty_trash.set_sensitive(false);
     actions.append(&empty_trash);
     let (filter_entry, filter_revealer, filter_button) =
         filter_controls("Filter explorer (Ctrl+F)");
     actions.append(&filter_button);
-    let (shell, content, model, stack, status, spinner) = pane_base(
+    let (shell, content, model, stack, status, spinner, truncated_hint) = pane_base(
         title,
         "explorer-pane",
         Some(navigation.upcast()),
@@ -1583,7 +1608,7 @@ fn build_explorer_pane(
     let new_entry_is_directory = Rc::new(Cell::new(true));
     let flattened_models = gio::ListStore::new::<gio::ListModel>();
     flattened_models.append(&new_entry_placeholder.clone().upcast::<gio::ListModel>());
-    flattened_models.append(&filtered_model.upcast::<gio::ListModel>());
+    flattened_models.append(&filtered_model.clone().upcast::<gio::ListModel>());
     let view_model = gtk::FlattenListModel::new(Some(flattened_models));
     let view_model_object = view_model.clone().upcast::<gio::ListModel>();
     let selection = gtk::MultiSelection::new(Some(view_model.clone()));
@@ -1826,14 +1851,17 @@ fn build_explorer_pane(
         model,
         selection,
         filtered_model: Some(view_model_object),
+        filter_model: Some(filtered_model),
         syncing_selection,
         stack,
         status,
         spinner,
+        truncated_hint,
         view: view.upcast(),
         bound_items,
         filter_entry: Some(filter_entry),
         filter_button: Some(filter_button),
+        empty_trash_button: is_trash.then_some(empty_trash),
         new_entry_placeholder: Some(new_entry_placeholder),
         new_entry_is_directory: Some(new_entry_is_directory),
     }
@@ -1851,6 +1879,7 @@ fn pane_base(
     gtk::Stack,
     gtk::Label,
     gtk::Spinner,
+    gtk::Image,
 ) {
     let shell = gtk::Box::new(gtk::Orientation::Vertical, 0);
     shell.add_css_class(class);
@@ -1858,15 +1887,23 @@ fn pane_base(
     shell.set_vexpand(true);
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     header.add_css_class("mode-pane-header");
+    let heading_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    heading_box.set_hexpand(true);
     let heading = gtk::Label::new(Some(title));
     heading.set_xalign(0.0);
-    heading.set_hexpand(true);
     let spinner = gtk::Spinner::new();
     spinner.start();
+    let truncated_hint = crate::assets::primary_icon(crate::assets::icons::TRIANGLE_ALERT, 16);
+    truncated_hint.set_tooltip_text(Some(
+        "This directory has more entries than could be loaded; showing a partial listing.",
+    ));
+    truncated_hint.set_visible(false);
+    heading_box.append(&heading);
+    heading_box.append(&truncated_hint);
     if let Some(leading) = header_leading {
         header.append(&leading);
     }
-    header.append(&heading);
+    header.append(&heading_box);
     header.append(&spinner);
     if let Some(actions) = header_actions {
         header.append(&actions);
@@ -1876,9 +1913,7 @@ fn pane_base(
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.set_hexpand(true);
     content.set_vexpand(true);
-    let loading = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    loading.set_valign(gtk::Align::Center);
-    loading.append(&gtk::Label::new(Some("Loading…")));
+    let loading = super::browser::loading_skeleton();
     let status = gtk::Label::new(Some("This directory is empty"));
     status.add_css_class("status-message");
     status.set_wrap(true);
@@ -1890,7 +1925,15 @@ fn pane_base(
     shell.append(&stack);
 
     let model = gtk::StringList::new(&[]);
-    (shell, content, model, stack, status, spinner)
+    (
+        shell,
+        content,
+        model,
+        stack,
+        status,
+        spinner,
+        truncated_hint,
+    )
 }
 
 fn register_bound_mode_item(
@@ -2445,13 +2488,32 @@ fn replace_entries(pane: &Pane, entries: &[FileEntry]) {
     show_count(pane);
 }
 
+fn reconnect_pane_model(pane: &Pane) {
+    if pane.selection.model().is_some() {
+        return;
+    }
+    if let Some(filtered) = pane.filter_model.as_ref() {
+        filtered.set_model(Some(&pane.model));
+    }
+    if let Some(filtered) = pane.filtered_model.as_ref() {
+        pane.selection.set_model(Some(filtered));
+    } else {
+        pane.selection.set_model(Some(&pane.model));
+    }
+    pane.syncing_selection.set(false);
+}
+
 fn show_count(pane: &Pane) {
-    if pane.model.n_items() == 0 {
+    let count = pane.model.n_items();
+    if count == 0 {
         pane.status.remove_css_class("error");
         pane.status.set_label("This directory is empty");
         pane.stack.set_visible_child_name("status");
     } else {
         pane.stack.set_visible_child_name("content");
+    }
+    if let Some(button) = &pane.empty_trash_button {
+        button.set_sensitive(count > 0);
     }
 }
 

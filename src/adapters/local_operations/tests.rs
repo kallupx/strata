@@ -2,31 +2,68 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashSet,
     error::Error,
+    ffi::OsString,
     fs,
     io::{Cursor, Write},
+    os::unix::fs::PermissionsExt,
     path::Path,
     rc::Rc,
-    sync::{Arc, Mutex, atomic::AtomicUsize},
-    time::SystemTime,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::{Duration, SystemTime},
 };
 
 use gtk::{gio, glib, prelude::*};
 
-static ASYNC_FILE_TEST: Mutex<()> = Mutex::new(());
+use crate::test_support::ASYNC_MAIN_CONTEXT_DEFAULT;
 
 use super::{
-    LocalOperationProvider, copy_recursively, deletion_error_message, deletion_error_summary,
-    extract_7z_from_reader, extract_tar, extract_zip_from_archive, operation_error_summary,
-    replace_local, replace_local_with, transfer_is_noop, validated_archive_path, validated_child,
+    LocalOperationProvider, await_cancellable, copy_new_recursively, copy_recursively,
+    deletion_error_message, deletion_error_summary, extract_7z_from_reader, extract_tar,
+    extract_zip_from_archive, operation_error_summary, replace_local, replace_local_with,
+    transfer_is_noop, validated_archive_path, validated_child, write_staged_archive,
 };
 use crate::{
-    model::Location,
+    model::{EntryKind, FileEntry, Location, MetadataValue},
     services::{
-        OperationEvent, OperationProvider, OperationRequestId, PasteItem, PasteRequest,
+        ArchiveFormat, CompressRequest, DeleteRequest, LoadHandle, OperationEvent,
+        OperationProvider, OperationRequestId, PasteItem, PasteRequest, RestoreRequest,
         TransferConflict,
     },
 };
+
+fn file_entry(path: &std::path::Path) -> FileEntry {
+    FileEntry {
+        location: Location::local(path),
+        native_name: path.file_name().unwrap_or_default().to_owned(),
+        display_name: path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        kind: EntryKind::File,
+        size: MetadataValue::Unknown,
+        modified_unix_seconds: MetadataValue::Unknown,
+    }
+}
+
+fn directory_entry(path: &std::path::Path) -> FileEntry {
+    FileEntry {
+        kind: EntryKind::Directory,
+        ..file_entry(path)
+    }
+}
+
+fn settle_cancelled_io(context: &glib::MainContext) {
+    context.block_on(glib::timeout_future(Duration::from_millis(25)));
+    while context.pending() {
+        context.iteration(false);
+    }
+}
 
 #[test]
 fn deletion_error_summaries_are_bounded_and_report_the_failure_count() {
@@ -105,8 +142,29 @@ fn transfers_into_the_same_location_or_a_descendant_are_noops() {
 }
 
 #[test]
+fn completed_gio_result_wins_a_cancellation_race() {
+    let context = glib::MainContext::new();
+    let cancellable = gio::Cancellable::new();
+    let cancel_after_result = cancellable.clone();
+    let file = gio::File::for_path("/fixture");
+
+    let result = context.block_on(await_cancellable(
+        &file,
+        &cancellable,
+        move |_, _, result| {
+            result.resolve(Ok::<_, glib::Error>(()));
+            cancel_after_result.cancel();
+        },
+    ));
+
+    assert!(result.is_ok());
+}
+
+#[test]
 fn recursive_copy_preserves_nested_directory_contents() -> Result<(), Box<dyn Error>> {
-    let _serial = ASYNC_FILE_TEST.lock().map_err(|error| error.to_string())?;
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
     let unique = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
@@ -121,6 +179,8 @@ fn recursive_copy_preserves_nested_directory_contents() -> Result<(), Box<dyn Er
         gio::File::for_path(&source),
         gio::File::for_path(&target),
         false,
+        gio::Cancellable::new(),
+        None,
     ));
 
     assert!(result.is_ok());
@@ -132,6 +192,8 @@ fn recursive_copy_preserves_nested_directory_contents() -> Result<(), Box<dyn Er
         gio::File::for_path(&source),
         gio::File::for_path(&target),
         true,
+        gio::Cancellable::new(),
+        None,
     ));
     assert!(overwrite.is_ok());
     assert_eq!(fs::read(target.join("top.txt"))?, b"replacement");
@@ -142,7 +204,9 @@ fn recursive_copy_preserves_nested_directory_contents() -> Result<(), Box<dyn Er
 
 #[test]
 fn staged_file_replacement_preserves_the_destination_on_disk_full() -> Result<(), Box<dyn Error>> {
-    let _serial = ASYNC_FILE_TEST.lock().map_err(|error| error.to_string())?;
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
     let unique = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
@@ -157,7 +221,9 @@ fn staged_file_replacement_preserves_the_destination_on_disk_full() -> Result<()
         gio::File::for_path(source),
         gio::File::for_path(&target),
         false,
-        Rc::new(|_, staged, _| {
+        gio::Cancellable::new(),
+        None,
+        Rc::new(|_, staged, _, _| {
             Box::pin(async move {
                 fs::write(
                     staged
@@ -184,7 +250,9 @@ fn staged_file_replacement_preserves_the_destination_on_disk_full() -> Result<()
 #[test]
 fn cancelling_staging_preserves_the_destination_and_cleans_the_partial_copy()
 -> Result<(), Box<dyn Error>> {
-    let _serial = ASYNC_FILE_TEST.lock().map_err(|error| error.to_string())?;
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
     let unique = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
@@ -196,12 +264,15 @@ fn cancelling_staging_preserves_the_destination_and_cleans_the_partial_copy()
     fs::write(&target, b"original")?;
     let staging = Rc::new(Cell::new(false));
     let staging_for_copy = staging.clone();
+    let cancellable = gio::Cancellable::new();
 
     let task = glib::MainContext::default().spawn_local(replace_local_with(
         gio::File::for_path(&source),
         gio::File::for_path(&target),
         false,
-        Rc::new(move |_, staged, _| {
+        cancellable.clone(),
+        None,
+        Rc::new(move |_, staged, _, cancellable| {
             let staging = staging_for_copy.clone();
             Box::pin(async move {
                 fs::write(
@@ -212,7 +283,11 @@ fn cancelling_staging_preserves_the_destination_and_cleans_the_partial_copy()
                 )
                 .map_err(super::io_error)?;
                 staging.set(true);
-                std::future::pending().await
+                cancellable.future().await;
+                Err(glib::Error::new(
+                    gio::IOErrorEnum::Cancelled,
+                    "injected cancellation",
+                ))
             })
         }),
     ));
@@ -220,12 +295,11 @@ fn cancelling_staging_preserves_the_destination_and_cleans_the_partial_copy()
     while !staging.get() {
         context.iteration(true);
     }
-    task.abort();
-    drop(task);
-    while context.pending() {
-        context.iteration(false);
-    }
+    cancellable.cancel();
+    let result = context.block_on(task)?;
+    settle_cancelled_io(&context);
 
+    assert!(result.is_err_and(|error| error.matches(gio::IOErrorEnum::Cancelled)));
     assert_eq!(fs::read(&target)?, b"original");
     assert_eq!(fs::read(&source)?, b"replacement");
     assert_eq!(fs::read_dir(&root)?.count(), 2);
@@ -235,7 +309,9 @@ fn cancelling_staging_preserves_the_destination_and_cleans_the_partial_copy()
 
 #[test]
 fn staged_file_replacement_commits_then_removes_a_moved_source() -> Result<(), Box<dyn Error>> {
-    let _serial = ASYNC_FILE_TEST.lock().map_err(|error| error.to_string())?;
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
     let unique = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
@@ -250,6 +326,8 @@ fn staged_file_replacement_commits_then_removes_a_moved_source() -> Result<(), B
         gio::File::for_path(&source),
         gio::File::for_path(&target),
         true,
+        gio::Cancellable::new(),
+        None,
     ));
 
     assert!(result.is_ok(), "{result:?}");
@@ -261,8 +339,60 @@ fn staged_file_replacement_commits_then_removes_a_moved_source() -> Result<(), B
 }
 
 #[test]
+fn cancelled_replacement_move_tracks_the_modified_source_and_target_roots()
+-> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("strata-replacement-move-cancel-test-{unique}"));
+    let source = root.join("source");
+    let target = root.join("target");
+    fs::create_dir_all(source.join("new"))?;
+    fs::create_dir_all(target.join("old"))?;
+    fs::write(source.join("new/item.txt"), b"replacement")?;
+    for index in 0..16 {
+        fs::write(target.join(format!("old/item-{index}.txt")), b"old")?;
+    }
+
+    let cancellable = gio::Cancellable::new();
+    let cancel_after_commit = cancellable.clone();
+    let committed_marker = target.join("new/item.txt");
+    let context = glib::MainContext::default();
+    let watcher = context.spawn_local(async move {
+        while !committed_marker.exists() {
+            glib::timeout_future(Duration::from_millis(1)).await;
+        }
+        cancel_after_commit.cancel();
+    });
+    let mut affected_locations = HashSet::new();
+    let result = context.block_on(replace_local(
+        gio::File::for_path(&source),
+        gio::File::for_path(&target),
+        true,
+        cancellable,
+        Some(&mut affected_locations),
+    ));
+    context.block_on(watcher)?;
+    settle_cancelled_io(&context);
+
+    assert!(result.is_err_and(|error| error.matches(gio::IOErrorEnum::Cancelled)));
+    assert!(affected_locations.contains(&Location::local(&source)));
+    assert!(affected_locations.contains(&Location::local(&target)));
+    assert_eq!(fs::read(target.join("new/item.txt"))?, b"replacement");
+    assert!(source.exists());
+
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
 fn each_transfer_item_keeps_its_own_conflict_decision() -> Result<(), Box<dyn Error>> {
-    let _serial = ASYNC_FILE_TEST.lock().map_err(|error| error.to_string())?;
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
     let unique = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
@@ -292,30 +422,45 @@ fn each_transfer_item_keeps_its_own_conflict_decision() -> Result<(), Box<dyn Er
                     conflict: TransferConflict::FailIfExists,
                 },
             ],
-            move_sources: false,
+            move_sources: true,
         },
         Rc::new(move |event| emitted.borrow_mut().push(event)),
     );
-    while events.borrow().is_empty() {
+    while !events.borrow().iter().any(|event| {
+        matches!(
+            event,
+            OperationEvent::Pasted { .. }
+                | OperationEvent::Cancelled { .. }
+                | OperationEvent::TransferFailed { .. }
+                | OperationEvent::Failed { .. }
+        )
+    }) {
         glib::MainContext::default().iteration(true);
     }
 
     assert!(matches!(
-        events.borrow().as_slice(),
-        [OperationEvent::Failed { .. }]
+        events.borrow().last(),
+        Some(OperationEvent::TransferFailed {
+            completed_locations,
+            ..
+        }) if completed_locations == &[Location::local(sources.join("replace.txt"))]
     ));
     assert_eq!(
         fs::read(destination.join("replace.txt"))?,
         b"new replacement"
     );
     assert_eq!(fs::read(destination.join("late.txt"))?, b"late arrival");
+    assert!(!sources.join("replace.txt").exists());
+    assert!(sources.join("late.txt").exists());
     fs::remove_dir_all(root)?;
     Ok(())
 }
 
 #[test]
 fn staged_directory_replacement_does_not_merge_old_contents() -> Result<(), Box<dyn Error>> {
-    let _serial = ASYNC_FILE_TEST.lock().map_err(|error| error.to_string())?;
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
     let unique = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
@@ -331,6 +476,8 @@ fn staged_directory_replacement_does_not_merge_old_contents() -> Result<(), Box<
         gio::File::for_path(&source),
         gio::File::for_path(&target),
         false,
+        gio::Cancellable::new(),
+        None,
     ));
 
     assert!(result.is_ok(), "{result:?}");
@@ -338,6 +485,280 @@ fn staged_directory_replacement_does_not_merge_old_contents() -> Result<(), Box<
     assert!(!target.join("old").exists());
     assert!(source.exists());
     fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+fn test_file_entry(path: &Path) -> FileEntry {
+    let name = path.file_name().unwrap_or_default().to_os_string();
+    FileEntry {
+        location: Location::local(path),
+        native_name: name.clone(),
+        display_name: name.to_string_lossy().into_owned(),
+        kind: EntryKind::File,
+        size: MetadataValue::Unknown,
+        modified_unix_seconds: MetadataValue::Unknown,
+    }
+}
+
+fn run_compression(request: CompressRequest) -> Vec<OperationEvent> {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let emitted = events.clone();
+    let operation = LocalOperationProvider.compress(
+        request,
+        Rc::new(move |event| emitted.borrow_mut().push(event)),
+    );
+    while !events.borrow().iter().any(|event| {
+        matches!(
+            event,
+            OperationEvent::Compressed { .. } | OperationEvent::Failed { .. }
+        )
+    }) {
+        glib::MainContext::default().iteration(true);
+    }
+    drop(operation);
+    events.borrow().clone()
+}
+
+fn compression_stages(destination: &Path) -> Result<Vec<OsString>, Box<dyn Error>> {
+    Ok(fs::read_dir(destination)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".strata-compression-"))
+        .collect())
+}
+
+#[test]
+fn compression_provider_rejects_escaping_archive_names() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let root = tempfile::tempdir()?;
+    let destination = root.path().join("destination");
+    let source = root.path().join("source.txt");
+    fs::create_dir(&destination)?;
+    fs::write(&source, b"source")?;
+
+    let events = run_compression(CompressRequest {
+        id: OperationRequestId(1),
+        entries: vec![test_file_entry(&source)],
+        destination: Location::local(&destination),
+        archive_name: "../outside".to_owned(),
+        conflict: TransferConflict::ReplaceExisting,
+        format: ArchiveFormat::Zip,
+        password: None,
+    });
+
+    assert!(matches!(events.as_slice(), [OperationEvent::Failed { .. }]));
+    assert!(!root.path().join("outside.zip").exists());
+    assert!(compression_stages(&destination)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn compression_conflict_choices_preserve_or_replace_the_destination() -> Result<(), Box<dyn Error>>
+{
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let root = tempfile::tempdir()?;
+    let destination = root.path().join("destination");
+    let source = root.path().join("source.txt");
+    let archive = destination.join("existing.zip");
+    fs::create_dir(&destination)?;
+    fs::write(&source, b"replacement")?;
+    fs::write(&archive, b"original")?;
+    fs::set_permissions(&archive, fs::Permissions::from_mode(0o640))?;
+    let request = |conflict| CompressRequest {
+        id: OperationRequestId(1),
+        entries: vec![test_file_entry(&source)],
+        destination: Location::local(&destination),
+        archive_name: "existing".to_owned(),
+        conflict,
+        format: ArchiveFormat::Zip,
+        password: None,
+    };
+
+    let refused = run_compression(request(TransferConflict::FailIfExists));
+    assert!(
+        refused
+            .iter()
+            .any(|event| matches!(event, OperationEvent::Failed { .. }))
+    );
+    assert_eq!(fs::read(&archive)?, b"original");
+    assert_eq!(fs::metadata(&archive)?.permissions().mode() & 0o777, 0o640);
+
+    let replaced = run_compression(request(TransferConflict::ReplaceExisting));
+    assert!(
+        replaced
+            .iter()
+            .any(|event| matches!(event, OperationEvent::Compressed { .. }))
+    );
+    let extracted = destination.join("extracted");
+    fs::create_dir(&extracted)?;
+    assert_eq!(
+        extract_zip(&archive, &extracted)?,
+        Some("source.txt".to_owned())
+    );
+    assert_eq!(fs::metadata(&archive)?.permissions().mode() & 0o777, 0o640);
+    assert!(compression_stages(&destination)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn compression_failure_preserves_an_existing_archive() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let root = tempfile::tempdir()?;
+    let destination = root.path().join("destination");
+    let missing = root.path().join("missing.txt");
+    let archive = destination.join("existing.zip");
+    fs::create_dir(&destination)?;
+    fs::write(&archive, b"original")?;
+
+    let events = run_compression(CompressRequest {
+        id: OperationRequestId(1),
+        entries: vec![test_file_entry(&missing)],
+        destination: Location::local(&destination),
+        archive_name: "existing".to_owned(),
+        conflict: TransferConflict::ReplaceExisting,
+        format: ArchiveFormat::Zip,
+        password: None,
+    });
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, OperationEvent::Failed { .. }))
+    );
+    assert_eq!(fs::read(&archive)?, b"original");
+    assert!(compression_stages(&destination)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn every_compression_format_commits_a_readable_archive() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let root = tempfile::tempdir()?;
+    let destination = root.path().join("destination");
+    let source = root.path().join("source.txt");
+    let mode_reference = root.path().join("mode-reference");
+    fs::create_dir(&destination)?;
+    fs::write(&source, b"contents")?;
+    fs::File::create(&mode_reference)?;
+    let expected_mode = fs::metadata(&mode_reference)?.permissions().mode() & 0o777;
+
+    for format in [
+        ArchiveFormat::Zip,
+        ArchiveFormat::SevenZ,
+        ArchiveFormat::TarGz,
+        ArchiveFormat::Tar,
+    ] {
+        let base = format!("archive-{}", format.extension().replace('.', "-"));
+        let events = run_compression(CompressRequest {
+            id: OperationRequestId(1),
+            entries: vec![test_file_entry(&source)],
+            destination: Location::local(&destination),
+            archive_name: base.clone(),
+            conflict: TransferConflict::FailIfExists,
+            format,
+            password: None,
+        });
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, OperationEvent::Compressed { .. }))
+        );
+        let archive = destination.join(format!("{base}.{}", format.extension()));
+        let extracted = destination.join(format!("extracted-{base}"));
+        fs::create_dir(&extracted)?;
+        match format {
+            ArchiveFormat::Zip => {
+                extract_zip(&archive, &extracted)?;
+            }
+            ArchiveFormat::SevenZ => {
+                extract_7z_from_reader(
+                    fs::File::open(&archive)?,
+                    &extracted,
+                    sevenz_rust2::Password::empty(),
+                    &Arc::new(AtomicUsize::new(0)),
+                )?;
+            }
+            ArchiveFormat::TarGz => {
+                extract_tar(&archive, &extracted, true, &Arc::new(AtomicUsize::new(0)))?;
+            }
+            ArchiveFormat::Tar => {
+                extract_tar(&archive, &extracted, false, &Arc::new(AtomicUsize::new(0)))?;
+            }
+        }
+        assert_eq!(fs::read(extracted.join("source.txt"))?, b"contents");
+        assert_eq!(
+            fs::metadata(&archive)?.permissions().mode() & 0o777,
+            expected_mode
+        );
+    }
+    assert!(compression_stages(&destination)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn cancelling_staged_compression_unlinks_the_partial_output() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let root = tempfile::tempdir()?;
+    let destination = root.path().to_path_buf();
+    let archive = destination.join("existing.zip");
+    fs::write(&archive, b"original")?;
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let worker_started = started.clone();
+    let worker_release = release.clone();
+    let worker_finished = finished.clone();
+    let worker_destination = destination.clone();
+    let worker_archive = archive.clone();
+    let task = glib::MainContext::default().spawn_local(async move {
+        write_staged_archive(
+            &worker_destination,
+            &worker_archive,
+            TransferConflict::ReplaceExisting,
+            move |mut file| {
+                file.write_all(b"partial")
+                    .map_err(|error| error.to_string())?;
+                worker_started.store(true, Ordering::Release);
+                while !worker_release.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                worker_finished.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .await
+    });
+    let context = glib::MainContext::default();
+    while !started.load(Ordering::Acquire) {
+        context.iteration(false);
+        std::thread::yield_now();
+    }
+    assert_eq!(compression_stages(&destination)?.len(), 1);
+
+    task.abort();
+    drop(task);
+    while context.pending() {
+        context.iteration(false);
+    }
+    let stage_was_removed = compression_stages(&destination)?.is_empty();
+    let destination_was_preserved = fs::read(&archive)? == b"original";
+    release.store(true, Ordering::Release);
+    while !finished.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+
+    assert!(stage_was_removed);
+    assert!(destination_was_preserved);
     Ok(())
 }
 
@@ -429,6 +850,67 @@ fn archive_paths_must_be_nonempty_confined_relative_paths() -> Result<(), Box<dy
 }
 
 #[test]
+fn cancelling_between_deletions_reports_completed_and_unattempted_items()
+-> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("strata-delete-cancel-test-{unique}"));
+    let first = root.join("first.txt");
+    let second = root.join("second.txt");
+    fs::create_dir_all(&root)?;
+    fs::write(&first, b"first")?;
+    fs::write(&second, b"second")?;
+
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let operation = Rc::new(RefCell::new(None::<LoadHandle>));
+    let emitted = events.clone();
+    let operation_for_emit = operation.clone();
+    let handle = LocalOperationProvider.delete(
+        DeleteRequest {
+            id: OperationRequestId(7),
+            entries: vec![file_entry(&first), file_entry(&second)],
+            permanent: true,
+        },
+        Rc::new(move |event| {
+            let cancel = matches!(event, OperationEvent::DeleteProgress { completed: 1, .. });
+            emitted.borrow_mut().push(event);
+            if cancel {
+                operation_for_emit.borrow_mut().take();
+            }
+        }),
+    );
+    operation.replace(Some(handle));
+    while !events
+        .borrow()
+        .iter()
+        .any(|event| matches!(event, OperationEvent::Cancelled { .. }))
+    {
+        glib::MainContext::default().iteration(true);
+    }
+
+    let result = events
+        .borrow()
+        .iter()
+        .find_map(|event| match event {
+            OperationEvent::Cancelled { result, .. } => Some(result.clone()),
+            _ => None,
+        })
+        .expect("terminal cancellation result");
+    assert_eq!(result.completed, [Location::local(&first)]);
+    assert!(result.failed.is_empty());
+    assert_eq!(result.not_attempted, [Location::local(&second)]);
+    assert!(!first.exists());
+    assert!(second.exists());
+
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
 fn every_archive_format_rejects_parent_traversal() -> Result<(), Box<dyn Error>> {
     let root = tempfile::tempdir()?;
     let destination = root.path().join("destination");
@@ -479,6 +961,182 @@ fn every_archive_format_rejects_parent_traversal() -> Result<(), Box<dyn Error>>
     ] {
         assert!(!root.path().join(marker).exists(), "created {marker}");
     }
+    Ok(())
+}
+
+#[test]
+fn cancelling_recursive_copy_removes_only_its_staging_output() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("strata-copy-cancel-test-{unique}"));
+    let source = root.join("source");
+    let target = root.join("target");
+    fs::create_dir_all(source.join("nested"))?;
+    fs::write(source.join("nested/item.txt"), b"contents")?;
+    fs::write(root.join("pre-existing.txt"), b"keep")?;
+
+    let cancellable = gio::Cancellable::new();
+    let task = glib::MainContext::default().spawn_local(copy_new_recursively(
+        gio::File::for_path(&source),
+        gio::File::for_path(&target),
+        cancellable.clone(),
+    ));
+    let context = glib::MainContext::default();
+    loop {
+        context.iteration(true);
+        if fs::read_dir(&root)?.any(|entry| {
+            entry.is_ok_and(|entry| entry.file_name().to_string_lossy().starts_with(".strata-"))
+        }) {
+            break;
+        }
+    }
+    cancellable.cancel();
+    let result = context.block_on(task)?;
+    settle_cancelled_io(&context);
+
+    assert!(result.is_err_and(|error| error.matches(gio::IOErrorEnum::Cancelled)));
+    assert!(!target.exists());
+    assert_eq!(fs::read(root.join("pre-existing.txt"))?, b"keep");
+    assert_eq!(fs::read_dir(&root)?.count(), 2);
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn cancelling_recursive_delete_leaves_the_unfinished_root_in_place() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("strata-recursive-delete-cancel-test-{unique}"));
+    let nested = root.join("nested");
+    fs::create_dir_all(&nested)?;
+    for index in 0..4 {
+        fs::write(nested.join(format!("item-{index}.txt")), b"contents")?;
+    }
+
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let emitted = events.clone();
+    let operation = LocalOperationProvider.delete(
+        DeleteRequest {
+            id: OperationRequestId(10),
+            entries: vec![directory_entry(&root)],
+            permanent: true,
+        },
+        Rc::new(move |event| emitted.borrow_mut().push(event)),
+    );
+    let context = glib::MainContext::default();
+    while fs::read_dir(&nested)?.count() == 4 {
+        context.iteration(true);
+    }
+    drop(operation);
+    while !events
+        .borrow()
+        .iter()
+        .any(|event| matches!(event, OperationEvent::Cancelled { .. }))
+    {
+        context.iteration(true);
+    }
+    settle_cancelled_io(&context);
+
+    let result = events
+        .borrow()
+        .iter()
+        .find_map(|event| match event {
+            OperationEvent::Cancelled { result, .. } => Some(result.clone()),
+            _ => None,
+        })
+        .expect("terminal cancellation result");
+    assert!(result.failed == [Location::local(&root)]);
+    assert!(result.affected_locations.contains(&Location::local(&root)));
+    assert!(
+        !result
+            .affected_locations
+            .contains(&Location::local(&nested))
+    );
+    assert!(root.exists());
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn cancelling_between_moves_reports_completed_and_unattempted_sources() -> Result<(), Box<dyn Error>>
+{
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("strata-move-cancel-test-{unique}"));
+    let sources = root.join("sources");
+    let destination = root.join("destination");
+    let first = sources.join("first.txt");
+    let second = sources.join("second.txt");
+    fs::create_dir_all(&sources)?;
+    fs::create_dir_all(&destination)?;
+    fs::write(&first, b"first")?;
+    fs::write(&second, b"second")?;
+
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let operation = Rc::new(RefCell::new(None::<LoadHandle>));
+    let emitted = events.clone();
+    let operation_for_emit = operation.clone();
+    let handle = LocalOperationProvider.paste(
+        PasteRequest {
+            id: OperationRequestId(8),
+            destination: Location::local(&destination),
+            items: vec![
+                PasteItem {
+                    source: Location::local(&first),
+                    conflict: TransferConflict::FailIfExists,
+                },
+                PasteItem {
+                    source: Location::local(&second),
+                    conflict: TransferConflict::FailIfExists,
+                },
+            ],
+            move_sources: true,
+        },
+        Rc::new(move |event| {
+            let cancel = matches!(event, OperationEvent::TransferProgress { completed: 1, .. });
+            emitted.borrow_mut().push(event);
+            if cancel {
+                operation_for_emit.borrow_mut().take();
+            }
+        }),
+    );
+    operation.replace(Some(handle));
+    while !events
+        .borrow()
+        .iter()
+        .any(|event| matches!(event, OperationEvent::Cancelled { .. }))
+    {
+        glib::MainContext::default().iteration(true);
+    }
+
+    let result = events
+        .borrow()
+        .iter()
+        .find_map(|event| match event {
+            OperationEvent::Cancelled { result, .. } => Some(result.clone()),
+            _ => None,
+        })
+        .expect("terminal cancellation result");
+    assert_eq!(result.completed, [Location::local(&first)]);
+    assert!(result.failed.is_empty());
+    assert_eq!(result.not_attempted, [Location::local(&second)]);
+    assert!(destination.join("first.txt").exists());
+    assert!(!first.exists());
+    assert!(second.exists());
+
+    fs::remove_dir_all(root)?;
     Ok(())
 }
 
@@ -536,5 +1194,36 @@ fn extraction_supports_nesting_and_regular_conflicts() -> Result<(), Box<dyn Err
     );
     assert_eq!(fs::read(destination.join("existing/old.txt"))?, b"old");
     assert_eq!(fs::read(destination.join("existing (2)/new.txt"))?, b"new");
+    Ok(())
+}
+
+#[test]
+fn cancelling_restore_before_io_reports_every_item_as_unattempted() -> Result<(), Box<dyn Error>> {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let emitted = events.clone();
+    let entries = vec![file_entry(std::path::Path::new("/fixture/trashed.txt"))];
+    let operation = LocalOperationProvider.restore(
+        RestoreRequest {
+            id: OperationRequestId(9),
+            entries: entries.clone(),
+        },
+        Rc::new(move |event| emitted.borrow_mut().push(event)),
+    );
+
+    drop(operation);
+    while events.borrow().is_empty() {
+        glib::MainContext::default().iteration(true);
+    }
+
+    assert!(matches!(
+        events.borrow().as_slice(),
+        [OperationEvent::Cancelled { result, .. }]
+            if result.completed.is_empty()
+                && result.failed.is_empty()
+                && result.not_attempted == [entries[0].location.clone()]
+    ));
     Ok(())
 }

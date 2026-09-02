@@ -4,7 +4,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     io::ErrorKind,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -15,11 +15,12 @@ use crate::{
     model::{EntryKind, FileEntry, Location, MetadataValue},
     services::{
         DirectoryChange, DirectoryEvent, DirectoryRequest, FileSource, LoadHandle,
-        LocationValidationError, RequestId, backend_unavailable_message,
+        LocationValidationError, RequestId, backend_unavailable_message, sanitize_uri_credentials,
     },
 };
 
 const ATTRIBUTES: &str = "standard::display-name,standard::name,standard::type,standard::is-hidden,standard::is-symlink,standard::size,time::modified";
+const MAX_PENDING_MONITOR_CHANGES: usize = 256;
 
 #[derive(Default)]
 pub struct LocalFileSource;
@@ -45,13 +46,16 @@ fn map_validation_error(error: std::io::Error) -> LocationValidationError {
 /// SFTP, ...) can still return a `.path()` via its FUSE mirror even though the
 /// file isn't native; using that path would leak the mirror's opaque
 /// `/run/user/$UID/gvfs/...` location instead of the clean URI (lgse/strata#5).
-pub(crate) fn location_for_file(file: &gio::File) -> Location {
+/// Returns `None` when GIO provides a malformed URI.
+pub(crate) fn location_for_file(file: &gio::File) -> Option<Location> {
     if file.is_native()
         && let Some(path) = file.path()
     {
-        return Location::local(path);
+        return Some(Location::local(path));
     }
-    Location::uri(file.uri())
+    let uri = file.uri();
+    let (sanitized, _) = sanitize_uri_credentials(&uri).ok()?;
+    Some(Location::uri(sanitized))
 }
 
 fn uri_validation_result(
@@ -178,20 +182,41 @@ impl FileSource for LocalFileSource {
         log_directory_load_started(request_id, &location);
 
         let task = glib::MainContext::default().spawn_local(async move {
+            let deadline = started + request.time_budget;
+            let finish_truncated = |entries: usize, reason: &'static str| {
+                tracing::warn!(
+                    request_id = request_id.0,
+                    entries,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    reason,
+                    "directory load truncated"
+                );
+                emit(DirectoryEvent::Finished {
+                    request_id,
+                    truncated: true,
+                });
+            };
             let directory = location
                 .native_path()
                 .map(gio::File::for_path)
                 .unwrap_or_else(|| gio::File::for_uri(location.uri_value().unwrap_or_default()));
-            let enumerator = match directory
-                .enumerate_children_future(
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                finish_truncated(0, "time budget");
+                return;
+            }
+            let enumerator = match glib::future_with_timeout(
+                remaining,
+                directory.enumerate_children_future(
                     ATTRIBUTES,
                     gio::FileQueryInfoFlags::NONE,
                     glib::Priority::DEFAULT,
-                )
-                .await
+                ),
+            )
+            .await
             {
-                Ok(enumerator) => enumerator,
-                Err(error) => {
+                Ok(Ok(enumerator)) => enumerator,
+                Ok(Err(error)) => {
                     tracing::warn!(
                         request_id = request_id.0,
                         error_domain = ?error.domain(),
@@ -204,34 +229,52 @@ impl FileSource for LocalFileSource {
                     });
                     return;
                 }
+                Err(_) => {
+                    finish_truncated(0, "time budget");
+                    return;
+                }
             };
 
             let mut total_entries = 0usize;
             let mut first_batch = true;
             loop {
-                match enumerator
-                    .next_files_future(request.batch_size as i32, glib::Priority::DEFAULT)
-                    .await
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    finish_truncated(total_entries, "time budget");
+                    break;
+                }
+                match glib::future_with_timeout(
+                    remaining,
+                    enumerator
+                        .next_files_future(request.batch_size as i32, glib::Priority::DEFAULT),
+                )
+                .await
                 {
-                    Ok(files) if files.is_empty() => {
+                    Ok(Ok(files)) if files.is_empty() => {
                         tracing::info!(
                             request_id = request_id.0,
                             entries = total_entries,
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "directory load finished"
                         );
-                        emit(DirectoryEvent::Finished { request_id });
+                        emit(DirectoryEvent::Finished {
+                            request_id,
+                            truncated: false,
+                        });
                         break;
                     }
-                    Ok(files) => {
-                        let entries: Vec<_> = files
+                    Ok(Ok(files)) => {
+                        let mut entries: Vec<_> = files
                             .into_iter()
                             .filter(|info| request.include_hidden || !info_is_hidden(info))
-                            .map(|info| {
+                            .filter_map(|info| {
                                 let child = directory.child(info.name());
-                                entry_from_info(location_for_file(&child), info)
+                                Some(entry_from_info(location_for_file(&child)?, info))
                             })
                             .collect();
+                        let remaining_capacity = request.max_entries.saturating_sub(total_entries);
+                        let entry_budget_exhausted = entries.len() > remaining_capacity;
+                        entries.truncate(remaining_capacity);
                         total_entries += entries.len();
                         if first_batch {
                             tracing::info!(
@@ -246,8 +289,12 @@ impl FileSource for LocalFileSource {
                             request_id,
                             entries,
                         });
+                        if entry_budget_exhausted {
+                            finish_truncated(total_entries, "entry budget");
+                            break;
+                        }
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         tracing::warn!(
                             request_id = request_id.0,
                             error_domain = ?error.domain(),
@@ -258,6 +305,10 @@ impl FileSource for LocalFileSource {
                             request_id,
                             message: error.to_string(),
                         });
+                        break;
+                    }
+                    Err(_) => {
+                        finish_truncated(total_entries, "time budget");
                         break;
                     }
                 }
@@ -305,6 +356,9 @@ impl FileSource for LocalFileSource {
         let timeout_for_change = timeout.clone();
         let cancelled_for_change = cancelled.clone();
         monitor.connect_changed(move |_, file, other_file, event| {
+            if pending_for_change.borrow().contains_key(Path::new("")) {
+                return;
+            }
             let path = file.path();
             let other_path = other_file.and_then(gio::File::path);
             let change = match event {
@@ -338,13 +392,9 @@ impl FileSource for LocalFileSource {
                 PendingMonitorChange::Move { to, .. } => to.clone(),
                 PendingMonitorChange::Rescan => PathBuf::new(),
             };
-            pending_for_change
-                .borrow_mut()
-                .entry(key)
-                .and_modify(|pending| {
-                    *pending = merge_pending_change(pending.clone(), change.clone());
-                })
-                .or_insert(change);
+            if !queue_monitor_change(&mut pending_for_change.borrow_mut(), key, change) {
+                return;
+            }
 
             if let Some(source) = timeout_for_change.take() {
                 source.remove();
@@ -382,6 +432,27 @@ fn log_directory_load_started(request_id: RequestId, location: &Location) {
         location = %location.diagnostic_path(),
         "directory load location"
     );
+}
+
+fn queue_monitor_change(
+    pending: &mut HashMap<PathBuf, PendingMonitorChange>,
+    key: PathBuf,
+    change: PendingMonitorChange,
+) -> bool {
+    if pending.contains_key(Path::new("")) {
+        return false;
+    }
+    pending
+        .entry(key)
+        .and_modify(|pending| {
+            *pending = merge_pending_change(pending.clone(), change.clone());
+        })
+        .or_insert(change);
+    if pending.len() > MAX_PENDING_MONITOR_CHANGES {
+        pending.clear();
+        pending.insert(PathBuf::new(), PendingMonitorChange::Rescan);
+    }
+    true
 }
 
 fn merge_pending_change(

@@ -3,9 +3,9 @@
 #[cfg(test)]
 mod tests;
 
-use std::{fmt, rc::Rc};
+use std::{fmt, rc::Rc, time::Duration};
 
-use crate::model::{FileEntry, Location};
+use crate::model::{FileEntry, Location, uri_contains_credentials};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RequestId(pub u64);
@@ -16,11 +16,17 @@ pub struct DirectoryRequest {
     pub location: Location,
     pub batch_size: usize,
     pub include_hidden: bool,
+    /// Caps how many entries a single load will retain/render, bounding worst-case time and
+    /// memory on an adversarially large or unbounded directory.
+    pub max_entries: usize,
+    /// Caps how long a single load may run before it is reported as truncated.
+    pub time_budget: Duration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocationValidationError {
     Empty,
+    InvalidUri,
     NotAbsolute,
     Missing,
     NotDirectory,
@@ -38,6 +44,7 @@ impl fmt::Display for LocationValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => formatter.write_str("Enter a location."),
+            Self::InvalidUri => formatter.write_str("Enter a valid URI."),
             Self::NotAbsolute => formatter.write_str("Enter an absolute path."),
             Self::Missing => formatter.write_str("That location does not exist."),
             Self::NotDirectory => formatter.write_str("That location is not a directory."),
@@ -86,21 +93,75 @@ pub fn backend_unavailable_message(uri: &str) -> String {
     }
 }
 
-/// Detects a `user:password@host` (or `user:password@host:port`) userinfo
-/// segment in a URI's authority. Per lgse/strata#20, a URI typed with an
-/// embedded password must never be accepted, stored, or echoed back.
-pub fn uri_has_embedded_password(uri: &str) -> bool {
-    let Some(after_scheme) = uri.split_once("://").map(|(_, rest)| rest) else {
-        return false;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UriCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+/// Removes URI user-info secrets while preserving the username separately.
+pub fn sanitize_uri_credentials(
+    input: &str,
+) -> Result<(String, Option<UriCredentials>), LocationValidationError> {
+    let uri = glib::Uri::parse(
+        input,
+        glib::UriFlags::HAS_PASSWORD | glib::UriFlags::HAS_AUTH_PARAMS,
+    )
+    .map_err(|_| LocationValidationError::InvalidUri)?;
+    if !uri_contains_credentials(&uri) {
+        return Ok((uri.to_str().to_string(), None));
+    }
+
+    let mut username = uri.user().map(|user| user.to_string()).unwrap_or_default();
+    let mut password = uri.password().map(|password| password.to_string());
+    let mut auth_params = uri.auth_params().map(|params| params.to_string());
+
+    if password.is_none()
+        && let Some((user, embedded_password)) = username.split_once(':')
+    {
+        password = Some(embedded_password.to_owned());
+        username = user.to_owned();
+    }
+    if auth_params.is_none()
+        && let Some((user, embedded_params)) = username.split_once(';')
+    {
+        auth_params = Some(embedded_params.to_owned());
+        username = user.to_owned();
+    }
+    if password.is_none() {
+        password = auth_params
+            .as_deref()
+            .and_then(|params| params.strip_prefix("password="))
+            .map(str::to_owned);
+    }
+
+    let sanitized = glib::Uri::build_with_user(
+        glib::UriFlags::empty(),
+        &uri.scheme(),
+        (!username.is_empty()).then_some(username.as_str()),
+        None,
+        None,
+        uri.host().as_deref(),
+        uri.port(),
+        &uri.path(),
+        uri.query().as_deref(),
+        uri.fragment().as_deref(),
+    )
+    .to_str()
+    .to_string();
+    let credentials = UriCredentials {
+        username,
+        password: password.unwrap_or_default(),
     };
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    let Some((userinfo, _host)) = authority.rsplit_once('@') else {
-        return false;
-    };
-    userinfo.contains(':')
+    Ok((sanitized, Some(credentials)))
+}
+
+/// Rejects URI password and authentication-parameter fields, including encoded delimiters.
+pub fn validate_uri_credentials(uri: &str) -> Result<(), LocationValidationError> {
+    match sanitize_uri_credentials(uri)? {
+        (_, Some(_)) => Err(LocationValidationError::EmbeddedCredential),
+        (_, None) => Ok(()),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +180,9 @@ pub enum DirectoryEvent {
     },
     Finished {
         request_id: RequestId,
+        /// `true` if the load stopped short of covering the full directory, because it hit the
+        /// entry or time budget; already-emitted `Batch` entries are then a lower bound.
+        truncated: bool,
     },
     Failed {
         request_id: RequestId,

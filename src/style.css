@@ -20,7 +20,7 @@ headerbar {
   border-bottom: 1px solid alpha(@theme_border, 0.6);
   box-shadow: none;
   min-height: 54px;
-  padding: 0 8px;
+  padding: 0;
 }
 
 .location-control {
@@ -55,14 +55,14 @@ headerbar .sidebar-toggle:hover,
 headerbar button.header-action:hover,
 headerbar menubutton.header-action > button:hover,
 headerbar button.header-action.active {
-  background: alpha(@theme_muted, 0.62);
+  background: alpha(@theme_accent, 0.15);
 }
 
 headerbar .sidebar-toggle:active,
 headerbar button.header-action:active,
 headerbar menubutton.header-action > button:active,
 headerbar menubutton.header-action > button:checked {
-  background: alpha(@theme_muted, 0.8);
+  background: alpha(@theme_accent, 0.22);
   transform: scale(0.97);
 }
 
@@ -80,11 +80,6 @@ headerbar menubutton.header-action > button {
   color: @theme_text;
 }
 
-headerbar button.header-action image,
-headerbar menubutton.header-action > button image {
-  opacity: 0.42;
-}
-
 headerbar button.header-action:hover,
 headerbar button.header-action:active,
 headerbar button.header-action.active,
@@ -94,17 +89,6 @@ headerbar menubutton.header-action > button:active,
 headerbar menubutton.header-action > button:checked,
 headerbar menubutton.header-action > button:focus-visible {
   color: @theme_text;
-}
-
-headerbar button.header-action:hover image,
-headerbar button.header-action:active image,
-headerbar button.header-action.active image,
-headerbar button.header-action:focus-visible image,
-headerbar menubutton.header-action > button:hover image,
-headerbar menubutton.header-action > button:active image,
-headerbar menubutton.header-action > button:checked image,
-headerbar menubutton.header-action > button:focus-visible image {
-  opacity: 1;
 }
 
 .appearance-popover contents {
@@ -146,7 +130,7 @@ headerbar menubutton.header-action > button:focus-visible image {
 }
 
 .appearance-option:hover {
-  background: alpha(@theme_muted, 0.5);
+  background: alpha(@theme_accent, 0.15);
   color: @theme_text;
 }
 
@@ -201,7 +185,7 @@ headerbar menubutton.header-action > button:focus-visible image {
 }
 
 .location-action:active {
-  background: alpha(@theme_muted, 0.78);
+  background: alpha(@theme_accent, 0.22);
   transform: scale(0.97);
 }
 
@@ -218,7 +202,7 @@ headerbar menubutton.header-action > button:focus-visible image {
 }
 
 .breadcrumb:hover {
-  background: alpha(@theme_muted, 0.62);
+  background: alpha(@theme_accent, 0.15);
   color: @theme_text;
 }
 
@@ -260,7 +244,7 @@ headerbar menubutton.header-action > button:focus-visible image {
 }
 
 .copy-path:hover {
-  background: alpha(@theme_muted, 0.72);
+  background: alpha(@theme_accent, 0.15);
 }
 
 .breadcrumb-separator,
@@ -345,7 +329,7 @@ headerbar menubutton.header-action > button:focus-visible image {
 }
 
 .search-result:hover {
-  background: alpha(@theme_muted, 0.38);
+  background: alpha(@theme_accent, 0.15);
 }
 
 .search-result:selected,
@@ -531,12 +515,12 @@ headerbar menubutton.header-action > button:focus-visible image {
 }
 
 .action-dialog-close:hover {
-  background: alpha(@theme_muted, 0.56);
+  background: alpha(@theme_accent, 0.15);
   color: @theme_text;
 }
 
 .action-dialog-close:active {
-  background: alpha(@theme_muted, 0.78);
+  background: alpha(@theme_accent, 0.22);
   color: @theme_accent;
   transform: scale(0.97);
 }
@@ -574,12 +558,12 @@ headerbar menubutton.header-action > button:focus-visible image {
 }
 
 .action-dialog-cancel:hover {
-  background: alpha(@theme_muted, 0.62);
+  background: alpha(@theme_accent, 0.15);
   border-color: @theme_text;
 }
 
 .action-dialog-cancel:active {
-  background: alpha(@theme_muted, 0.82);
+  background: alpha(@theme_accent, 0.22);
   border-color: @theme_accent;
   color: @theme_accent;
   transform: scale(0.97);
@@ -779,13 +763,13 @@ menubutton.form-control > button {
 
 dropdown.form-control > button:hover,
 menubutton.form-control > button:hover {
-  background: alpha(@theme_muted, 0.62);
+  background: alpha(@theme_accent, 0.15);
   border-color: alpha(@theme_accent, 0.68);
 }
 
 dropdown.form-control > button:active,
 menubutton.form-control > button:active {
-  background: alpha(@theme_muted, 0.78);
+  background: alpha(@theme_accent, 0.22);
   transform: scale(0.97);
 }
 
@@ -846,6 +830,57 @@ menubutton.form-control:disabled > button {
   background: @theme_danger;
 }
 
+.update-dialog-details {
+  background: alpha(@theme_bg, 0.3);
+  border: 1px solid alpha(@theme_border, 0.24);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.update-dialog-detail-row {
+  padding: 3px 0;
+}
+
+.update-dialog-detail-label {
+  color: @theme_dim_text;
+  font-size: 0.88em;
+}
+
+.update-dialog-detail-value {
+  color: @theme_text;
+  font-weight: 700;
+}
+
+.update-dialog-actions {
+  border-top: 1px solid alpha(@theme_border, 0.28);
+  padding: 12px 20px;
+}
+
+.update-dialog-action {
+  background: alpha(@theme_accent, 0.12);
+  border: 1px solid alpha(@theme_accent, 0.6);
+  border-radius: 5px;
+  box-shadow: none;
+  color: @theme_accent;
+  min-height: 30px;
+  padding: 4px 14px;
+}
+
+.update-dialog-action:hover {
+  background: alpha(@theme_accent, 0.22);
+  border-color: @theme_accent;
+  color: @theme_accent;
+}
+
+.update-dialog-action:active {
+  background: alpha(@theme_accent, 0.32);
+  color: @theme_accent;
+}
+
+.update-dialog-action:focus-visible {
+  outline: 2px solid alpha(@theme_accent, 0.5);
+  outline-offset: 1px;
+}
 
 .settings-dialog {
   background: @theme_surface;
@@ -855,8 +890,8 @@ menubutton.form-control:disabled > button {
 }
 
 .settings-navigation {
-  background: @theme_bg;
-  border-right: 1px solid alpha(@theme_border, 0.26);
+  background: @theme_surface;
+  border-right: 1px solid alpha(@theme_border, 0.6);
   border-radius: 7px 0 0 7px;
   min-width: 220px;
   padding: 18px 12px;
@@ -870,9 +905,9 @@ menubutton.form-control:disabled > button {
 .settings-navigation button {
   background: transparent;
   border: none;
-  border-radius: 5px;
+  border-radius: 6px;
   box-shadow: none;
-  color: @theme_dim_text;
+  color: @theme_text;
   min-height: 38px;
   padding: 5px 10px;
   transition: background 160ms ease-out, color 160ms ease-out, transform 160ms ease-out;
@@ -883,7 +918,7 @@ menubutton.form-control:disabled > button {
 }
 
 .settings-navigation button:hover {
-  background: alpha(@theme_muted, 0.62);
+  background: alpha(@theme_accent, 0.15);
   color: @theme_text;
 }
 
@@ -891,9 +926,10 @@ menubutton.form-control:disabled > button {
   transform: scale(0.97);
 }
 
-.settings-navigation button.settings-nav-active {
-  background: alpha(@theme_highlight, 0.82);
-  color: @theme_accent;
+.settings-navigation button.settings-nav-active,
+.settings-navigation button.settings-nav-active:hover {
+  background: alpha(@theme_accent, 0.18);
+  color: @theme_text;
 }
 
 .settings-page {
@@ -925,11 +961,11 @@ menubutton.form-control:disabled > button {
 }
 
 .settings-close:hover {
-  background: alpha(@theme_muted, 0.62);
+  background: alpha(@theme_accent, 0.15);
 }
 
 .settings-close:active {
-  background: alpha(@theme_muted, 0.82);
+  background: alpha(@theme_accent, 0.22);
   transform: scale(0.97);
 }
 
@@ -982,6 +1018,16 @@ menubutton.form-control:disabled > button {
 .release-notes-title {
   color: @theme_text;
   font-weight: 700;
+}
+
+.prerelease-badge {
+  background: alpha(@theme_danger, 0.14);
+  border: 1px solid @theme_danger;
+  border-radius: 999px;
+  color: @theme_danger;
+  font-size: 0.78em;
+  font-weight: 700;
+  padding: 2px 9px;
 }
 
 .release-notes-content {
@@ -1170,7 +1216,7 @@ menubutton.form-control:disabled > button {
 }
 
 .about-repository:hover {
-  background: alpha(@theme_muted, 0.55);
+  background: alpha(@theme_accent, 0.15);
   color: @theme_text;
 }
 
@@ -1236,12 +1282,12 @@ switch:checked slider {
 }
 
 .sidebar-update:hover {
-  background: alpha(@theme_muted, 0.38);
+  background: alpha(@theme_accent, 0.15);
   color: @theme_accent;
 }
 
 .sidebar-update:active {
-  background: alpha(@theme_muted, 0.56);
+  background: alpha(@theme_accent, 0.22);
   color: @theme_accent;
   transform: scale(0.97);
 }
@@ -1262,6 +1308,25 @@ switch:checked slider {
   font-weight: 650;
 }
 
+.sidebar-update.preview {
+  color: @theme_danger;
+}
+
+.sidebar-update.preview:hover {
+  background: alpha(@theme_danger, 0.16);
+  color: @theme_danger;
+}
+
+.sidebar-update.preview:active {
+  background: alpha(@theme_danger, 0.24);
+  color: @theme_danger;
+}
+
+.sidebar-update.preview .sidebar-update-dot,
+.sidebar-update.preview .sidebar-update-label {
+  color: @theme_danger;
+}
+
 .sidebar-row {
   background: transparent;
   border: none;
@@ -1274,7 +1339,7 @@ switch:checked slider {
 }
 
 .sidebar-row:hover {
-  background: alpha(@theme_muted, 0.38);
+  background: alpha(@theme_accent, 0.15);
 }
 
 .sidebar-row:active {
@@ -1366,13 +1431,13 @@ paned > separator {
 }
 
 .preview-header-action:hover {
-  background: alpha(@theme_muted, 0.62);
+  background: alpha(@theme_accent, 0.15);
   border-color: alpha(@theme_border, 0.42);
   color: @theme_accent;
 }
 
 .preview-header-action:active {
-  background: alpha(@theme_muted, 0.82);
+  background: alpha(@theme_accent, 0.22);
   border-color: @theme_accent;
   color: @theme_accent;
   transform: scale(0.97);
@@ -1451,6 +1516,10 @@ paned > separator {
   padding: 24px;
 }
 
+.preview-feedback-icon {
+  margin-bottom: 5px;
+}
+
 .preview-feedback-title {
   color: @theme_text;
   font-weight: 700;
@@ -1458,6 +1527,62 @@ paned > separator {
 
 .preview-feedback-detail {
   color: @theme_dim_text;
+}
+
+.preview-command {
+  margin-top: 8px;
+  min-width: 250px;
+}
+
+entry.preview-command-entry {
+  background: alpha(@theme_bg, 0.72);
+  border-color: alpha(@theme_border, 0.54);
+  color: @theme_text;
+  font-family: monospace;
+  padding-right: 38px;
+}
+
+entry.preview-command-entry:hover {
+  border-color: alpha(@theme_accent, 0.68);
+}
+
+entry.preview-command-entry:focus,
+entry.preview-command-entry:focus-visible,
+entry.preview-command-entry:focus-within {
+  border-color: @theme_accent;
+  box-shadow: 0 0 0 1px alpha(@theme_accent, 0.42);
+  outline: 2px solid @theme_accent;
+  outline-offset: -2px;
+}
+
+entry.preview-command-entry selection {
+  background: @theme_accent;
+  color: @theme_bg;
+}
+
+.preview-command-copy {
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  box-shadow: none;
+  margin-right: 4px;
+  min-height: 28px;
+  min-width: 28px;
+  padding: 4px;
+}
+
+.preview-command-copy:hover {
+  background: alpha(@theme_accent, 0.15);
+}
+
+.preview-command-copy:active {
+  background: alpha(@theme_accent, 0.22);
+  transform: scale(0.96);
+}
+
+.preview-command-copy:focus-visible {
+  outline: 2px solid @theme_accent;
+  outline-offset: -2px;
 }
 
 .preview-spinner {
@@ -1496,9 +1621,9 @@ paned > separator {
 
 .peek-popover {
   background: @theme_surface;
-  border: 1px solid alpha(@theme_border, 0.6);
+  border: 1px solid alpha(@theme_border, 0.8);
   border-radius: 9px;
-  box-shadow: 0 0 14px alpha(@theme_accent, 0.24);
+  box-shadow: 0 0 14px alpha(@theme_accent, 0.24), 0 6px 20px alpha(@theme_bg, 0.45);
   color: @theme_text;
   padding: 0;
 }
@@ -1506,13 +1631,19 @@ paned > separator {
 .peek-popover .column-header {
   background: @theme_surface;
   border-bottom: 1px solid alpha(@theme_border, 0.24);
-  border-radius: 6px 6px 0 0;
+  border-radius: 9px 9px 0 0;
+  color: @theme_dim_text;
 }
 
 .peek-popover scrolledwindow,
 .peek-popover viewport,
 .peek-popover listview {
   background: @theme_surface;
+  padding: 6px 0;
+}
+
+.peek-popover row:hover .file-chevron {
+  opacity: 1;
 }
 
 .column-header {
@@ -1540,29 +1671,17 @@ button.column-header-action:hover,
 button.column-header-action:checked,
 menubutton.column-header-action > button:hover,
 menubutton.column-header-action > button:checked {
-  background: alpha(@theme_muted, 0.62);
+  background: alpha(@theme_accent, 0.22);
 }
 
 button.column-header-action:active,
 menubutton.column-header-action > button:active {
-  background: alpha(@theme_muted, 0.78);
+  background: alpha(@theme_accent, 0.22);
   transform: scale(0.97);
 }
 
 .column-header-action image {
   color: @theme_text;
-  opacity: 0.42;
-}
-
-button.column-header-action:hover image,
-button.column-header-action:active image,
-button.column-header-action:checked image,
-button.column-header-action:focus-visible image,
-menubutton.column-header-action > button:hover image,
-menubutton.column-header-action > button:active image,
-menubutton.column-header-action > button:checked image,
-menubutton.column-header-action > button:focus-visible image {
-  opacity: 1;
 }
 
 .column-filter {
@@ -1570,10 +1689,6 @@ menubutton.column-header-action > button:focus-visible image {
   border-bottom: 1px solid alpha(@theme_border, 0.6);
   min-height: 30px;
   padding: 0 11px;
-}
-
-.column-filter image {
-  opacity: 0.42;
 }
 
 .column-filter-entry,
@@ -1625,12 +1740,12 @@ menubutton.column-header-action > button:focus-visible image {
 }
 
 .column-menu-option:hover {
-  background: alpha(@theme_muted, 0.5);
+  background: alpha(@theme_accent, 0.15);
   color: @theme_text;
 }
 
 .column-menu-option:active {
-  background: alpha(@theme_muted, 0.78);
+  background: alpha(@theme_accent, 0.22);
   transform: scale(0.97);
 }
 
@@ -1685,7 +1800,7 @@ menubutton.column-header-action > button:focus-visible image {
 }
 
 .segmented-control-option:hover {
-  background: alpha(@theme_muted, 0.62);
+  background: alpha(@theme_accent, 0.15);
   color: @theme_text;
 }
 
@@ -1700,7 +1815,7 @@ menubutton.column-header-action > button:focus-visible image {
 }
 
 .segmented-control-option:active {
-  background: alpha(@theme_muted, 0.82);
+  background: alpha(@theme_accent, 0.22);
   color: @theme_accent;
   transform: scale(0.97);
 }
@@ -1755,9 +1870,14 @@ menubutton.column-header-action > button:focus-visible image {
 }
 
 .transfer-suggestion:active {
-  background: alpha(@theme_muted, 0.8);
+  background: alpha(@theme_accent, 0.22);
   color: @theme_accent;
   transform: scale(0.97);
+}
+
+.transfer-suggestion-parent {
+  color: @theme_dim_text;
+  font-size: 0.85em;
 }
 
 .properties-content {
@@ -1853,13 +1973,13 @@ menubutton.column-header-action > button:focus-visible image {
 }
 
 .properties-action:hover {
-  background: alpha(@theme_muted, 0.52);
+  background: alpha(@theme_accent, 0.15);
   border-color: @theme_accent;
   color: @theme_accent;
 }
 
 .properties-action:active {
-  background: alpha(@theme_muted, 0.78);
+  background: alpha(@theme_accent, 0.22);
   border-color: @theme_accent;
   color: @theme_accent;
   transform: scale(0.97);
@@ -1930,12 +2050,12 @@ menubutton.column-header-action > button:focus-visible image {
 }
 
 .item-context-option:hover {
-  background: alpha(@theme_muted, 0.52);
+  background: alpha(@theme_accent, 0.15);
   color: @theme_text;
 }
 
 .item-context-option:active {
-  background: alpha(@theme_muted, 0.78);
+  background: alpha(@theme_accent, 0.22);
   transform: scale(0.97);
 }
 
@@ -1992,12 +2112,12 @@ menubutton.column-header-action > button:focus-visible image {
 }
 
 .folder-context-option:hover {
-  background: alpha(@theme_muted, 0.52);
+  background: alpha(@theme_accent, 0.15);
   color: @theme_text;
 }
 
 .folder-context-option:active {
-  background: alpha(@theme_muted, 0.78);
+  background: alpha(@theme_accent, 0.22);
   transform: scale(0.97);
 }
 
@@ -2083,7 +2203,7 @@ menubutton.column-header-action > button:focus-visible image {
 }
 
 .file-list row:hover {
-  background: alpha(@theme_muted, 0.65);
+  background: alpha(@theme_accent, 0.15);
   color: @theme_text;
 }
 
@@ -2137,30 +2257,32 @@ menubutton.column-header-action > button:focus-visible image {
 }
 
 .file-size {
-  background: @theme_bg;
+  background: @theme_surface;
   color: @theme_dim_text;
   font-size: 0.9em;
   opacity: 0;
-  padding-left: 10px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  transition: opacity 120ms ease-out;
 }
 
 .file-list row:hover .file-size {
-  background: alpha(@theme_muted, 0.65);
   opacity: 1;
 }
 
 .file-list row:selected .file-size {
-  background: alpha(@theme_muted, 0.65);
   color: @theme_dim_text;
+  opacity: 1;
 }
 
 .file-list .file-row.active-path .file-size {
   background: @theme_highlight;
   color: @theme_dim_text;
+  opacity: 1;
 }
 
 .file-list row:selected {
-  background: alpha(@theme_muted, 0.65);
+  background: alpha(@theme_accent, 0.22);
   color: @theme_text;
   outline: none;
 }
@@ -2187,11 +2309,11 @@ menubutton.column-header-action > button:focus-visible image {
 }
 
 .loading-skeleton {
-  padding: 16px 18px;
+  padding: 8px;
 }
 
 .skeleton-row {
-  background: alpha(@theme_border, 0.12);
+  background: alpha(@theme_border, 0.28);
   border-radius: 4px;
   min-height: 10px;
 }
@@ -2253,7 +2375,7 @@ entry.theme-search {
 
 .theme-search-clear:hover,
 .theme-search-clear:active {
-  background: alpha(@theme_muted, 0.62);
+  background: alpha(@theme_accent, 0.22);
 }
 
 .theme-search-clear:active {
@@ -2376,7 +2498,7 @@ entry.theme-search {
 }
 
 .add-theme-card:hover {
-  background: alpha(@theme_muted, 0.45);
+  background: alpha(@theme_accent, 0.15);
   border-color: @theme_accent;
   color: @theme_text;
 }
@@ -2561,11 +2683,11 @@ menubutton.grid-thumbnail-menu > button {
 }
 
 menubutton.grid-thumbnail-menu > button:hover {
-  background: alpha(@theme_muted, 0.62);
+  background: alpha(@theme_accent, 0.15);
 }
 
 menubutton.grid-thumbnail-menu > button:active {
-  background: alpha(@theme_muted, 0.82);
+  background: alpha(@theme_accent, 0.22);
   transform: scale(0.97);
 }
 
@@ -2605,17 +2727,17 @@ menubutton.grid-thumbnail-menu > button:focus-visible {
 }
 
 .file-grid > child:hover .grid-card {
-  background: alpha(@theme_muted, 0.62);
+  background: alpha(@theme_accent, 0.15);
 }
 
 .file-grid > child:selected {
   background: transparent;
-  color: @theme_accent;
+  color: @theme_text;
   outline: none;
 }
 
 .file-grid > child:selected .grid-card {
-  background: @theme_highlight;
+  background: alpha(@theme_accent, 0.22);
   outline: 1px solid alpha(@theme_accent, 0.9);
   outline-offset: -1px;
 }
@@ -2661,7 +2783,7 @@ menubutton.grid-thumbnail-menu > button:focus-visible {
 }
 
 .file-grid > child:selected .grid-card-label {
-  color: @theme_accent;
+  color: @theme_text;
 }
 
 .mode-grid-columns.density-airy .file-grid {
@@ -2709,12 +2831,12 @@ menubutton.grid-thumbnail-menu > button:focus-visible {
 }
 
 .explorer-heading-button:hover {
-  background: alpha(@theme_muted, 0.5);
+  background: alpha(@theme_accent, 0.15);
   color: @theme_text;
 }
 
 .explorer-heading-button:active {
-  background: alpha(@theme_muted, 0.72);
+  background: alpha(@theme_accent, 0.22);
   color: @theme_accent;
   transform: scale(0.97);
 }
@@ -2763,7 +2885,7 @@ menubutton.grid-thumbnail-menu > button:focus-visible {
 }
 
 .explorer-navigation-button:hover:not(:disabled) {
-  background: alpha(@theme_muted, 0.56);
+  background: alpha(@theme_accent, 0.15);
   color: @theme_text;
 }
 
@@ -2774,7 +2896,7 @@ menubutton.grid-thumbnail-menu > button:focus-visible {
 }
 
 .explorer-navigation-button:active {
-  background: alpha(@theme_muted, 0.78);
+  background: alpha(@theme_accent, 0.22);
   color: @theme_accent;
   transform: scale(0.97);
 }
@@ -2792,12 +2914,12 @@ menubutton.grid-thumbnail-menu > button:focus-visible {
 }
 
 .explorer-list row:hover {
-  background: alpha(@theme_muted, 0.62);
+  background: alpha(@theme_accent, 0.15);
 }
 
 .explorer-list row:selected {
-  background: @theme_highlight;
-  color: @theme_accent;
+  background: alpha(@theme_accent, 0.22);
+  color: @theme_text;
 }
 
 .explorer-row.drop-destination {
@@ -2839,6 +2961,6 @@ menubutton.grid-thumbnail-menu > button:focus-visible {
 
 @media (prefers-reduced-motion: reduce) {
   * {
-    transition-duration: 1ms !important;
+    transition-duration: 1ms;
   }
 }

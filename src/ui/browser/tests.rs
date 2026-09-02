@@ -3,6 +3,41 @@
 use super::*;
 
 #[test]
+fn terminal_shortcut_prefers_one_selected_directory() {
+    let entry = |name: &str, kind| FileEntry {
+        location: Location::local(format!("/fixture/{name}")),
+        native_name: name.into(),
+        display_name: name.into(),
+        kind,
+        size: crate::model::MetadataValue::Unknown,
+        modified_unix_seconds: crate::model::MetadataValue::Unknown,
+    };
+    let directory = entry("selected", crate::model::EntryKind::Directory);
+    let file = entry("notes.txt", crate::model::EntryKind::File);
+
+    assert_eq!(
+        selected_terminal_location(std::slice::from_ref(&directory)),
+        Some(directory.location.clone())
+    );
+    assert_eq!(selected_terminal_location(&[directory, file.clone()]), None);
+    assert_eq!(selected_terminal_location(&[file]), None);
+    assert_eq!(selected_terminal_location(&[]), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_directory_argument_preserves_native_path_bytes() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let path = Path::new(OsStr::from_bytes(b"/tmp/non-utf8-\xff"));
+
+    assert_eq!(
+        terminal_directory_argument(path).as_encoded_bytes(),
+        b"--dir=/tmp/non-utf8-\xff"
+    );
+}
+
+#[test]
 fn global_activity_uses_the_latest_active_label() {
     let mut activity = GlobalActivityState::default();
     let connecting = activity.begin("Connecting…");
@@ -66,6 +101,18 @@ fn password_storage_selection_maps_to_gio_values() {
         gio::PasswordSave::Permanently
     );
     assert_eq!(password_save_for_selection(99), gio::PasswordSave::Never);
+}
+
+#[test]
+fn location_input_credentials_are_one_shot_and_never_saved() {
+    let (location, credentials) = credentials_from_location_input("smb://alice:secret@host/share")
+        .expect("credential URI should parse");
+    let credentials = credentials.expect("credentials should be separated");
+
+    assert_eq!(location, "smb://alice@host/share");
+    assert_eq!(credentials.username, "alice");
+    assert_eq!(credentials.password, "secret");
+    assert_eq!(credentials.save, gio::PasswordSave::Never);
 }
 
 #[test]
@@ -254,6 +301,35 @@ fn incoming_file_lists_preserve_local_and_remote_locations() {
 }
 
 #[test]
+fn incoming_file_lists_sanitize_remote_credentials() {
+    let files = gtk::gdk::FileList::from_array(&[
+        gio::File::for_uri("smb://user%3Asecret@host/share"),
+        gio::File::for_uri("smb://user%3Bpassword=secret@host/share"),
+        gio::File::for_uri("sftp://user@host/home/user/video.mp4"),
+    ]);
+
+    let locations = locations_from_file_list_value(&files.to_value())
+        .expect("file list should contain sanitized locations");
+    let uris = locations
+        .iter()
+        .map(|location| {
+            location
+                .uri_value()
+                .expect("remote location should have a URI")
+                .trim_end_matches('/')
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        uris,
+        [
+            "smb://user@host/share",
+            "smb://user@host/share",
+            "sftp://user@host/home/user/video.mp4",
+        ]
+    );
+}
+
+#[test]
 fn local_file_drops_prefer_move_while_external_drops_prefer_copy() {
     let both = gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE;
 
@@ -290,6 +366,15 @@ fn multi_selection_summary_lists_at_most_three_names() {
         selected_items_summary(&[entry("one"), entry("two"), entry("three"), entry("four")]),
         "one, two, three, …"
     );
+    let summary = selected_items_summary(&[
+        entry("a-very-long-file-name-that-would-expand-the-context-menu"),
+        entry("another-very-long-file-name-that-would-expand-the-menu"),
+    ]);
+    assert_eq!(
+        summary.chars().count(),
+        ITEM_CONTEXT_SUMMARY_MAX_CHARS as usize
+    );
+    assert!(summary.ends_with('…'));
 }
 
 #[test]
@@ -328,6 +413,39 @@ fn transfer_collisions_detect_existing_destination_items() -> Result<(), Box<dyn
 }
 
 #[test]
+fn archive_names_strip_only_the_selected_dotted_extension() {
+    assert_eq!(
+        normalized_archive_name("backup.zip", ArchiveFormat::Zip),
+        "backup"
+    );
+    assert_eq!(
+        normalized_archive_name("backupzip", ArchiveFormat::Zip),
+        "backupzip"
+    );
+    assert_eq!(
+        normalized_archive_name("backup.tar.gz", ArchiveFormat::TarGz),
+        "backup"
+    );
+    assert!(
+        validate_basename(&normalized_archive_name(
+            "../outside.zip",
+            ArchiveFormat::Zip
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn archive_collisions_use_the_final_name() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let destination = Location::local(root.path());
+    assert!(!archive_has_collision(&destination, "archive.zip"));
+    std::fs::write(root.path().join("archive.zip"), b"existing")?;
+    assert!(archive_has_collision(&destination, "archive.zip"));
+    Ok(())
+}
+
+#[test]
 fn destination_paths_expand_home_and_relative_input() {
     let base = std::path::Path::new("/work/current");
     let home = std::path::Path::new("/home/example");
@@ -348,17 +466,20 @@ fn destination_paths_expand_home_and_relative_input() {
 }
 
 #[test]
-fn directory_autocomplete_suggests_only_matching_folders() -> Result<(), Box<dyn std::error::Error>>
-{
+fn path_suggestions_list_only_matching_folders() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::env::temp_dir().join(format!("strata-path-suggestions-{}", std::process::id()));
     let _ignored = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("Documents"))?;
     std::fs::create_dir_all(root.join("Downloads"))?;
+    std::fs::create_dir_all(root.join("relative/Documents"))?;
     std::fs::write(root.join("Document.txt"), b"not a folder")?;
+    let home = root.join("home");
 
-    let suggestions = directory_suggestions(&format!("{}/Doc", root.display()), &root, &root);
-
+    let suggestions = path_suggestions(&format!("{}/Doc", root.display()), &root, &home);
     assert_eq!(suggestions, vec![root.join("Documents")]);
+
+    let relative = path_suggestions("relative/Doc", &root, &home);
+    assert_eq!(relative, vec![root.join("relative/Documents")]);
     std::fs::remove_dir_all(root)?;
     Ok(())
 }
@@ -454,6 +575,28 @@ fn cut_clipboard_locations_match_regardless_of_order() {
         &[Location::local("/fixture/first")],
         &[Location::local("/fixture/other")]
     ));
+    assert!(!same_locations(
+        &[
+            Location::local("/fixture/first"),
+            Location::local("/fixture/first")
+        ],
+        &[
+            Location::local("/fixture/first"),
+            Location::local("/fixture/second")
+        ]
+    ));
+}
+
+#[test]
+fn completed_moves_are_removed_from_the_cut_list() {
+    let first = Location::local("/fixture/first");
+    let second = Location::local("/fixture/second");
+    let third = Location::local("/fixture/third");
+    let mut cut = vec![first.clone(), second.clone(), third.clone()];
+
+    retain_untransferred(&mut cut, &[first, third]);
+
+    assert_eq!(cut, vec![second]);
 }
 
 #[test]

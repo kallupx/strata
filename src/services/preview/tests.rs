@@ -18,6 +18,7 @@ fn recognizes_configuration_files_as_plain_text() {
 #[test]
 fn classifies_common_preview_content_types() {
     assert_eq!(content_family("image/png"), PreviewContent::Image);
+    assert_eq!(content_family("image/gif"), PreviewContent::Media);
     assert_eq!(content_family("video/mp4"), PreviewContent::Media);
     assert!(matches!(
         content_family("application/pdf"),

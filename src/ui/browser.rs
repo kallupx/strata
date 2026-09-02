@@ -2,9 +2,12 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashSet,
+    ffi::OsString,
     future::Future,
     path::Path,
     pin::Pin,
+    process::{Command, Stdio},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -17,8 +20,9 @@ use crate::{
     model::{EntryKind, FileEntry, Location, SortDirection, SortKey},
     services::{
         ArchiveFormat, FileSource, LoadHandle, LocationValidationError, OperationProvider,
-        PasteItem, PreviewContent, TransferConflict, backend_unavailable_message, content_family,
-        has_plain_text_extension, validate_basename,
+        PasteItem, PreviewContent, SearchEvent, TransferConflict, UriCredentials,
+        backend_unavailable_message, content_family, has_plain_text_extension, index_tree,
+        sanitize_uri_credentials, validate_basename,
     },
 };
 
@@ -68,6 +72,8 @@ struct ColumnView {
     bound_rows: Rc<RefCell<Vec<BoundRow>>>,
     entry_count: Rc<Cell<usize>>,
     spinner: gtk::Spinner,
+    truncated_hint: gtk::Image,
+    empty_trash_button: Option<gtk::Button>,
     new_entry_row: gtk::Box,
     new_entry_icon: gtk::Image,
     new_entry_entry: gtk::Entry,
@@ -111,17 +117,22 @@ struct PeekView {
     spinner: gtk::Spinner,
 }
 
+pub(super) fn loading_skeleton() -> gtk::Box {
+    let skeleton = gtk::Box::new(gtk::Orientation::Vertical, 9);
+    skeleton.add_css_class("loading-skeleton");
+    for width in [168, 124, 192, 148, 176, 112] {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        row.add_css_class("skeleton-row");
+        row.set_size_request(width, 10);
+        row.set_halign(gtk::Align::Start);
+        skeleton.append(&row);
+    }
+    skeleton
+}
+
 impl LoadPresentation {
     fn new(content: &impl IsA<gtk::Widget>, retry: Option<gtk::Button>) -> Self {
-        let skeleton = gtk::Box::new(gtk::Orientation::Vertical, 9);
-        skeleton.add_css_class("loading-skeleton");
-        for width in [168, 124, 192, 148, 176, 112] {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            row.add_css_class("skeleton-row");
-            row.set_size_request(width, 10);
-            row.set_halign(gtk::Align::Start);
-            skeleton.append(&row);
-        }
+        let skeleton = loading_skeleton();
 
         let feedback = gtk::Box::new(gtk::Orientation::Vertical, 8);
         feedback.add_css_class("directory-feedback");
@@ -202,7 +213,7 @@ impl Default for PeekBehavior {
         Self {
             open_delay: Duration::from_millis(180),
             close_delay: Duration::from_millis(80),
-            fade_duration: Duration::from_millis(100),
+            fade_duration: Duration::from_millis(150),
             item_limit: 8,
         }
     }
@@ -280,9 +291,10 @@ pub(super) struct ViewState {
     delete_progress: RefCell<Option<DeleteProgressView>>,
     pin_handler: RefCell<Option<PinHandler>>,
     pin_status_handler: RefCell<Option<PinStatusHandler>>,
-    pending_select: RefCell<Option<String>>,
+    pending_select: RefCell<Vec<String>>,
     pending_extract_retry: RefCell<Option<(FileEntry, Location)>>,
     pending_navigate: RefCell<Option<Location>>,
+    pending_location_credentials: RefCell<Option<MountCredentials>>,
     pending_trash_summary: RefCell<Option<LoadHandle>>,
     pending_empty_trash: RefCell<Option<LoadHandle>>,
     trash_loading: RefCell<Option<TrashLoadingView>>,
@@ -425,9 +437,10 @@ impl BrowserView {
             delete_progress: RefCell::new(None),
             pin_handler: RefCell::new(None),
             pin_status_handler: RefCell::new(None),
-            pending_select: RefCell::new(None),
+            pending_select: RefCell::new(Vec::new()),
             pending_extract_retry: RefCell::new(None),
             pending_navigate: RefCell::new(None),
+            pending_location_credentials: RefCell::new(None),
             pending_trash_summary: RefCell::new(None),
             pending_empty_trash: RefCell::new(None),
             trash_loading: RefCell::new(None),
@@ -804,6 +817,29 @@ impl BrowserView {
         }
     }
 
+    pub fn open_terminal(&self) {
+        self.state.sync_mode_selection();
+        let selected = self.state.browser.selected_entries();
+        let location = selected_terminal_location(&selected).or_else(|| {
+            let mode = self.view_mode();
+            let depth = if mode == BrowserMode::Columns {
+                new_folder_destination_depth(
+                    self.state.hovered_column.get(),
+                    self.state.focused_column_depth(),
+                    self.state.browser.active_depth(),
+                    self.state.columns.borrow().len(),
+                )
+            } else {
+                self.state.browser.active_depth()
+            };
+            depth.and_then(|depth| self.state.browser.location_at(depth))
+        });
+        let Some(location) = location else {
+            return;
+        };
+        launch_terminal(&location, &self.state.overlay);
+    }
+
     pub fn show_location_properties(&self, location: &Location) {
         self.state.show_folder_properties(location);
     }
@@ -1041,7 +1077,6 @@ impl ViewState {
         sources: Vec<Location>,
         move_sources: bool,
     ) {
-        let clear_cut = move_sources && same_locations(&sources, &self.cut_locations.borrow());
         let mut accepted = Vec::new();
         let mut collisions = Vec::new();
         for source in sources {
@@ -1054,13 +1089,7 @@ impl ViewState {
                 });
             }
         }
-        self.resolve_transfer_collisions(
-            destination,
-            collisions,
-            accepted,
-            move_sources,
-            clear_cut,
-        );
+        self.resolve_transfer_collisions(destination, collisions, accepted, move_sources);
     }
 
     fn resolve_transfer_collisions(
@@ -1069,17 +1098,8 @@ impl ViewState {
         mut collisions: Vec<Location>,
         accepted: Vec<PasteItem>,
         move_sources: bool,
-        clear_cut: bool,
     ) {
         if collisions.is_empty() {
-            if clear_cut {
-                self.complete_cut_transfer(
-                    &accepted
-                        .iter()
-                        .map(|item| item.source.clone())
-                        .collect::<Vec<_>>(),
-                );
-            }
             self.browser.transfer(destination, accepted, move_sources);
             return;
         }
@@ -1151,7 +1171,6 @@ impl ViewState {
                 },
                 skipped_accepted.clone(),
                 move_sources,
-                clear_cut,
             );
         });
 
@@ -1181,7 +1200,6 @@ impl ViewState {
                 remaining,
                 accepted,
                 move_sources,
-                clear_cut,
             );
         });
 
@@ -1229,9 +1247,7 @@ impl ViewState {
     }
 
     fn complete_cut_transfer(&self, transferred: &[Location]) {
-        self.cut_locations
-            .borrow_mut()
-            .retain(|location| !transferred.contains(location));
+        retain_untransferred(&mut self.cut_locations.borrow_mut(), transferred);
         let remaining = self.cut_locations.borrow().clone();
         if remaining.is_empty() {
             if let Some(display) = gtk::gdk::Display::default() {
@@ -1248,6 +1264,7 @@ impl ViewState {
     fn refresh_cut_rows(&self) {
         let cut = self.cut_locations.borrow();
         self.mode_views.borrow().set_cut_locations(&cut);
+        let cut_lookup: HashSet<_> = cut.iter().collect();
         for (depth, column) in self.columns.borrow().iter().enumerate() {
             column.bound_rows.borrow_mut().retain(|bound| {
                 let (Some(item), Some(row)) = (bound.item.upgrade(), bound.row.upgrade()) else {
@@ -1259,7 +1276,7 @@ impl ViewState {
                     item.position(),
                 )
                 .and_then(|position| self.browser.entry_at(depth, position))
-                .is_some_and(|entry| cut.contains(&entry.location));
+                .is_some_and(|entry| cut_lookup.contains(&entry.location));
                 set_cut_path_style(&row, is_cut);
                 true
             });
@@ -1285,7 +1302,7 @@ impl ViewState {
             };
             let sources = files
                 .into_iter()
-                .map(|file| location_for_file(&file))
+                .filter_map(|file| location_for_file(&file))
                 .collect::<Vec<_>>();
             if let Some(state) = weak.upgrade() {
                 let move_sources = same_locations(&sources, &state.cut_locations.borrow());
@@ -1338,7 +1355,7 @@ impl ViewState {
         let field_label = form_label("Destination folder");
         let field = form_entry();
         field.set_hexpand(true);
-        field.set_placeholder_text(Some("Type a folder path…"));
+        field.set_placeholder_text(Some("Search for a folder…"));
         field.set_text(&folder_input_path(&base));
         field.set_position(-1);
         layout.body.append(&field_label);
@@ -1372,29 +1389,27 @@ impl ViewState {
         let pending_creation = Rc::new(RefCell::new(None::<std::path::PathBuf>));
         let creating_destination = Rc::new(Cell::new(false));
         let suggestions_box = suggestions.clone();
-        let suggestions_generation = generation.clone();
-        let suggestions_base = base.clone();
         let suggestions_error = error.clone();
         let changed_confirm = confirm.clone();
         let changed_creation = pending_creation.clone();
-        field.connect_changed(move |field| {
-            field.remove_css_class("error");
-            suggestions_error.set_visible(false);
-            suggestions_error.remove_css_class("warning");
-            suggestions_error.add_css_class("error");
-            changed_creation.borrow_mut().take();
-            changed_confirm.set_label(if move_sources {
-                "Move here"
-            } else {
-                "Copy here"
-            });
-            refresh_transfer_suggestions(
-                field,
-                &suggestions_box,
-                &suggestions_generation,
-                suggestions_base.clone(),
-            );
-        });
+        setup_transfer_search(
+            &field,
+            &suggestions_box,
+            &generation,
+            base.clone(),
+            move |field| {
+                field.remove_css_class("error");
+                suggestions_error.set_visible(false);
+                suggestions_error.remove_css_class("warning");
+                suggestions_error.add_css_class("error");
+                changed_creation.borrow_mut().take();
+                changed_confirm.set_label(if move_sources {
+                    "Move here"
+                } else {
+                    "Copy here"
+                });
+            },
+        );
 
         let initial_text = folder_input_path(&base);
         let dirty_field = field.clone();
@@ -1474,6 +1489,11 @@ impl ViewState {
                 transfer_state
                     .pending_navigate
                     .replace(Some(Location::local(path.clone())));
+                let names: Vec<String> = sources
+                    .iter()
+                    .filter_map(|s| s.native_path()?.file_name()?.to_str().map(String::from))
+                    .collect();
+                transfer_state.pending_select.borrow_mut().extend(names);
                 transfer_state.start_transfer(Location::local(path), sources.clone(), move_sources);
                 dismiss_modal_layer(&confirm_layer, &confirm_overlay, confirm_root.as_ref());
                 return;
@@ -1505,6 +1525,13 @@ impl ViewState {
                         created_state
                             .pending_navigate
                             .replace(Some(Location::local(path.clone())));
+                        let names: Vec<String> = created_sources
+                            .iter()
+                            .filter_map(|s| {
+                                s.native_path()?.file_name()?.to_str().map(String::from)
+                            })
+                            .collect();
+                        created_state.pending_select.borrow_mut().extend(names);
                         created_state.start_transfer(
                             Location::local(path),
                             created_sources,
@@ -1575,7 +1602,7 @@ impl ViewState {
         });
         layer.add_controller(escape);
 
-        refresh_transfer_suggestions(&field, &suggestions, &generation, base);
+        field.emit_by_name::<()>("changed", &[]);
         field.grab_focus();
     }
 
@@ -1712,6 +1739,15 @@ impl ViewState {
     }
 
     fn load_trash_summary(self: &Rc<Self>) {
+        let trash_empty = self
+            .columns
+            .borrow()
+            .iter()
+            .find(|column| column.empty_trash_button.is_some())
+            .is_some_and(|column| column.entry_count.get() == 0);
+        if trash_empty {
+            return;
+        }
         self.show_trash_loading_indicator();
         let weak = Rc::downgrade(self);
         let started = Instant::now();
@@ -2228,6 +2264,109 @@ impl ViewState {
         (layout.body, layout.confirm, dismiss)
     }
 
+    fn start_compression(
+        self: &Rc<Self>,
+        entries: Vec<FileEntry>,
+        destination: Location,
+        archive_name: String,
+        format: ArchiveFormat,
+        password: Option<String>,
+    ) {
+        let final_name = format!("{archive_name}.{}", format.extension());
+        if !archive_has_collision(&destination, &final_name) {
+            self.browser.compress(
+                entries,
+                destination,
+                archive_name,
+                TransferConflict::FailIfExists,
+                format,
+                password,
+            );
+            return;
+        }
+        let Some(window_overlay) = self
+            .overlay
+            .root()
+            .and_downcast::<gtk::Window>()
+            .and_then(|window| window.child())
+            .and_downcast::<gtk::Overlay>()
+        else {
+            return;
+        };
+        let blurred_root = window_overlay.child().and_downcast::<BlurBin>();
+        if let Some(root) = blurred_root.as_ref() {
+            root.set_blurred(true);
+        }
+        let layout = message_dialog_layout(
+            crate::assets::icons::FILE_ARCHIVE,
+            "File already exists",
+            &final_name,
+            "Replace",
+            ModalTone::Danger,
+        );
+        layout.body.append(&message_dialog_description(&format!(
+            "An archive named “{final_name}” already exists in {}. Replacing it will overwrite its contents.",
+            compact_display_path(&destination)
+        )));
+        let content = layout.content;
+        let close = layout.close;
+        let cancel = layout.cancel;
+        let replace = layout.confirm;
+        let layer = modal_layer(&content, &window_overlay, blurred_root.clone(), None);
+        window_overlay.add_overlay(&layer);
+
+        for button in [&close, &cancel] {
+            let dismissed_layer = layer.clone();
+            let dismissed_overlay = window_overlay.clone();
+            let dismissed_root = blurred_root.clone();
+            let browser = self.browser.clone();
+            button.connect_clicked(move |_| {
+                dismiss_modal_layer(
+                    &dismissed_layer,
+                    &dismissed_overlay,
+                    dismissed_root.as_ref(),
+                );
+                browser.focus_active();
+            });
+        }
+
+        let replaced_layer = layer.clone();
+        let replaced_overlay = window_overlay.clone();
+        let replaced_root = blurred_root.clone();
+        let browser = self.browser.clone();
+        replace.connect_clicked(move |_| {
+            dismiss_modal_layer(&replaced_layer, &replaced_overlay, replaced_root.as_ref());
+            browser.compress(
+                entries.clone(),
+                destination.clone(),
+                archive_name.clone(),
+                TransferConflict::ReplaceExisting,
+                format,
+                password.clone(),
+            );
+        });
+
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let escaped_layer = layer.clone();
+        let escaped_overlay = window_overlay;
+        let escaped_root = blurred_root;
+        let enter_replace = replace.clone();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                dismiss_modal_layer(&escaped_layer, &escaped_overlay, escaped_root.as_ref());
+                glib::Propagation::Stop
+            } else if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
+                enter_replace.emit_clicked();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        layer.add_controller(keys);
+        replace.grab_focus();
+    }
+
     fn show_compress_dialog(self: &Rc<Self>, entries: Vec<FileEntry>) {
         if entries.is_empty() {
             return;
@@ -2248,6 +2387,9 @@ impl ViewState {
 
         let name_entry = form_entry();
         name_entry.set_text(&default_name);
+        name_entry.connect_changed(|field| {
+            update_basename_validation(field);
+        });
         let password_entry = form_password_entry();
         password_entry.set_show_peek_icon(true);
         let confirm_entry = form_password_entry();
@@ -2330,7 +2472,7 @@ impl ViewState {
             });
         }
 
-        let browser = self.browser.clone();
+        let state = Rc::downgrade(self);
         let confirm_entries = entries.clone();
         let confirm_destination = destination.clone();
         let name_for_confirm = name_entry.clone();
@@ -2343,6 +2485,13 @@ impl ViewState {
         confirm.connect_clicked(move |_| {
             let name = name_for_confirm.text().to_string();
             let format = format_for_confirm.get();
+            let archive_name = normalized_archive_name(&name, format);
+            if let Err(message) = validate_basename(&archive_name) {
+                name_for_confirm.add_css_class("error");
+                name_for_confirm.set_tooltip_text(Some(message));
+                name_for_confirm.grab_focus();
+                return;
+            }
             let password = if format.supports_password() && protected_for_confirm.is_active() {
                 let pw = password_for_confirm.text().to_string();
                 if pw.is_empty() {
@@ -2366,19 +2515,16 @@ impl ViewState {
             } else {
                 None
             };
-            let archive_name = if name.ends_with(format.extension()) {
-                name.trim_end_matches(format.extension()).to_owned()
-            } else {
-                name
-            };
             dismiss_for_confirm();
-            browser.compress(
-                confirm_entries.clone(),
-                confirm_destination.clone(),
-                archive_name,
-                format,
-                password,
-            );
+            if let Some(state) = state.upgrade() {
+                state.start_compression(
+                    confirm_entries.clone(),
+                    confirm_destination.clone(),
+                    archive_name,
+                    format,
+                    password,
+                );
+            }
         });
         name_entry.grab_focus();
     }
@@ -2408,7 +2554,7 @@ impl ViewState {
             .unwrap_or_else(glib::home_dir);
         let field = form_entry();
         field.set_hexpand(true);
-        field.set_placeholder_text(Some("Type a folder path…"));
+        field.set_placeholder_text(Some("Search for a folder…"));
         field.set_text(&folder_input_path(&base));
         field.set_position(-1);
         let extract_initial_text = folder_input_path(&base);
@@ -2445,17 +2591,17 @@ impl ViewState {
 
         let generation = Rc::new(Cell::new(0_u64));
         let suggestions_box = suggestions.clone();
-        let suggestions_generation = generation.clone();
-        let suggestions_base = base.clone();
-        field.connect_changed(move |field| {
-            field.remove_css_class("error");
-            refresh_transfer_suggestions(
-                field,
-                &suggestions_box,
-                &suggestions_generation,
-                suggestions_base.clone(),
-            );
-        });
+        let extract_error = error.clone();
+        setup_transfer_search(
+            &field,
+            &suggestions_box,
+            &generation,
+            base.clone(),
+            move |field| {
+                field.remove_css_class("error");
+                extract_error.set_visible(false);
+            },
+        );
 
         let extract_state = self.clone();
         let confirm_field = field.clone();
@@ -2888,18 +3034,42 @@ impl ViewState {
 
     fn submit_location(self: &Rc<Self>) {
         let input = self.location_entry.text();
-        match self.browser.navigate_input(input.as_str()) {
+        let (input, credentials) = match credentials_from_location_input(input.as_str()) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.restore_location_text();
+                self.location_stack.set_visible_child_name("breadcrumbs");
+                show_error_dialog(&self.overlay, "Unable to open location", &error.to_string());
+                return;
+            }
+        };
+        if credentials.is_some() {
+            self.location_entry.set_text(&input);
+        }
+        self.pending_location_credentials.replace(credentials);
+        match self.browser.navigate_input(&input) {
             Ok(()) => {
                 self.location_stack.set_visible_child_name("breadcrumbs");
                 self.browser.focus_active();
             }
             Err(LocationValidationError::NotMounted(location)) => {
-                self.mount_then_navigate(location, MountStrategy::EnclosingVolume);
+                let credentials = self.pending_location_credentials.take();
+                self.mount_then_navigate_with_credentials(
+                    location,
+                    MountStrategy::EnclosingVolume,
+                    credentials,
+                );
             }
             Err(LocationValidationError::Mountable(location)) => {
-                self.mount_then_navigate(location, MountStrategy::Mountable);
+                let credentials = self.pending_location_credentials.take();
+                self.mount_then_navigate_with_credentials(
+                    location,
+                    MountStrategy::Mountable,
+                    credentials,
+                );
             }
             Err(error) => {
+                self.pending_location_credentials.take();
                 self.restore_location_text();
                 self.location_stack.set_visible_child_name("breadcrumbs");
                 show_error_dialog(&self.overlay, "Unable to open location", &error.to_string());
@@ -2927,10 +3097,6 @@ impl ViewState {
                 );
             }
         }
-    }
-
-    fn mount_then_navigate(self: &Rc<Self>, location: Location, strategy: MountStrategy) {
-        self.mount_then_navigate_with_credentials(location, strategy, None);
     }
 
     fn mount_then_navigate_with_credentials(
@@ -3303,6 +3469,7 @@ impl ViewState {
         self.mode_views.borrow_mut().handle(&event);
         match event {
             BrowserEvent::Reset => {
+                self.pending_location_credentials.take();
                 self.truncate(0);
             }
             BrowserEvent::ColumnsTruncated { len } => {
@@ -3320,7 +3487,7 @@ impl ViewState {
                     .map(|insertion| insertion.entries.len())
                     .sum();
                 if let Some(column) = self.columns.borrow().get(depth).cloned() {
-                    if entry_count > 0 {
+                    if entry_count > 0 && !column.spinner.is_spinning() {
                         column.presentation.show_content();
                     }
                     for insertion in insertions {
@@ -3332,6 +3499,7 @@ impl ViewState {
                     let count = column.entry_count.get() + entry_count;
                     column.entry_count.set(count);
                     set_filter_placeholder(&column, count);
+                    update_empty_trash_sensitivity(&column, count);
                     crate::metrics::mark_batch_rendered(entry_count, render_started);
                 }
             }
@@ -3347,6 +3515,7 @@ impl ViewState {
                     column.model.splice(0, column.model.n_items(), &labels);
                     column.entry_count.set(entries.len());
                     set_filter_placeholder(&column, entries.len());
+                    update_empty_trash_sensitivity(&column, entries.len());
                 }
             }
             BrowserEvent::SortingStarted { depth } => {
@@ -3395,42 +3564,60 @@ impl ViewState {
                     } else {
                         column.presentation.show_content();
                     }
+                    update_empty_trash_sensitivity(column, count);
                 }
             }
             BrowserEvent::ColumnReloaded { depth } => {
                 if let Some(column) = self.columns.borrow().get(depth) {
+                    column.syncing_selection.set(true);
+                    column.selection.set_model(None::<&gio::ListModel>);
+                    column.filtered_model.set_model(None::<&gio::ListModel>);
                     column.model.splice(0, column.model.n_items(), &[]);
                     column.entry_count.set(0);
                     set_filter_placeholder(column, 0);
+                    column.truncated_hint.set_visible(false);
                     column.spinner.set_visible(true);
                     column.spinner.start();
                     column.presentation.show_loading();
                 }
             }
-            BrowserEvent::LoadFinished { depth } => {
+            BrowserEvent::LoadFinished { depth, truncated } => {
                 if let Some(column) = self.columns.borrow().get(depth) {
+                    if column.selection.model().is_none() {
+                        column.filtered_model.set_model(Some(&column.model));
+                        column.selection.set_model(Some(&column.filtered_model));
+                        column.syncing_selection.set(false);
+                    }
                     column.spinner.stop();
                     column.spinner.set_visible(false);
-                    if column.entry_count.get() == 0 {
+                    column.truncated_hint.set_visible(truncated);
+                    let count = column.entry_count.get();
+                    if count == 0 {
                         column.presentation.show_empty();
                     } else {
                         column.presentation.show_content();
                     }
+                    update_empty_trash_sensitivity(column, count);
                 }
-                if self.browser.active_depth() == Some(depth)
-                    && let Some(name) = self.pending_select.take()
-                {
-                    let weak = Rc::downgrade(self);
-                    let name = name.clone();
-                    glib::idle_add_local_once(move || {
-                        if let Some(state) = weak.upgrade() {
-                            state.browser.select_entry_by_name(&name);
-                        }
-                    });
+                if self.browser.active_depth() == Some(depth) {
+                    let names = self.pending_select.take();
+                    if !names.is_empty() {
+                        let weak = Rc::downgrade(self);
+                        glib::idle_add_local_once(move || {
+                            if let Some(state) = weak.upgrade() {
+                                state.browser.select_entries_by_name(&names);
+                            }
+                        });
+                    }
                 }
             }
             BrowserEvent::LoadFailed { depth, message } => {
                 if let Some(column) = self.columns.borrow().get(depth) {
+                    if column.selection.model().is_none() {
+                        column.filtered_model.set_model(Some(&column.model));
+                        column.selection.set_model(Some(&column.filtered_model));
+                        column.syncing_selection.set(false);
+                    }
                     column.spinner.stop();
                     column.spinner.set_visible(false);
                     column
@@ -3534,13 +3721,40 @@ impl ViewState {
                     rename.field.grab_focus();
                 }
             }
+            BrowserEvent::TransferStarted { total, moving } => {
+                let browser = self.browser.clone();
+                self.show_file_operation_progress(
+                    total,
+                    if moving {
+                        crate::assets::icons::FOLDER
+                    } else {
+                        crate::assets::icons::COPY
+                    },
+                    if moving {
+                        "Moving items"
+                    } else {
+                        "Copying items"
+                    },
+                    "Cancelling will not undo completed changes",
+                    Rc::new(move || browser.cancel_file_operation()),
+                );
+            }
+            BrowserEvent::TransferProgress { completed, total } => {
+                self.update_delete_progress(completed, total);
+            }
+            BrowserEvent::TransferFinished { moved_locations } => {
+                if !moved_locations.is_empty() {
+                    self.complete_cut_transfer(&moved_locations);
+                }
+                self.dismiss_delete_progress();
+            }
             BrowserEvent::DeletionStarted { total } => {
                 let browser = self.browser.clone();
                 self.show_file_operation_progress(
                     total,
                     crate::assets::icons::TRASH,
                     "Deleting items",
-                    "This may take a moment",
+                    "Cancelling will not undo completed changes",
                     Rc::new(move || browser.cancel_file_operation()),
                 );
             }
@@ -3554,7 +3768,7 @@ impl ViewState {
                     total,
                     crate::assets::icons::FOLDER,
                     "Restoring items",
-                    "Items are being returned to their original locations",
+                    "Cancelling will not undo completed changes",
                     Rc::new(move || browser.cancel_file_operation()),
                 );
             }
@@ -3577,6 +3791,26 @@ impl ViewState {
             BrowserEvent::OperationCompletedWithErrors { message } => {
                 show_error_dialog(&self.overlay, "Completed with errors", &message);
             }
+            BrowserEvent::OperationCancelled {
+                completed,
+                failed,
+                not_attempted,
+                affected_locations,
+            } => {
+                let message = format!(
+                    "{} completed, {} failed, and {} not attempted.\n\nCompleted changes were not reverted.",
+                    item_count_label(completed),
+                    item_count_label(failed),
+                    item_count_label(not_attempted),
+                );
+                let browser = self.browser.clone();
+                show_error_dialog_after_close(
+                    &self.overlay,
+                    "Operation cancelled",
+                    &message,
+                    Rc::new(move || browser.refresh_after_cancellation(&affected_locations)),
+                );
+            }
             BrowserEvent::NavigationRejected {
                 parent_depth,
                 error,
@@ -3586,17 +3820,30 @@ impl ViewState {
             BrowserEvent::EmptyTrashRequested => {
                 self.load_trash_summary();
             }
-            BrowserEvent::LocationNavigationRejected { error } => match error {
-                LocationValidationError::NotMounted(location) => {
-                    self.mount_then_navigate(location, MountStrategy::EnclosingVolume);
+            BrowserEvent::LocationNavigationRejected { error } => {
+                let credentials = self.pending_location_credentials.take();
+                match error {
+                    LocationValidationError::NotMounted(location) => {
+                        self.mount_then_navigate_with_credentials(
+                            location,
+                            MountStrategy::EnclosingVolume,
+                            credentials,
+                        );
+                    }
+                    LocationValidationError::Mountable(location) => {
+                        self.mount_then_navigate_with_credentials(
+                            location,
+                            MountStrategy::Mountable,
+                            credentials,
+                        );
+                    }
+                    error => show_error_dialog(
+                        &self.overlay,
+                        "Unable to open location",
+                        &error.to_string(),
+                    ),
                 }
-                LocationValidationError::Mountable(location) => {
-                    self.mount_then_navigate(location, MountStrategy::Mountable);
-                }
-                error => {
-                    show_error_dialog(&self.overlay, "Unable to open location", &error.to_string())
-                }
-            },
+            }
             BrowserEvent::ArchiveStarted { total } => {
                 let browser = self.browser.clone();
                 self.show_file_operation_progress(
@@ -3614,7 +3861,7 @@ impl ViewState {
                 self.dismiss_delete_progress();
                 self.pending_extract_retry.replace(None);
                 if !select_name.is_empty() {
-                    self.pending_select.replace(Some(select_name));
+                    self.pending_select.borrow_mut().push(select_name);
                 }
                 if let Some(dest) = self.pending_navigate.take() {
                     self.browser.navigate(dest);
@@ -3694,18 +3941,28 @@ impl ViewState {
 
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         header.add_css_class("column-header");
+        let heading_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        heading_box.set_hexpand(true);
         let heading = gtk::Label::new(Some(&location.display_name()));
         heading.set_xalign(0.0);
-        heading.set_hexpand(true);
         heading.set_tooltip_text(Some(&location.display_path()));
+        let truncated_hint = crate::assets::primary_icon(crate::assets::icons::TRIANGLE_ALERT, 16);
+        truncated_hint.set_tooltip_text(Some(
+            "This directory has more entries than could be loaded; showing a partial listing.",
+        ));
+        truncated_hint.set_visible(false);
+        heading_box.append(&heading);
+        heading_box.append(&truncated_hint);
         let spinner = gtk::Spinner::new();
         spinner.start();
-        header.append(&heading);
+        header.append(&heading_box);
         header.append(&spinner);
         let header_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         header_actions.add_css_class("column-header-actions");
         let empty_trash = empty_trash_button(&self.browser);
-        empty_trash.set_visible(is_trash_root(location));
+        let is_trash = is_trash_root(location);
+        empty_trash.set_visible(is_trash);
+        empty_trash.set_sensitive(false);
         header_actions.append(&empty_trash);
         header_actions.append(&column_sort_direction_toggle(&self.browser, depth));
         header_actions.append(&column_sort_menu(&self.browser, depth));
@@ -3728,7 +3985,7 @@ impl ViewState {
         let filter_button = gtk::ToggleButton::builder()
             .tooltip_text("Filter this pane (Ctrl+F)")
             .build();
-        filter_button.set_child(Some(&crate::assets::text_icon(
+        filter_button.set_child(Some(&crate::assets::primary_icon(
             crate::assets::icons::FUNNEL,
             16,
         )));
@@ -3748,7 +4005,10 @@ impl ViewState {
             let close = gtk::Button::builder()
                 .tooltip_text("Close this pane")
                 .build();
-            close.set_child(Some(&crate::assets::text_icon(crate::assets::icons::X, 16)));
+            close.set_child(Some(&crate::assets::primary_icon(
+                crate::assets::icons::X,
+                16,
+            )));
             close.add_css_class("column-header-action");
             let weak_browser = Rc::downgrade(&self.browser);
             close.connect_clicked(move |_| {
@@ -3791,15 +4051,14 @@ impl ViewState {
                 return;
             }
             let filtered_positions = bitset_positions(&selection.selection());
-            let source_positions: Vec<_> = filtered_positions
+            let mapped_positions = source_positions_for_filtered(
+                &source_for_selection,
+                &filtered_for_selection,
+                &filtered_positions,
+            );
+            let source_positions: Vec<_> = mapped_positions
                 .iter()
-                .filter_map(|position| {
-                    source_position_for_filtered(
-                        &source_for_selection,
-                        &filtered_for_selection,
-                        *position,
-                    )
-                })
+                .map(|(_, source_position)| *source_position)
                 .collect();
             let changed_end = position.saturating_add(count);
             let focused = filtered_positions
@@ -3815,11 +4074,9 @@ impl ViewState {
                 .or_else(|| filtered_positions.last().copied());
             focused_filtered_changed.set(focused);
             let focused_source = focused.and_then(|position| {
-                source_position_for_filtered(
-                    &source_for_selection,
-                    &filtered_for_selection,
-                    position,
-                )
+                mapped_positions
+                    .iter()
+                    .find_map(|(filtered, source)| (*filtered == position).then_some(*source))
             });
             if let Some(browser) = weak_browser.upgrade() {
                 browser.set_selection(depth, &source_positions, focused_source);
@@ -4160,6 +4417,7 @@ impl ViewState {
                 })
                 .unwrap_or_default();
             size.set_label(&size_text);
+            size.set_visible(!size_text.is_empty());
         });
         factory.connect_unbind(|_, item| super::thumbnail::cancel_list_item_thumbnails(item));
 
@@ -4493,6 +4751,8 @@ impl ViewState {
             bound_rows,
             entry_count,
             spinner,
+            truncated_hint,
+            empty_trash_button: is_trash.then_some(empty_trash),
             new_entry_row,
             new_entry_icon,
             new_entry_entry,
@@ -4664,21 +4924,24 @@ impl ViewState {
             return;
         };
         content.add_css_class("peek-popover");
-        let right = bounds.x() + bounds.width() + 4.0;
+        let gap = 8.0;
+        let right = bounds.x() + bounds.width() + gap;
         let left = (bounds.x() - 260.0).max(0.0);
-        let x = if right + 256.0 <= self.overlay.width() as f32 {
-            right
-        } else {
-            left
-        };
+        let positioned_right = right + 256.0 <= self.overlay.width() as f32;
+        let x = if positioned_right { right } else { left };
         let transition_duration = self
             .peek_behavior
             .fade_duration
             .as_millis()
             .min(u128::from(u32::MAX)) as u32;
+        let transition_type = if positioned_right {
+            gtk::RevealerTransitionType::SlideRight
+        } else {
+            gtk::RevealerTransitionType::SlideLeft
+        };
         let revealer = gtk::Revealer::builder()
             .child(&content)
-            .transition_type(gtk::RevealerTransitionType::Crossfade)
+            .transition_type(transition_type)
             .transition_duration(transition_duration)
             .reveal_child(false)
             .halign(gtk::Align::Start)
@@ -4749,6 +5012,7 @@ fn peek_label_factory(entries: Rc<RefCell<Vec<FileEntry>>>) -> gtk::SignalListIt
             return;
         };
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row.add_css_class("file-row");
         let icon = gtk::Image::new();
         icon.add_css_class("file-icon");
         icon.set_pixel_size(17);
@@ -4827,14 +5091,34 @@ fn source_position_for_filtered(
     filtered: &gtk::FilterListModel,
     filtered_position: u32,
 ) -> Option<usize> {
-    let item = filtered.item(filtered_position)?;
-    (0..source.n_items())
-        .find(|position| {
-            source
-                .item(*position)
-                .is_some_and(|candidate| candidate == item)
+    source_positions_for_filtered(source, filtered, &[filtered_position])
+        .first()
+        .map(|(_, source)| *source)
+}
+
+fn source_positions_for_filtered(
+    source: &gtk::StringList,
+    filtered: &gtk::FilterListModel,
+    filtered_positions: &[u32],
+) -> Vec<(u32, usize)> {
+    let mut source_position = 0;
+    filtered_positions
+        .iter()
+        .filter_map(|filtered_position| {
+            let item = filtered.item(*filtered_position)?;
+            while source_position < source.n_items() {
+                let candidate_position = source_position;
+                source_position += 1;
+                if source
+                    .item(candidate_position)
+                    .is_some_and(|candidate| candidate == item)
+                {
+                    return Some((*filtered_position, candidate_position as usize));
+                }
+            }
+            None
         })
-        .map(|position| position as usize)
+        .collect()
 }
 
 fn set_column_selection(column: &ColumnView, position: u32) {
@@ -4893,11 +5177,13 @@ pub(super) fn install_folder_context_menu(
     let new_file = context_menu_option("New File", None);
     let paste = context_menu_option("Paste", Some("Ctrl+V"));
     let select_all = context_menu_option("Select All", Some("Ctrl+A"));
+    let open_terminal = context_menu_option("Open in Terminal", Some("Ctrl+T"));
     let properties = context_menu_option("Properties", None);
     content.append(&new_folder);
     content.append(&new_file);
     content.append(&paste);
     content.append(&select_all);
+    content.append(&open_terminal);
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     content.append(&properties);
 
@@ -4956,12 +5242,24 @@ pub(super) fn install_folder_context_menu(
     });
     let weak = Rc::downgrade(state);
     let properties_popover = popover.downgrade();
+    let properties_location = location.clone();
     properties.connect_clicked(move |_| {
         if let Some(popover) = properties_popover.upgrade() {
             popover.popdown();
         }
         if let Some(state) = weak.upgrade() {
-            state.show_folder_properties(&location);
+            state.show_folder_properties(&properties_location);
+        }
+    });
+    let weak = Rc::downgrade(state);
+    let terminal_popover = popover.downgrade();
+    let terminal_location = location.clone();
+    open_terminal.connect_clicked(move |_| {
+        if let Some(popover) = terminal_popover.upgrade() {
+            popover.popdown();
+        }
+        if let Some(state) = weak.upgrade() {
+            launch_terminal(&terminal_location, &state.overlay);
         }
     });
 
@@ -4985,6 +5283,7 @@ pub(super) fn install_folder_context_menu(
                 .contains_type(gtk::gdk::FileList::static_type())
         }));
         select_all.set_sensitive(selection.n_items() > 0);
+        open_terminal.set_sensitive(can_open_terminal(&location));
         if popover_for_click.parent().is_none()
             && let Some(parent) = gesture.widget()
         {
@@ -5003,6 +5302,8 @@ pub(super) fn install_folder_context_menu(
 
 pub(super) type ContextPickPosition = Rc<dyn Fn(&gtk::Widget) -> Option<u32>>;
 pub(super) type ContextSourcePosition = Rc<dyn Fn(u32) -> Option<usize>>;
+
+const ITEM_CONTEXT_SUMMARY_MAX_CHARS: i32 = 60;
 
 pub(super) fn install_item_context_menu(
     state: &Rc<ViewState>,
@@ -5024,10 +5325,12 @@ pub(super) fn install_item_context_menu(
     let heading = gtk::Label::new(None);
     heading.add_css_class("item-context-title");
     heading.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    heading.set_max_width_chars(ITEM_CONTEXT_SUMMARY_MAX_CHARS);
     heading.set_xalign(0.0);
     let summary = gtk::Label::new(None);
     summary.add_css_class("item-context-summary");
     summary.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    summary.set_max_width_chars(ITEM_CONTEXT_SUMMARY_MAX_CHARS);
     summary.set_xalign(0.0);
     header.append(&heading);
     header.append(&summary);
@@ -5036,6 +5339,8 @@ pub(super) fn install_item_context_menu(
 
     let single = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let open = item_context_option(crate::assets::icons::EXTERNAL_LINK, "Open", "↵");
+    let open_terminal =
+        item_context_option(crate::assets::icons::TERMINAL, "Open in Terminal", "Ctrl+T");
     let preview = item_context_option(crate::assets::icons::EYE, "Quick preview", "Space");
     let restore = item_context_option(crate::assets::icons::FOLDER, "Restore", "");
     restore.set_visible(in_trash);
@@ -5051,14 +5356,25 @@ pub(super) fn install_item_context_menu(
     } else {
         "Move to Trash"
     };
-    let move_to_trash =
-        item_context_danger_option(crate::assets::icons::TRASH, delete_label, "Del");
-    move_to_trash.add_css_class("danger");
+    let move_to_trash = if in_trash {
+        let option = item_context_danger_option(crate::assets::icons::TRASH, delete_label, "Del");
+        option.add_css_class("danger");
+        option
+    } else {
+        item_context_option(crate::assets::icons::TRASH, delete_label, "Del")
+    };
+    let permanent_delete = item_context_danger_option(
+        crate::assets::icons::TRASH,
+        "Permanently delete",
+        "Shift+Del",
+    );
+    permanent_delete.add_css_class("danger");
     let properties = item_context_option(crate::assets::icons::INFO, "Properties", "Alt+Enter");
     let compress = item_context_option(crate::assets::icons::FILE_ARCHIVE, "Compress…", "");
     let extract = item_context_option(crate::assets::icons::FILE_ARCHIVE, "Extract here", "");
     let extract_to = item_context_option(crate::assets::icons::FILE_ARCHIVE, "Extract to…", "");
     single.append(&open);
+    single.append(&open_terminal);
     single.append(&preview);
     single.append(&restore);
     single.append(&extract);
@@ -5078,6 +5394,7 @@ pub(super) fn install_item_context_menu(
     single.append(&properties);
     single.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     single.append(&move_to_trash);
+    single.append(&permanent_delete);
     content.append(&single);
 
     let multiple = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -5088,9 +5405,19 @@ pub(super) fn install_item_context_menu(
     let move_multiple = item_context_option(crate::assets::icons::FOLDER, "Move to…", "");
     let copy_to_multiple = item_context_option(crate::assets::icons::COPY, "Copy to…", "");
     let cut_multiple = item_context_option(crate::assets::icons::SCISSORS, "Cut", "Ctrl+X");
-    let trash_multiple =
-        item_context_danger_option(crate::assets::icons::TRASH, delete_label, "Del");
-    trash_multiple.add_css_class("danger");
+    let trash_multiple = if in_trash {
+        let option = item_context_danger_option(crate::assets::icons::TRASH, delete_label, "Del");
+        option.add_css_class("danger");
+        option
+    } else {
+        item_context_option(crate::assets::icons::TRASH, delete_label, "Del")
+    };
+    let permanent_delete_multiple = item_context_danger_option(
+        crate::assets::icons::TRASH,
+        "Permanently delete",
+        "Shift+Del",
+    );
+    permanent_delete_multiple.add_css_class("danger");
     let compress_multiple =
         item_context_option(crate::assets::icons::FILE_ARCHIVE, "Compress…", "");
     multiple.append(&restore_multiple);
@@ -5104,6 +5431,7 @@ pub(super) fn install_item_context_menu(
     multiple.append(&compress_multiple);
     multiple.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     multiple.append(&trash_multiple);
+    multiple.append(&permanent_delete_multiple);
     multiple.set_visible(false);
     content.append(&multiple);
 
@@ -5148,6 +5476,20 @@ pub(super) fn install_item_context_menu(
             && !entry.is_directory()
         {
             state.browser.preview(depth, position);
+        }
+    });
+    let weak = Rc::downgrade(state);
+    let terminal_target = target.clone();
+    let terminal_popover = popover.downgrade();
+    open_terminal.connect_clicked(move |_| {
+        if let Some(popover) = terminal_popover.upgrade() {
+            popover.popdown();
+        }
+        let Some((_, entry)) = terminal_target.borrow().clone() else {
+            return;
+        };
+        if let Some(state) = weak.upgrade() {
+            launch_terminal(&entry.location, &state.overlay);
         }
     });
     let weak = Rc::downgrade(state);
@@ -5211,6 +5553,8 @@ pub(super) fn install_item_context_menu(
     connect_context_copy(&copy_multiple, &popover, state, &target);
     connect_context_trash(&move_to_trash, &popover, state, &target, in_trash);
     connect_context_trash(&trash_multiple, &popover, state, &target, in_trash);
+    connect_context_trash(&permanent_delete, &popover, state, &target, true);
+    connect_context_trash(&permanent_delete_multiple, &popover, state, &target, true);
     connect_context_compress(&compress, &popover, state, &target);
     connect_context_compress(&compress_multiple, &popover, state, &target);
     connect_context_extract(&extract, &popover, state, &target, false);
@@ -5269,16 +5613,12 @@ pub(super) fn install_item_context_menu(
         if !selection.is_selected(filtered_position) {
             selection.select_item(filtered_position, true);
         }
-        let selected_positions = bitset_positions(&selection.selection())
-            .into_iter()
-            .filter_map(|position| source_position(position))
-            .collect::<Vec<_>>();
-        state
-            .browser
-            .set_selection(depth, &selected_positions, Some(resolved_position));
         target.replace(Some((resolved_position, entry.clone())));
         let entries = state.browser.selected_entries();
         preview.set_visible(entry_supports_quick_preview(&entry));
+        open_terminal.set_visible(entry.is_directory() && can_open_terminal(&entry.location));
+        permanent_delete.set_visible(!in_trash);
+        permanent_delete_multiple.set_visible(!in_trash);
         pin.set_visible(entry.is_directory() && !is_trash_location(&entry.location));
         pin.set_sensitive(
             state
@@ -5598,6 +5938,11 @@ fn selected_items_summary(entries: &[FileEntry]) -> String {
     if entries.len() > 3 {
         names.push_str(", …");
     }
+    let max_chars = ITEM_CONTEXT_SUMMARY_MAX_CHARS as usize;
+    if names.chars().count() > max_chars {
+        names = names.chars().take(max_chars - 1).collect();
+        names.push('…');
+    }
     names
 }
 
@@ -5762,60 +6107,150 @@ fn connect_context_extract(
     });
 }
 
-fn refresh_transfer_suggestions(
+fn render_transfer_suggestions(
+    suggestions: &gtk::Box,
+    items: Vec<crate::services::SearchItem>,
+    field: &gtk::Entry,
+) {
+    while let Some(child) = suggestions.first_child() {
+        suggestions.remove(&child);
+    }
+    let mut dirs: Vec<_> = items.into_iter().filter(|item| item.is_directory).collect();
+    dirs.sort_by_key(|item| item.path.ancestors().count());
+    dirs.truncate(8);
+    if dirs.is_empty() {
+        let empty = gtk::Label::new(Some("No matching folders"));
+        empty.add_css_class("transfer-suggestions-empty");
+        empty.set_xalign(0.0);
+        suggestions.append(&empty);
+        return;
+    }
+    for item in dirs {
+        append_suggestion(suggestions, &item.path, field);
+    }
+}
+
+fn append_suggestion(suggestions: &gtk::Box, path: &Path, field: &gtk::Entry) {
+    let option = gtk::Button::new();
+    option.add_css_class("transfer-suggestion");
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
+    row.append(&crate::assets::primary_icon(
+        crate::assets::icons::FOLDER,
+        16,
+    ));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    let label = gtk::Label::new(Some(&name));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    row.append(&label);
+    if let Some(parent) = path.parent().map(compact_native_path) {
+        let parent_label = gtk::Label::new(Some(&parent));
+        parent_label.add_css_class("transfer-suggestion-parent");
+        parent_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        parent_label.set_xalign(1.0);
+        row.append(&parent_label);
+    }
+    option.set_child(Some(&row));
+    option.set_tooltip_text(Some(&path.to_string_lossy()));
+    let selected_field = field.clone();
+    let path = path.to_path_buf();
+    option.connect_clicked(move |_| {
+        selected_field.remove_css_class("error");
+        selected_field.set_text(&folder_input_path(&path));
+        selected_field.set_position(-1);
+        selected_field.grab_focus();
+    });
+    suggestions.append(&option);
+}
+
+fn setup_transfer_search(
     field: &gtk::Entry,
     suggestions: &gtk::Box,
     generation: &Rc<Cell<u64>>,
     base: std::path::PathBuf,
+    on_changed: impl Fn(&gtk::Entry) + 'static,
 ) {
-    let request = generation.get().saturating_add(1);
-    generation.set(request);
-    let input = field.text().to_string();
-    let home = glib::home_dir();
-    let field = field.clone();
-    let suggestions = suggestions.clone();
-    let generation = generation.clone();
-    glib::MainContext::default().spawn_local(async move {
-        let matches =
-            gio::spawn_blocking(move || directory_suggestions(&input, &base, &home)).await;
-        if generation.get() != request {
-            return;
-        }
-        while let Some(child) = suggestions.first_child() {
-            suggestions.remove(&child);
-        }
-        let Ok(matches) = matches else {
-            return;
+    let (search_handle, search_receiver) = index_tree(glib::home_dir());
+    let search_handle = Rc::new(search_handle);
+    let query_handle = Rc::downgrade(&search_handle);
+    let search_mode = Rc::new(Cell::new(false));
+    let poll_suggestions = suggestions.downgrade();
+    let poll_field = field.downgrade();
+    let poll_mode = search_mode.clone();
+    let _poll = glib::timeout_add_local(Duration::from_millis(16), move || {
+        let _keep_search_alive = &search_handle;
+        let (Some(suggestions), Some(field)) = (poll_suggestions.upgrade(), poll_field.upgrade())
+        else {
+            return glib::ControlFlow::Break;
         };
-        if matches.is_empty() {
-            let empty = gtk::Label::new(Some("No matching folders"));
-            empty.add_css_class("transfer-suggestions-empty");
-            empty.set_xalign(0.0);
-            suggestions.append(&empty);
+        if field.root().is_none() {
+            return glib::ControlFlow::Break;
         }
-        for path in matches {
-            let option = gtk::Button::new();
-            option.add_css_class("transfer-suggestion");
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
-            row.append(&crate::assets::primary_icon(
-                crate::assets::icons::FOLDER,
-                16,
-            ));
-            let label = gtk::Label::new(Some(&compact_native_path(&path)));
-            label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-            label.set_xalign(0.0);
-            label.set_hexpand(true);
-            row.append(&label);
-            option.set_child(Some(&row));
-            option.set_tooltip_text(Some(&path.to_string_lossy()));
-            let selected_field = field.clone();
-            option.connect_clicked(move |_| {
-                selected_field.remove_css_class("error");
-                selected_field.set_text(&folder_input_path(&path));
-                selected_field.set_position(-1);
-                selected_field.grab_focus();
+        if !poll_mode.get() {
+            return glib::ControlFlow::Continue;
+        }
+        let mut latest = None;
+        for _ in 0..8 {
+            match search_receiver.try_recv() {
+                Ok(event) => latest = Some(event),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return glib::ControlFlow::Break;
+                }
+            }
+        }
+        if let Some(SearchEvent::Results { query, items, .. }) = latest
+            && query == field.text().trim()
+        {
+            render_transfer_suggestions(&suggestions, items, &field);
+        }
+        glib::ControlFlow::Continue
+    });
+    let suggestions_clone = suggestions.clone();
+    let generation_clone = generation.clone();
+    field.connect_changed(move |field| {
+        on_changed(field);
+        let input = field.text().to_string();
+        let request = generation_clone.get().saturating_add(1);
+        generation_clone.set(request);
+        let looks_like_path = input.trim().contains(std::path::MAIN_SEPARATOR)
+            || input.trim().starts_with('~')
+            || input.trim().is_empty();
+        if looks_like_path {
+            search_mode.set(false);
+            let gen_check = generation_clone.clone();
+            let home = glib::home_dir();
+            let base = base.clone();
+            let field_clone = field.clone();
+            let suggestions_clone = suggestions_clone.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let matches =
+                    gio::spawn_blocking(move || path_suggestions(&input, &base, &home)).await;
+                if gen_check.get() != request {
+                    return;
+                }
+                while let Some(child) = suggestions_clone.first_child() {
+                    suggestions_clone.remove(&child);
+                }
+                let Ok(paths) = matches else { return };
+                if paths.is_empty() {
+                    let empty = gtk::Label::new(Some("No matching folders"));
+                    empty.add_css_class("transfer-suggestions-empty");
+                    empty.set_xalign(0.0);
+                    suggestions_clone.append(&empty);
+                }
+                for path in paths {
+                    append_suggestion(&suggestions_clone, &path, &field_clone);
+                }
             });
-            suggestions.append(&option);
+        } else {
+            search_mode.set(true);
+            if let Some(search_handle) = query_handle.upgrade() {
+                search_handle.query(&input);
+            }
         }
     });
 }
@@ -5845,7 +6280,7 @@ fn resolve_destination_path(input: &str, base: &Path, home: &Path) -> std::path:
     }
 }
 
-fn directory_suggestions(input: &str, base: &Path, home: &Path) -> Vec<std::path::PathBuf> {
+fn path_suggestions(input: &str, base: &Path, home: &Path) -> Vec<std::path::PathBuf> {
     let resolved = resolve_destination_path(input, base, home);
     let trailing_separator = input.trim_end().ends_with(std::path::MAIN_SEPARATOR);
     let (directory, prefix) = if trailing_separator {
@@ -5917,6 +6352,18 @@ fn transfer_has_collision(source: &Location, destination: &Location) -> bool {
     target.query_exists(None::<&gio::Cancellable>)
 }
 
+fn normalized_archive_name(name: &str, format: ArchiveFormat) -> String {
+    name.strip_suffix(&format!(".{}", format.extension()))
+        .unwrap_or(name)
+        .to_owned()
+}
+
+fn archive_has_collision(destination: &Location, archive_name: &str) -> bool {
+    gio_file_for_location(destination)
+        .child(archive_name)
+        .query_exists(None::<&gio::Cancellable>)
+}
+
 fn transfer_dropped_files(
     state: &Rc<ViewState>,
     target: &gtk::DropTarget,
@@ -5958,13 +6405,9 @@ pub(super) fn locations_from_file_list_value(value: &glib::Value) -> Option<Vec<
     let locations = files
         .files()
         .iter()
-        .map(location_for_gio_file)
+        .filter_map(location_for_file)
         .collect::<Vec<_>>();
     (!locations.is_empty()).then_some(locations)
-}
-
-pub(super) fn location_for_gio_file(file: &gio::File) -> Location {
-    location_for_file(file)
 }
 
 pub(super) fn file_drag_content(entries: &[FileEntry]) -> Option<gtk::gdk::ContentProvider> {
@@ -6061,13 +6504,21 @@ fn new_folder_destination_depth(
 }
 
 fn same_locations(left: &[Location], right: &[Location]) -> bool {
-    !left.is_empty()
-        && left.len() == right.len()
-        && left.iter().all(|location| right.contains(location))
+    if left.is_empty() || left.len() != right.len() {
+        return false;
+    }
+    let left: HashSet<_> = left.iter().collect();
+    let right: HashSet<_> = right.iter().collect();
+    left.len() == right.len() && left == right
+}
+
+fn retain_untransferred(cut: &mut Vec<Location>, transferred: &[Location]) {
+    let transferred: HashSet<_> = transferred.iter().collect();
+    cut.retain(|location| !transferred.contains(location));
 }
 
 fn item_context_option(icon: &str, label: &str, accelerator: &str) -> gtk::Button {
-    item_context_option_with_icon(crate::assets::text_icon(icon, 15), label, accelerator)
+    item_context_option_with_icon(crate::assets::primary_icon(icon, 15), label, accelerator)
 }
 
 fn item_context_danger_option(icon: &str, label: &str, accelerator: &str) -> gtk::Button {
@@ -6121,6 +6572,13 @@ pub(super) fn column_sort_menu(browser: &Rc<Browser>, depth: usize) -> gtk::Menu
     let preferences = browser.column_preferences(depth).unwrap_or_default();
     let selected_checks: Rc<RefCell<Vec<(SortKey, gtk::Image)>>> =
         Rc::new(RefCell::new(Vec::new()));
+    let popover = gtk::Popover::builder()
+        .has_arrow(false)
+        .halign(gtk::Align::End)
+        .position(gtk::PositionType::Bottom)
+        .build();
+    popover.add_css_class("column-popover");
+    let popover_weak = popover.downgrade();
     for (label, key) in [
         ("Name", SortKey::Name),
         ("Size", SortKey::Size),
@@ -6131,12 +6589,16 @@ pub(super) fn column_sort_menu(browser: &Rc<Browser>, depth: usize) -> gtk::Menu
         selected_checks.borrow_mut().push((key, check));
         let checks = selected_checks.clone();
         let weak_browser = Rc::downgrade(browser);
+        let popover_weak = popover_weak.clone();
         option.connect_clicked(move |_| {
             for (check_key, check) in checks.borrow().iter() {
                 check.set_visible(*check_key == key);
             }
             if let Some(browser) = weak_browser.upgrade() {
                 browser.set_sort_key(depth, key);
+            }
+            if let Some(popover) = popover_weak.upgrade() {
+                popover.popdown();
             }
         });
         content.append(&option);
@@ -6148,6 +6610,7 @@ pub(super) fn column_sort_menu(browser: &Rc<Browser>, depth: usize) -> gtk::Menu
     let weak_browser = Rc::downgrade(browser);
     let folders_enabled_for_click = folders_enabled.clone();
     let folders_check_for_click = folders_check.clone();
+    let popover_weak = popover_weak.clone();
     folders_first.connect_clicked(move |_| {
         let enabled = !folders_enabled_for_click.get();
         folders_enabled_for_click.set(enabled);
@@ -6155,16 +6618,13 @@ pub(super) fn column_sort_menu(browser: &Rc<Browser>, depth: usize) -> gtk::Menu
         if let Some(browser) = weak_browser.upgrade() {
             browser.set_folders_first(depth, enabled);
         }
+        if let Some(popover) = popover_weak.upgrade() {
+            popover.popdown();
+        }
     });
     content.append(&folders_first);
 
-    let popover = gtk::Popover::builder()
-        .child(&content)
-        .has_arrow(false)
-        .halign(gtk::Align::End)
-        .position(gtk::PositionType::Bottom)
-        .build();
-    popover.add_css_class("column-popover");
+    popover.set_child(Some(&content));
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     let dismissed_popover = popover.clone();
@@ -6212,7 +6672,7 @@ pub(super) fn column_sort_menu(browser: &Rc<Browser>, depth: usize) -> gtk::Menu
         .tooltip_text("Choose sort field")
         .popover(&popover)
         .build();
-    button.set_child(Some(&crate::assets::text_icon(
+    button.set_child(Some(&crate::assets::primary_icon(
         crate::assets::icons::SETTINGS_2,
         16,
     )));
@@ -6226,7 +6686,7 @@ pub(super) fn column_sort_direction_toggle(browser: &Rc<Browser>, depth: usize) 
         .unwrap_or_default()
         .sort_direction;
     let button = gtk::Button::new();
-    let icon = crate::assets::text_icon(crate::assets::icons::ARROW_UP_NARROW_WIDE, 16);
+    let icon = crate::assets::primary_icon(crate::assets::icons::ARROW_UP_NARROW_WIDE, 16);
     button.set_child(Some(&icon));
     button.add_css_class("column-header-action");
     sync_sort_direction_toggle(&button, &icon, direction);
@@ -6263,7 +6723,7 @@ pub(super) fn column_sort_direction_toggle(browser: &Rc<Browser>, depth: usize) 
 
 fn sync_sort_direction_toggle(button: &gtk::Button, icon: &gtk::Image, direction: SortDirection) {
     let descending = direction == SortDirection::Descending;
-    crate::assets::set_text_icon(
+    crate::assets::set_primary_icon(
         icon,
         if descending {
             crate::assets::icons::ARROW_DOWN_WIDE_NARROW
@@ -6278,12 +6738,18 @@ fn sync_sort_direction_toggle(button: &gtk::Button, icon: &gtk::Image, direction
     }));
 }
 
+fn update_empty_trash_sensitivity(column: &ColumnView, count: usize) {
+    if let Some(button) = &column.empty_trash_button {
+        button.set_sensitive(count > 0);
+    }
+}
+
 pub(super) fn empty_trash_button(browser: &Rc<Browser>) -> gtk::Button {
     let button = gtk::Button::builder()
         .tooltip_text("Empty Trash")
         .visible(false)
         .build();
-    button.set_child(Some(&crate::assets::text_icon(
+    button.set_child(Some(&crate::assets::primary_icon(
         crate::assets::icons::TRASH,
         16,
     )));
@@ -6717,10 +7183,23 @@ pub(super) fn dismiss_modal_layer(
     let root = root.cloned();
     animate_out(&layer_for_anim, move || {
         overlay.remove_overlay(&layer);
-        if let Some(root) = root {
+        if let Some(root) = root
+            && !overlay_has_modal_layer(&overlay)
+        {
             root.set_blurred(false);
         }
     });
+}
+
+fn overlay_has_modal_layer(overlay: &gtk::Overlay) -> bool {
+    let mut child = overlay.first_child();
+    while let Some(widget) = child {
+        if widget.is_visible() && widget.has_css_class("app-modal-layer") {
+            return true;
+        }
+        child = widget.next_sibling();
+    }
+    false
 }
 
 fn gio_file_for_location(location: &Location) -> gio::File {
@@ -7022,6 +7501,23 @@ fn password_save_for_selection(selected: u32) -> gio::PasswordSave {
     }
 }
 
+fn credentials_from_location_input(
+    input: &str,
+) -> Result<(String, Option<MountCredentials>), LocationValidationError> {
+    if !input.contains("://") {
+        return Ok((input.to_owned(), None));
+    }
+    let (sanitized, credentials) = sanitize_uri_credentials(input)?;
+    let credentials = credentials.map(|credentials: UriCredentials| MountCredentials {
+        anonymous: false,
+        username: credentials.username,
+        domain: String::new(),
+        password: credentials.password,
+        save: gio::PasswordSave::Never,
+    });
+    Ok((sanitized, credentials))
+}
+
 #[derive(Clone)]
 struct MountCredentials {
     anonymous: bool,
@@ -7049,7 +7545,9 @@ fn apply_mount_credentials(operation: &gio::MountOperation, credentials: &MountC
         return;
     }
     operation.set_username(Some(&credentials.username));
-    operation.set_domain(Some(&credentials.domain));
+    if !credentials.domain.is_empty() {
+        operation.set_domain(Some(&credentials.domain));
+    }
     operation.set_password(Some(&credentials.password));
     operation.set_password_save(credentials.save);
 }
@@ -7261,13 +7759,74 @@ pub(super) fn open_location(location: &Location, parent: &impl IsA<gtk::Widget>)
     }
 }
 
+fn can_open_terminal(location: &Location) -> bool {
+    location.native_path().is_some() && !is_trash_location(location)
+}
+
+fn selected_terminal_location(entries: &[FileEntry]) -> Option<Location> {
+    let [entry] = entries else {
+        return None;
+    };
+    entry.is_directory().then(|| entry.location.clone())
+}
+
+fn terminal_directory_argument(path: &Path) -> OsString {
+    let mut argument = OsString::from("--dir=");
+    argument.push(path);
+    argument
+}
+
+pub(super) fn launch_terminal(location: &Location, parent: &impl IsA<gtk::Widget>) {
+    let Some(path) = location.native_path() else {
+        show_error_dialog(
+            parent,
+            "Unable to open terminal",
+            "This location is not a local folder",
+        );
+        return;
+    };
+    if is_trash_location(location) {
+        show_error_dialog(
+            parent,
+            "Unable to open terminal",
+            "Terminal cannot be opened in Trash",
+        );
+        return;
+    }
+    let path = path.to_path_buf();
+    tracing::debug!(
+        location = %location.diagnostic_path(),
+        "opening terminal"
+    );
+    let result = Command::new("xdg-terminal-exec")
+        .arg(terminal_directory_argument(&path))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Err(error) = result {
+        tracing::warn!(%error, "unable to launch terminal");
+        show_error_dialog(parent, "Unable to open terminal", &error.to_string());
+    }
+}
+
 pub(super) fn show_error_dialog(parent: &impl IsA<gtk::Widget>, message: &str, detail: &str) {
+    show_error_dialog_after_close(parent, message, detail, Rc::new(|| {}));
+}
+
+fn show_error_dialog_after_close(
+    parent: &impl IsA<gtk::Widget>,
+    message: &str,
+    detail: &str,
+    on_close: Rc<dyn Fn()>,
+) {
     let Some(window_overlay) = parent
         .root()
         .and_downcast::<gtk::Window>()
         .and_then(|window| window.child())
         .and_downcast::<gtk::Overlay>()
     else {
+        on_close();
         return;
     };
     let blurred_root = window_overlay.child().and_downcast::<BlurBin>();
@@ -7299,8 +7858,14 @@ pub(super) fn show_error_dialog(parent: &impl IsA<gtk::Widget>, message: &str, d
     let close_layer = layer.clone();
     let close_overlay = window_overlay.clone();
     let close_root = blurred_root.clone();
+    let dismissed = Rc::new(Cell::new(false));
     let dismiss = move || {
+        if dismissed.replace(true) {
+            return;
+        }
         dismiss_modal_layer(&close_layer, &close_overlay, close_root.as_ref());
+        let on_close = on_close.clone();
+        glib::timeout_add_local_once(Duration::from_millis(250), move || on_close());
     };
     let dismiss = Rc::new(dismiss);
     let clicked_dismiss = dismiss.clone();

@@ -64,6 +64,8 @@ pub(crate) fn content_family(content_type: &str) -> PreviewContent {
             page: 0,
             pages: 0,
         }
+    } else if content_type == "image/gif" {
+        PreviewContent::Media
     } else if content_type.starts_with("image/") {
         PreviewContent::Image
     } else if content_type.starts_with("audio/") || content_type.starts_with("video/") {
