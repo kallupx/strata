@@ -3,14 +3,15 @@
 use std::{rc::Rc, sync::Arc};
 
 use gtk::prelude::*;
+use sourceview5::prelude::*;
 
 use super::{
     DocumentSelection, PreviewUnit, SelectionPoint, SourceUnit, VirtualPreviewState,
     bind_document_row, bind_document_table_row, bind_source_row, bounded_text_prefix,
-    code_block_copy_text, document_tag_table, drag_threshold_crossed, highlighted_code_language,
-    local_selection, matching_link, plain_text_view, rendered_document, selection_text,
-    source_document, source_line_numbers, source_line_numbers_view, source_units, styled_markup,
-    use_virtual_source, vertical_distance,
+    code_block_copy_text, document_tag_table, document_text_view, drag_threshold_crossed,
+    highlighted_code_language, local_selection, matching_link, plain_text_view, rendered_document,
+    selection_text, source_document, source_line_numbers, source_line_numbers_view, source_units,
+    styled_markup, use_virtual_source, vertical_distance,
 };
 use crate::{
     services::{
@@ -44,7 +45,7 @@ fn source_units_bound_normal_rows_and_isolate_pathological_lines() {
     );
     assert!(long[1].continuation);
     assert_eq!(source_line_numbers(long[0]), "301");
-    assert_eq!(source_line_numbers(long[1]), "301↳");
+    assert_eq!(source_line_numbers(long[1]), "↳");
     assert_eq!(units.iter().map(|unit| unit.line_count).sum::<usize>(), 302);
     assert_eq!(units.last().map(|unit| unit.first_line), Some(302));
     assert_eq!(
@@ -413,6 +414,36 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
         other_view.buffer().tag_table()
     );
 
+    let code = |language: &'static str, text: &str| DocumentUnit {
+        kind: DocumentUnitKind::Code {
+            list_depth: None,
+            language: Some(language),
+        },
+        text: text.to_owned(),
+        copy_text: format!("{text}\n"),
+        spans: Vec::new(),
+        wrap: false,
+        first: true,
+        last: true,
+    };
+    let rust_view = document_text_view(&code("rust", "let value = 1;"), &document_tags);
+    let python_view = document_text_view(&code("python3", "value = 1"), &document_tags);
+    let rust_buffer = rust_view
+        .buffer()
+        .downcast::<sourceview5::Buffer>()
+        .expect("Rust code should use a source buffer");
+    let python_buffer = python_view
+        .buffer()
+        .downcast::<sourceview5::Buffer>()
+        .expect("Python code should use a source buffer");
+    assert_ne!(rust_buffer.tag_table(), python_buffer.tag_table());
+    assert!(python_buffer.iter_has_context_class(&python_buffer.start_iter(), "no-spell-check"));
+    drop((rust_buffer, rust_view));
+    while gtk::glib::MainContext::default().pending() {
+        gtk::glib::MainContext::default().iteration(false);
+    }
+    assert!(python_buffer.iter_has_context_class(&python_buffer.start_iter(), "no-spell-check"));
+
     let table_row = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let table = bind_document_table_row(
         &table_row,
@@ -450,6 +481,8 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
         row,
         other_view,
         other_row,
+        python_buffer,
+        python_view,
         table,
         label,
         table_row,

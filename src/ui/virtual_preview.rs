@@ -507,12 +507,13 @@ fn document_text_view(
     document_tags: &gtk::TextTagTable,
 ) -> super::document_view::DocumentTextView {
     let buffer = if document_uses_source_buffer(unit) {
-        let buffer = sourceview5::Buffer::new(Some(document_tags));
+        let buffer = sourceview5::Buffer::new(None);
         super::theme::register_source_buffer(&buffer);
         buffer.upcast::<gtk::TextBuffer>()
     } else {
         gtk::TextBuffer::new(Some(document_tags))
     };
+    ensure_document_text_tags(&buffer);
     super::theme::register_document_buffer(&buffer);
     let view = super::document_view::DocumentTextView::new(&buffer, Vec::new());
     view.set_editable(false);
@@ -1736,7 +1737,7 @@ fn push_source_line_chunks(units: &mut Vec<SourceUnit>, line: &str, first_line: 
 
 fn source_line_numbers(unit: &SourceUnit) -> String {
     if unit.continuation {
-        return format!("{}↳", unit.first_line);
+        return "↳".to_owned();
     }
     (unit.first_line..unit.first_line + unit.line_count.max(1))
         .map(|line| line.to_string())
