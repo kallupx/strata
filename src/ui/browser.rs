@@ -3545,9 +3545,8 @@ impl ViewState {
                 if let Some(column) = self.columns.borrow().get(depth) {
                     column.syncing_selection.set(true);
                     column.selection.set_model(None::<&gio::ListModel>);
+                    column.filtered_model.set_model(None::<&gio::ListModel>);
                     column.model.splice(0, column.model.n_items(), &[]);
-                    column.selection.set_model(Some(&column.filtered_model));
-                    column.syncing_selection.set(false);
                     column.entry_count.set(0);
                     set_filter_placeholder(column, 0);
                     column.spinner.set_visible(true);
@@ -3557,6 +3556,11 @@ impl ViewState {
             }
             BrowserEvent::LoadFinished { depth } => {
                 if let Some(column) = self.columns.borrow().get(depth) {
+                    if column.selection.model().is_none() {
+                        column.filtered_model.set_model(Some(&column.model));
+                        column.selection.set_model(Some(&column.filtered_model));
+                        column.syncing_selection.set(false);
+                    }
                     column.spinner.stop();
                     column.spinner.set_visible(false);
                     let count = column.entry_count.get();
@@ -3581,6 +3585,11 @@ impl ViewState {
             }
             BrowserEvent::LoadFailed { depth, message } => {
                 if let Some(column) = self.columns.borrow().get(depth) {
+                    if column.selection.model().is_none() {
+                        column.filtered_model.set_model(Some(&column.model));
+                        column.selection.set_model(Some(&column.filtered_model));
+                        column.syncing_selection.set(false);
+                    }
                     column.spinner.stop();
                     column.spinner.set_visible(false);
                     column

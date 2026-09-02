@@ -2249,7 +2249,7 @@ menubutton.column-header-action > button:focus-visible image {
 }
 
 .loading-skeleton {
-  padding: 16px 18px;
+  padding: 8px;
 }
 
 .skeleton-row {

@@ -83,6 +83,7 @@ struct Pane {
     model: gtk::StringList,
     selection: gtk::MultiSelection,
     filtered_model: Option<gio::ListModel>,
+    filter_model: Option<gtk::FilterListModel>,
     syncing_selection: Rc<Cell<bool>>,
     stack: gtk::Stack,
     status: gtk::Label,
@@ -581,13 +582,10 @@ impl ModeViews {
                 for pane in self.panes_at(*depth) {
                     pane.syncing_selection.set(true);
                     pane.selection.set_model(None::<&gio::ListModel>);
-                    pane.model.splice(0, pane.model.n_items(), &[]);
-                    if let Some(filtered) = pane.filtered_model.as_ref() {
-                        pane.selection.set_model(Some(filtered));
-                    } else {
-                        pane.selection.set_model(Some(&pane.model));
+                    if let Some(filtered) = pane.filter_model.as_ref() {
+                        filtered.set_model(None::<&gio::ListModel>);
                     }
-                    pane.syncing_selection.set(false);
+                    pane.model.splice(0, pane.model.n_items(), &[]);
                     pane.spinner.set_visible(true);
                     pane.spinner.start();
                     pane.stack.set_visible_child_name("loading");
@@ -595,6 +593,7 @@ impl ModeViews {
             }
             BrowserEvent::LoadFinished { depth } => {
                 for pane in self.panes_at(*depth) {
+                    reconnect_pane_model(pane);
                     pane.spinner.stop();
                     pane.spinner.set_visible(false);
                     show_count(pane);
@@ -602,6 +601,7 @@ impl ModeViews {
             }
             BrowserEvent::LoadFailed { depth, message } => {
                 for pane in self.panes_at(*depth) {
+                    reconnect_pane_model(pane);
                     pane.spinner.stop();
                     pane.status
                         .set_label(&format!("Unable to read this directory\n{message}"));
@@ -1259,6 +1259,7 @@ fn build_grid_pane(
         model,
         selection,
         filtered_model: Some(view_model.upcast()),
+        filter_model: Some(filtered_model),
         syncing_selection,
         stack,
         status,
@@ -1603,7 +1604,7 @@ fn build_explorer_pane(
     let new_entry_is_directory = Rc::new(Cell::new(true));
     let flattened_models = gio::ListStore::new::<gio::ListModel>();
     flattened_models.append(&new_entry_placeholder.clone().upcast::<gio::ListModel>());
-    flattened_models.append(&filtered_model.upcast::<gio::ListModel>());
+    flattened_models.append(&filtered_model.clone().upcast::<gio::ListModel>());
     let view_model = gtk::FlattenListModel::new(Some(flattened_models));
     let view_model_object = view_model.clone().upcast::<gio::ListModel>();
     let selection = gtk::MultiSelection::new(Some(view_model.clone()));
@@ -1846,6 +1847,7 @@ fn build_explorer_pane(
         model,
         selection,
         filtered_model: Some(view_model_object),
+        filter_model: Some(filtered_model),
         syncing_selection,
         stack,
         status,
@@ -2462,6 +2464,21 @@ fn replace_entries(pane: &Pane, entries: &[FileEntry]) {
         .collect();
     pane.model.splice(0, pane.model.n_items(), &values);
     show_count(pane);
+}
+
+fn reconnect_pane_model(pane: &Pane) {
+    if pane.selection.model().is_some() {
+        return;
+    }
+    if let Some(filtered) = pane.filter_model.as_ref() {
+        filtered.set_model(Some(&pane.model));
+    }
+    if let Some(filtered) = pane.filtered_model.as_ref() {
+        pane.selection.set_model(Some(filtered));
+    } else {
+        pane.selection.set_model(Some(&pane.model));
+    }
+    pane.syncing_selection.set(false);
 }
 
 fn show_count(pane: &Pane) {
