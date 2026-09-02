@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::fs;
+use std::{fs, os::unix::fs::PermissionsExt as _, path::PathBuf};
 
-use super::{SetupContext, disable_config, enable_config, install_at, uninstall_at};
+use super::{
+    SetupContext, disable_config, enable_config, install_at, secure_executable, uninstall_at,
+};
 
 const FILE_CHOOSER: &str = "org.freedesktop.impl.portal.FileChooser";
 
@@ -34,8 +36,8 @@ fn install_and_uninstall_restore_an_existing_user_configuration() {
     let original = "[preferred]\ndefault=gtk;\n";
     fs::write(&config, original).expect("portal config");
 
-    let installed_path =
-        install_at(&context, &fixture.path().join("bin/strata")).expect("install portal");
+    let executable = executable(fixture.path());
+    let installed_path = install_at(&context, &executable).expect("install portal");
 
     assert_eq!(installed_path, config);
     assert!(
@@ -62,7 +64,7 @@ fn install_and_uninstall_restore_an_existing_user_configuration() {
         ))
     );
 
-    install_at(&context, &fixture.path().join("bin/strata")).expect("install portal again");
+    install_at(&context, &executable).expect("install portal again");
 
     assert!(!uninstall_at(&context).expect("uninstall portal"));
     assert_eq!(
@@ -78,7 +80,7 @@ fn uninstall_keeps_later_configuration_edits() {
     let config = context.portal_directory().join("portals.conf");
     fs::create_dir_all(config.parent().expect("config parent")).expect("config directory");
     fs::write(&config, "[preferred]\ndefault=gtk;\n").expect("portal config");
-    install_at(&context, &fixture.path().join("strata")).expect("install portal");
+    install_at(&context, &executable(fixture.path())).expect("install portal");
     fs::write(
         &config,
         format!(
@@ -102,7 +104,7 @@ fn generated_override_is_removed_on_uninstall() {
         .expect("system config directory");
     fs::write(&system_config, "[preferred]\ndefault=hyprland;gtk;\n").expect("system config");
 
-    let generated = install_at(&context, &fixture.path().join("strata")).expect("install portal");
+    let generated = install_at(&context, &executable(fixture.path())).expect("install portal");
 
     assert!(generated.ends_with("hyprland-portals.conf"));
     assert!(
@@ -112,6 +114,23 @@ fn generated_override_is_removed_on_uninstall() {
     );
     assert!(!uninstall_at(&context).expect("uninstall portal"));
     assert!(!generated.exists());
+}
+
+#[test]
+fn portal_activation_rejects_replaceable_executables() {
+    let fixture = tempfile::tempdir().expect("fixture directory");
+    let executable = executable(fixture.path());
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o775))
+        .expect("group-writable executable");
+    assert!(secure_executable(&executable).is_err());
+
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).expect("safe executable");
+    fs::set_permissions(
+        executable.parent().expect("executable parent"),
+        fs::Permissions::from_mode(0o777),
+    )
+    .expect("world-writable executable directory");
+    assert!(secure_executable(&executable).is_err());
 }
 
 fn context(root: &std::path::Path) -> SetupContext {
@@ -126,4 +145,12 @@ fn context(root: &std::path::Path) -> SetupContext {
             "portals.conf".to_owned(),
         ],
     }
+}
+
+fn executable(root: &std::path::Path) -> PathBuf {
+    let path = root.join("bin/strata");
+    fs::create_dir_all(path.parent().expect("executable parent")).expect("executable directory");
+    fs::write(&path, b"binary").expect("executable file");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("executable permissions");
+    path
 }

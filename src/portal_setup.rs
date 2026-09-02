@@ -129,10 +129,10 @@ fn portal_config_name(desktop: &str) -> Option<String> {
 }
 
 fn install_at(context: &SetupContext, executable: &Path) -> Result<PathBuf, String> {
+    let executable = secure_executable(executable)?;
     let executable = executable
         .to_str()
-        .filter(|path| Path::new(path).is_absolute())
-        .ok_or_else(|| "Strata must be installed at a UTF-8 absolute path".to_owned())?;
+        .ok_or_else(|| "Strata must be installed at a UTF-8 path".to_owned())?;
     if executable
         .chars()
         .any(|character| character.is_whitespace() || matches!(character, '\\' | '\'' | '"'))
@@ -208,6 +208,30 @@ fn install_at(context: &SetupContext, executable: &Path) -> Result<PathBuf, Stri
     }
     write_config(&target, installed.as_bytes(), file_mode(&target))?;
     Ok(target)
+}
+
+fn secure_executable(path: &Path) -> Result<PathBuf, String> {
+    let path = fs::canonicalize(path)
+        .map_err(|error| path_error("resolve the Strata executable", path, error))?;
+    let metadata = fs::metadata(&path)
+        .map_err(|error| path_error("inspect the Strata executable", &path, error))?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err("The Strata executable must be a regular executable file".to_owned());
+    }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err("The Strata executable must not be writable by other users".to_owned());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "The Strata executable has no containing directory".to_owned())?;
+    let parent_metadata = fs::metadata(parent)
+        .map_err(|error| path_error("inspect the Strata executable directory", parent, error))?;
+    if !parent_metadata.is_dir() || parent_metadata.permissions().mode() & 0o022 != 0 {
+        return Err(
+            "The Strata executable directory must not be writable by other users".to_owned(),
+        );
+    }
+    Ok(path)
 }
 
 fn uninstall_at(context: &SetupContext) -> Result<bool, String> {
