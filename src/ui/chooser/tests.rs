@@ -80,3 +80,15 @@ fn chooser_watches_local_directories() {
 
     assert!(watch.is_some());
 }
+
+#[test]
+fn chooser_previews_supported_files_but_not_directories() {
+    assert!(
+        chooser_preview_target(Some(entry("notes.txt", EntryKind::File))).is_some(),
+        "supported files should be previewable"
+    );
+    assert!(
+        chooser_preview_target(Some(entry("folder", EntryKind::Directory))).is_none(),
+        "folders should remain navigation targets"
+    );
+}

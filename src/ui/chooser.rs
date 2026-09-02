@@ -22,7 +22,7 @@ use ashpd::{
 use gtk::{gio, glib, prelude::*};
 
 use crate::{
-    adapters::{LocalFileSource, LocalOperationProvider},
+    adapters::{LocalFileSource, LocalOperationProvider, LocalPreviewProvider},
     app::BrowserEvent,
     model::{FileEntry, Location},
     portal::{
@@ -36,8 +36,9 @@ use crate::{
 };
 
 use super::{
-    browser::{BrowserView, column_menu_option},
+    browser::{BrowserView, column_menu_option, entry_supports_quick_preview},
     controls::{form_check_button, form_entry, form_label},
+    preview::PreviewDrawer,
     theme::ThemeManager,
     window::{build_appearance_menu, build_sidebar},
 };
@@ -147,6 +148,10 @@ fn filter_directory_change(
         }
         change => change,
     }
+}
+
+fn chooser_preview_target(entry: Option<FileEntry>) -> Option<FileEntry> {
+    entry.filter(entry_supports_quick_preview)
 }
 
 #[derive(Clone)]
@@ -494,6 +499,7 @@ pub(crate) fn present_chooser(
     view.set_single_click_previews(false);
     view.set_operation_provider(Rc::new(LocalOperationProvider));
     let browser = view.browser();
+    let preview = PreviewDrawer::new(Rc::new(LocalPreviewProvider), false);
 
     let window = gtk::Window::builder()
         .title(&request.title)
@@ -534,6 +540,24 @@ pub(crate) fn present_chooser(
     sidebar_toggle.connect_toggled(move |toggle| {
         toggled_sidebar.set_visible(toggle.is_active());
     });
+
+    let preview_split = gtk::Paned::new(gtk::Orientation::Horizontal);
+    preview_split.add_css_class("preview-split");
+    preview_split.set_wide_handle(false);
+    preview_split.set_resize_start_child(true);
+    preview_split.set_resize_end_child(false);
+    preview_split.set_shrink_start_child(false);
+    preview_split.set_shrink_end_child(true);
+    preview_split.set_start_child(Some(&content));
+    preview_split.set_end_child(Some(&preview.widget()));
+    preview_split.set_position(i32::MAX);
+    preview_split.set_vexpand(true);
+    let measured_content = content.clone();
+    let measured_view = view.clone();
+    preview.attach_split(
+        &preview_split,
+        Rc::new(move || measured_content.position() + measured_view.preview_occupied_width()),
+    );
 
     let details = gtk::Box::new(gtk::Orientation::Vertical, 8);
     details.add_css_class("chooser-details");
@@ -630,7 +654,7 @@ pub(crate) fn present_chooser(
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.append(&header);
-    root.append(&content);
+    root.append(&preview_split);
     root.append(&details);
     window.set_child(Some(&root));
     window.set_default_widget(Some(&accept));
@@ -672,10 +696,29 @@ pub(crate) fn present_chooser(
     }
 
     let state_for_observer = state.clone();
-    browser.observe(move |event| {
-        if let BrowserEvent::OpenRequested { location } = event {
-            state_for_observer.activate_file(&location);
+    let preview_for_selection = preview.clone();
+    let weak_browser = Rc::downgrade(&browser);
+    browser.observe(move |event| match event {
+        BrowserEvent::OpenRequested { location } => state_for_observer.activate_file(&location),
+        BrowserEvent::PreviewRequested { entry } => preview_for_selection.show(entry),
+        BrowserEvent::FocusChanged {
+            depth,
+            position: Some(position),
+        } if preview_for_selection.is_open() => {
+            if let Some(entry) = weak_browser
+                .upgrade()
+                .and_then(|browser| browser.entry_at(depth, position))
+                .and_then(|entry| chooser_preview_target(Some(entry)))
+            {
+                preview_for_selection.show(entry);
+            } else {
+                preview_for_selection.close();
+            }
         }
+        BrowserEvent::FocusChanged { position: None, .. } if preview_for_selection.is_open() => {
+            preview_for_selection.close();
+        }
+        _ => {}
     });
 
     let weak = Rc::downgrade(&state);
@@ -690,7 +733,7 @@ pub(crate) fn present_chooser(
         browser_for_destroy.clear_observer();
         sidebar.disconnect();
     });
-    install_shortcuts(&window, &state, &sidebar_toggle);
+    install_shortcuts(&window, &state, &sidebar_toggle, &preview);
 
     let weak_window = glib::WeakRef::new();
     weak_window.set(Some(&window));
@@ -833,22 +876,37 @@ fn apply_external_parent(window: &gtk::Window, parent: Option<&WindowIdentifierT
     }
 }
 
-fn install_shortcuts(window: &gtk::Window, state: &Rc<ChooserState>, sidebar: &gtk::ToggleButton) {
+fn install_shortcuts(
+    window: &gtk::Window,
+    state: &Rc<ChooserState>,
+    sidebar: &gtk::ToggleButton,
+    preview: &PreviewDrawer,
+) {
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     let weak = Rc::downgrade(state);
     let sidebar = sidebar.clone();
+    let preview = preview.clone();
     keys.connect_key_pressed(move |_, key, _, modifiers| {
         let Some(state) = weak.upgrade() else {
             return glib::Propagation::Proceed;
         };
         let control = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+        let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
         let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
         if key == gtk::gdk::Key::Escape {
             if state.view.cancel_new_entry() {
                 return glib::Propagation::Stop;
             }
+            if preview.is_open() {
+                preview.close();
+                return glib::Propagation::Stop;
+            }
             state.cancel();
+            return glib::Propagation::Stop;
+        }
+        if key == gtk::gdk::Key::space && !control && !alt && state.view.item_view_has_focus() {
+            preview.toggle(chooser_preview_target(state.view.browser().focused_entry()));
             return glib::Propagation::Stop;
         }
         if control && matches!(key, gtk::gdk::Key::l | gtk::gdk::Key::L) {

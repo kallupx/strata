@@ -66,7 +66,7 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
     browser.set_operation_provider(Rc::new(LocalOperationProvider));
     let controller = browser.browser();
 
-    let preview = PreviewDrawer::new(Rc::new(LocalPreviewProvider));
+    let preview = PreviewDrawer::new(Rc::new(LocalPreviewProvider), true);
     let preview_for_selection = preview.clone();
     let weak_controller = Rc::downgrade(&controller);
     controller.observe(move |event| match event {
