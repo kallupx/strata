@@ -645,6 +645,15 @@ pub(crate) fn present_chooser(
     cancel.add_css_class("action-dialog-cancel");
     let accept = gtk::Button::with_mnemonic(&request.accept_label);
     accept.add_css_class("action-dialog-confirm");
+    if matches!(
+        &request.kind,
+        ChooserKind::Open {
+            directory: true,
+            ..
+        }
+    ) {
+        accept.set_tooltip_text(Some("Select folder (Ctrl+Enter)"));
+    }
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.add_css_class("chooser-actions");
     actions.append(&new_folder);
@@ -968,6 +977,19 @@ fn install_shortcuts(
         if state.view.location_has_focus() {
             return glib::Propagation::Proceed;
         }
+        if is_folder_accept_shortcut(key, modifiers)
+            && state.view.item_view_has_focus()
+            && matches!(
+                &state.request.kind,
+                ChooserKind::Open {
+                    directory: true,
+                    ..
+                }
+            )
+        {
+            state.accept();
+            return glib::Propagation::Stop;
+        }
         if control && shift && matches!(key, gtk::gdk::Key::n | gtk::gdk::Key::N) {
             state.view.create_new_folder();
             return glib::Propagation::Stop;
@@ -1109,4 +1131,11 @@ fn install_shortcuts(
         glib::Propagation::Stop
     });
     window.add_controller(keys);
+}
+
+fn is_folder_accept_shortcut(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> bool {
+    modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+        && !modifiers
+            .intersects(gtk::gdk::ModifierType::SHIFT_MASK | gtk::gdk::ModifierType::ALT_MASK)
+        && matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
 }

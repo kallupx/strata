@@ -92,3 +92,25 @@ fn chooser_previews_supported_files_but_not_directories() {
         "folders should remain navigation targets"
     );
 }
+
+#[test]
+fn folder_accept_shortcut_requires_control_and_enter() {
+    let control = gtk::gdk::ModifierType::CONTROL_MASK;
+    let shift = gtk::gdk::ModifierType::SHIFT_MASK;
+    let alt = gtk::gdk::ModifierType::ALT_MASK;
+
+    assert!(is_folder_accept_shortcut(gtk::gdk::Key::Return, control));
+    assert!(is_folder_accept_shortcut(gtk::gdk::Key::KP_Enter, control));
+    assert!(!is_folder_accept_shortcut(
+        gtk::gdk::Key::Return,
+        gtk::gdk::ModifierType::empty()
+    ));
+    assert!(!is_folder_accept_shortcut(
+        gtk::gdk::Key::Return,
+        control | shift
+    ));
+    assert!(!is_folder_accept_shortcut(
+        gtk::gdk::Key::Return,
+        control | alt
+    ));
+}
