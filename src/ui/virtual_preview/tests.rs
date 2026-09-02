@@ -540,6 +540,27 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
         assert!(view.height() > 0);
         assert!(view.buffer().char_count() > 0);
     }
+
+    let mut heading = unit("Mixed supported and unsupported HTML");
+    heading.kind = DocumentUnitKind::Heading(1);
+    let units = vec![
+        PreviewUnit::Document(heading),
+        PreviewUnit::Document(unit("Safe text remains visible.")),
+    ];
+    let (rendered_root, rendered_state) =
+        super::virtual_preview(units, vec!["Unsupported content omitted".to_owned()], false);
+    stack.add_named(&rendered_root, Some("rendered-again"));
+    stack.set_visible_child_name("rendered-again");
+    while gtk::glib::MainContext::default().pending() {
+        gtk::glib::MainContext::default().iteration(false);
+    }
+    assert!(rendered_root.is_mapped());
+    assert!(!rendered_state.bound.borrow().is_empty());
+    for bound in rendered_state.bound.borrow().values() {
+        let view = bound.view.upgrade().expect("bound rendered view");
+        assert!(view.height() > 0);
+        assert!(view.buffer().char_count() > 0);
+    }
     window.close();
 }
 

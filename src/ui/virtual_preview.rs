@@ -564,6 +564,8 @@ fn bind_document_text_view(view: &super::document_view::DocumentTextView, unit: 
     } else {
         gtk::WrapMode::WordChar
     });
+    let (_, height) = view.create_pango_layout(Some(&text)).pixel_size();
+    view.set_height_request(height.max(VIRTUAL_ROW_MIN_HEIGHT));
     set_document_accessibility(view, unit);
 }
 
