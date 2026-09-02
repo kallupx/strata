@@ -2,6 +2,7 @@
 
 use std::{
     ffi::{OsStr, OsString},
+    future::Future,
     os::unix::ffi::OsStringExt as _,
     sync::atomic::Ordering,
 };
@@ -32,7 +33,13 @@ fn entry(path: &Path, directory: bool) -> FileEntry {
 
 #[test]
 fn open_defaults_match_the_portal_contract() {
-    let request = open_request(HandleToken::default(), None, "", OpenFileOptions::default());
+    let request = run_async(open_request(
+        HandleToken::default().to_string(),
+        None,
+        "",
+        OpenFileOptions::default(),
+    ))
+    .expect("open request");
     assert!(request.modal);
     assert_eq!(request.title, "Open Files");
     assert_eq!(request.accept_label, "Open");
@@ -52,7 +59,12 @@ fn current_file_takes_precedence_over_folder_and_name() {
     let file = current.path().join("existing.txt");
     std::fs::write(&file, b"data").expect("fixture file");
 
-    let suggestion = save_file_suggestion(Some(&file), Some(ignored.path()), Some("ignored.txt"));
+    let suggestion = run_async(save_file_suggestion(
+        Some(file),
+        Some(ignored.path().to_path_buf()),
+        Some("ignored.txt".to_owned()),
+    ))
+    .expect("save suggestion");
     assert_eq!(suggestion.0, current.path());
     assert_eq!(suggestion.1.as_deref(), Some(OsStr::new("existing.txt")));
 }
@@ -64,18 +76,20 @@ fn current_file_preserves_a_non_utf8_filename() {
     let file = current.path().join(&name);
     std::fs::write(&file, b"data").expect("fixture file");
 
-    let suggestion = save_file_suggestion(Some(&file), None, None);
+    let suggestion =
+        run_async(save_file_suggestion(Some(file), None, None)).expect("save suggestion");
     assert_eq!(suggestion, (current.path().to_path_buf(), Some(name)));
 }
 
 #[test]
 fn invalid_current_file_falls_back_without_using_lower_priority_suggestions() {
     let ignored = tempfile::tempdir().expect("ignored directory");
-    let suggestion = save_file_suggestion(
-        Some(Path::new("relative/missing.txt")),
-        Some(ignored.path()),
-        Some("ignored.txt"),
-    );
+    let suggestion = run_async(save_file_suggestion(
+        Some(PathBuf::from("relative/missing.txt")),
+        Some(ignored.path().to_path_buf()),
+        Some("ignored.txt".to_owned()),
+    ))
+    .expect("save suggestion");
     assert_eq!(suggestion, (crate::ui::home_directory(), None));
 }
 
@@ -108,7 +122,7 @@ fn save_files_preserve_order_and_report_collisions_once() {
     let folder = tempfile::tempdir().expect("destination");
     std::fs::write(folder.path().join("second"), b"existing").expect("collision");
     let names = vec![OsString::from("first"), OsString::from("second")];
-    let checked = check_destinations(folder.path(), &names).expect("safe destinations");
+    let checked = run_async(check_destinations(folder.path(), &names)).expect("safe destinations");
     assert_eq!(
         checked.paths,
         vec![folder.path().join("first"), folder.path().join("second")]
@@ -121,9 +135,12 @@ fn save_files_block_directory_collisions() {
     let folder = tempfile::tempdir().expect("destination");
     std::fs::create_dir(folder.path().join("reserved")).expect("collision directory");
     assert!(
-        check_destinations(folder.path(), &[OsString::from("reserved")])
-            .expect_err("directory collision")
-            .contains("folder")
+        run_async(check_destinations(
+            folder.path(),
+            &[OsString::from("reserved")],
+        ))
+        .expect_err("directory collision")
+        .contains("folder")
     );
 }
 
@@ -136,15 +153,16 @@ fn filters_and_choices_keep_input_order_and_current_filter() {
     let encoding = Choice::new("encoding", "Encoding", "utf8")
         .insert("utf8", "UTF-8")
         .insert("latin1", "Latin-1");
-    let request = open_request(
-        HandleToken::default(),
+    let request = run_async(open_request(
+        HandleToken::default().to_string(),
         None,
         "Choose",
         OpenFileOptions::default()
             .set_filters([images.clone(), text.clone()])
             .set_current_filter(Some(text.clone()))
             .set_choices([Choice::boolean("readonly", "Read only", true), encoding]),
-    );
+    ))
+    .expect("open request");
     assert_eq!(request.filters, [images, text.clone()]);
     assert_eq!(request.current_filter, Some(text));
     assert_eq!(
@@ -184,16 +202,67 @@ fn open_selection_validates_kind_cardinality_and_locality() {
 #[test]
 fn cancellation_before_presentation_is_sticky_and_cleanup_is_race_safe() {
     let tracker = Arc::new(RequestTracker::default());
-    let first = tracker.begin("same".into());
+    let first = tracker.begin("same".into()).expect("first request");
+    assert!(tracker.begin("same".into()).is_err());
     assert!(tracker.cancel("same"));
     assert!(first.cancelled.load(Ordering::SeqCst));
 
-    let replacement = tracker.begin("same".into());
     drop(first);
+    let replacement = tracker.begin("same".into()).expect("replacement request");
     assert!(tracker.cancel("same"));
     assert!(replacement.cancelled.load(Ordering::SeqCst));
     drop(replacement);
     assert!(!tracker.cancel("same"));
+}
+
+#[test]
+fn untrusted_request_inputs_are_bounded() {
+    let too_long = "x".repeat(MAX_STRING_BYTES + 1);
+    assert!(
+        validate_common_request(&too_long, None, None, &[]).is_err(),
+        "titles must be bounded"
+    );
+
+    let choices = (0..=MAX_CHOICES)
+        .map(|index| Choice::boolean(&format!("choice-{index}"), "Choice", false))
+        .collect::<Vec<_>>();
+    assert!(validate_choices(&choices).is_err());
+    let choice = (0..=MAX_CHOICE_OPTIONS).fold(
+        Choice::new("choice", "Choice", "option-0"),
+        |choice, index| choice.insert(&format!("option-{index}"), "Option"),
+    );
+    assert!(validate_choices(&[choice]).is_err());
+
+    let filters = (0..=MAX_FILTERS)
+        .map(|index| FileFilter::new(&format!("Filter {index}")))
+        .collect::<Vec<_>>();
+    assert!(validate_filters(&filters, None).is_err());
+    let filter = (0..=MAX_FILTER_RULES).fold(FileFilter::new("Filter"), |filter, index| {
+        filter.glob(&format!("*.{index}"))
+    });
+    assert!(validate_filters(&[filter], None).is_err());
+
+    let filenames = vec![OsString::from("file"); MAX_SAVE_FILES + 1];
+    assert!(validate_save_filenames(&filenames).is_err());
+    assert!(
+        validate_save_filenames(&[OsString::from("x".repeat(MAX_FILENAME_BYTES + 1))]).is_err()
+    );
+    assert!(validate_path(Some(Path::new(&"x".repeat(MAX_STRING_BYTES + 1))), "path").is_err());
+}
+
+#[test]
+fn active_request_count_is_bounded() {
+    let tracker = Arc::new(RequestTracker::default());
+    let requests = (0..MAX_ACTIVE_REQUESTS)
+        .map(|index| {
+            tracker
+                .begin(format!("request{index}"))
+                .expect("request within limit")
+        })
+        .collect::<Vec<_>>();
+    assert!(tracker.begin("one-too-many".into()).is_err());
+    drop(requests);
+    assert!(tracker.begin("available-again".into()).is_ok());
 }
 
 #[test]
@@ -207,4 +276,11 @@ fn backend_version_and_success_uri_scheme_are_fixed() {
                 .starts_with("file://")
         );
     }
+}
+
+fn run_async<T>(future: impl Future<Output = T>) -> T {
+    let context = glib::MainContext::new();
+    context
+        .with_thread_default(|| context.block_on(future))
+        .expect("test main context")
 }

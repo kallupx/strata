@@ -45,6 +45,7 @@ fn main() -> gtk::glib::ExitCode {
         return gtk::glib::ExitCode::SUCCESS;
     }
     if arguments.get(1).is_some_and(|value| value == "--portal") {
+        fall_back_if_gvfs_is_unresponsive();
         return portal::run();
     }
     if arguments

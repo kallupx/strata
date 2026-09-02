@@ -6,15 +6,18 @@ mod tests;
 use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
+    future::Future,
+    os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use ashpd::{
-    MaybeAppID, PortalError, Uri, WindowIdentifierType,
+    FilePath, MaybeAppID, PortalError, Uri, WindowIdentifierType,
     async_trait::async_trait,
     backend::{Builder, file_chooser::FileChooserImpl, request::RequestImpl},
     desktop::{
@@ -25,12 +28,23 @@ use ashpd::{
     },
 };
 use futures_channel::oneshot;
-use gio::prelude::FileExt as _;
+use gio::prelude::*;
 
 use crate::model::{FileEntry, Location};
 
 const BACKEND_NAME: &str = "org.freedesktop.impl.portal.desktop.strata";
 pub(crate) const FILE_CHOOSER_VERSION: u32 = 4;
+const MAX_ACTIVE_REQUESTS: usize = 16;
+const MAX_CHOICES: usize = 16;
+const MAX_CHOICE_OPTIONS: usize = 32;
+const MAX_TOTAL_CHOICE_OPTIONS: usize = 128;
+const MAX_FILTERS: usize = 32;
+const MAX_FILTER_RULES: usize = 64;
+const MAX_TOTAL_FILTER_RULES: usize = 256;
+const MAX_SAVE_FILES: usize = 256;
+const MAX_STRING_BYTES: usize = 4_096;
+const MAX_FILENAME_BYTES: usize = 255;
+const PATH_IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 pub(crate) enum ChooserKind {
@@ -59,17 +73,30 @@ struct RequestTracker {
 }
 
 impl RequestTracker {
-    fn begin(self: &Arc<Self>, token: String) -> TrackedRequest {
+    fn begin(self: &Arc<Self>, token: String) -> ashpd::backend::Result<TrackedRequest> {
+        if token.len() > MAX_FILENAME_BYTES {
+            return Err(PortalError::InvalidArgument(
+                "file chooser request token is too long".into(),
+            ));
+        }
+        let mut active = self.active.lock().expect("request tracker poisoned");
+        if active.contains_key(&token) {
+            return Err(PortalError::InvalidArgument(
+                "file chooser request token is already active".into(),
+            ));
+        }
+        if active.len() >= MAX_ACTIVE_REQUESTS {
+            return Err(PortalError::Failed(
+                "too many active file chooser requests".into(),
+            ));
+        }
         let cancelled = Arc::new(AtomicBool::new(false));
-        self.active
-            .lock()
-            .expect("request tracker poisoned")
-            .insert(token.clone(), cancelled.clone());
-        TrackedRequest {
+        active.insert(token.clone(), cancelled.clone());
+        Ok(TrackedRequest {
             tracker: self.clone(),
             token,
             cancelled,
-        }
+        })
     }
 
     fn cancel(&self, token: &str) -> bool {
@@ -114,9 +141,12 @@ struct FileChooserBackend {
 }
 
 impl FileChooserBackend {
-    async fn choose(&self, request: ChooserRequest) -> ashpd::backend::Result<SelectedFiles> {
+    async fn choose(
+        &self,
+        tracked: TrackedRequest,
+        request: ChooserRequest,
+    ) -> ashpd::backend::Result<SelectedFiles> {
         let token = request.token.clone();
-        let tracked = self.requests.begin(token.clone());
         let cancelled = tracked.cancelled.clone();
         let (send, receive) = oneshot::channel();
         glib::MainContext::default().invoke(move || {
@@ -152,8 +182,10 @@ impl FileChooserImpl for FileChooserBackend {
         title: &str,
         options: OpenFileOptions,
     ) -> ashpd::backend::Result<SelectedFiles> {
-        self.choose(open_request(token, parent, title, options))
-            .await
+        let token = token.to_string();
+        let tracked = self.requests.begin(token.clone())?;
+        let request = open_request(token, parent, title, options).await?;
+        self.choose(tracked, request).await
     }
 
     async fn save_file(
@@ -164,8 +196,10 @@ impl FileChooserImpl for FileChooserBackend {
         title: &str,
         options: SaveFileOptions,
     ) -> ashpd::backend::Result<SelectedFiles> {
-        self.choose(save_file_request(token, parent, title, options))
-            .await
+        let token = token.to_string();
+        let tracked = self.requests.begin(token.clone())?;
+        let request = save_file_request(token, parent, title, options).await?;
+        self.choose(tracked, request).await
     }
 
     async fn save_files(
@@ -176,8 +210,10 @@ impl FileChooserImpl for FileChooserBackend {
         title: &str,
         options: SaveFilesOptions,
     ) -> ashpd::backend::Result<SelectedFiles> {
-        self.choose(save_files_request(token, parent, title, options)?)
-            .await
+        let token = token.to_string();
+        let tracked = self.requests.begin(token.clone())?;
+        let request = save_files_request(token, parent, title, options).await?;
+        self.choose(tracked, request).await
     }
 }
 
@@ -233,19 +269,36 @@ pub(crate) fn run() -> glib::ExitCode {
     }
 }
 
-fn open_request(
-    token: HandleToken,
+async fn open_request(
+    token: String,
     parent: Option<WindowIdentifierType>,
     title: &str,
     options: OpenFileOptions,
-) -> ChooserRequest {
-    ChooserRequest {
-        token: token.to_string(),
+) -> ashpd::backend::Result<ChooserRequest> {
+    validate_common_request(
+        title,
+        options.accept_label(),
+        parent.as_ref(),
+        options.choices(),
+    )?;
+    validate_filters(options.filters(), options.current_filter())?;
+    validate_path(
+        options.current_folder().map(AsRef::as_ref),
+        "current folder",
+    )?;
+    let initial_directory = accessible_folder(
+        options
+            .current_folder()
+            .map(|path| path.as_ref().to_path_buf()),
+    )
+    .await?;
+    Ok(ChooserRequest {
+        token,
         title: request_title(title, "Open Files"),
         accept_label: options.accept_label().unwrap_or("Open").to_owned(),
         modal: options.modal().unwrap_or(true),
         parent,
-        initial_directory: accessible_folder(options.current_folder().map(AsRef::as_ref)),
+        initial_directory,
         kind: ChooserKind::Open {
             directory: options.directory().unwrap_or(false),
             multiple: options.multiple().unwrap_or(false),
@@ -253,22 +306,42 @@ fn open_request(
         filters: options.filters().to_vec(),
         current_filter: options.current_filter().cloned(),
         choices: options.choices().to_vec(),
-    }
+    })
 }
 
-fn save_file_request(
-    token: HandleToken,
+async fn save_file_request(
+    token: String,
     parent: Option<WindowIdentifierType>,
     title: &str,
     options: SaveFileOptions,
-) -> ChooserRequest {
-    let (initial_directory, current_name) = save_file_suggestion(
-        options.current_file().map(AsRef::as_ref),
+) -> ashpd::backend::Result<ChooserRequest> {
+    validate_common_request(
+        title,
+        options.accept_label(),
+        parent.as_ref(),
+        options.choices(),
+    )?;
+    validate_filters(options.filters(), options.current_filter())?;
+    validate_path(options.current_file().map(AsRef::as_ref), "current file")?;
+    validate_path(
         options.current_folder().map(AsRef::as_ref),
-        options.current_name(),
-    );
-    ChooserRequest {
-        token: token.to_string(),
+        "current folder",
+    )?;
+    if let Some(name) = options.current_name() {
+        validate_string(name, MAX_FILENAME_BYTES, "current filename")?;
+    }
+    let (initial_directory, current_name) = save_file_suggestion(
+        options
+            .current_file()
+            .map(|path| path.as_ref().to_path_buf()),
+        options
+            .current_folder()
+            .map(|path| path.as_ref().to_path_buf()),
+        options.current_name().map(str::to_owned),
+    )
+    .await?;
+    Ok(ChooserRequest {
+        token,
         title: request_title(title, "Save File"),
         accept_label: options.accept_label().unwrap_or("Save").to_owned(),
         modal: options.modal().unwrap_or(true),
@@ -278,28 +351,44 @@ fn save_file_request(
         filters: options.filters().to_vec(),
         current_filter: options.current_filter().cloned(),
         choices: options.choices().to_vec(),
-    }
+    })
 }
 
-fn save_files_request(
-    token: HandleToken,
+async fn save_files_request(
+    token: String,
     parent: Option<WindowIdentifierType>,
     title: &str,
     options: SaveFilesOptions,
 ) -> ashpd::backend::Result<ChooserRequest> {
+    validate_common_request(
+        title,
+        options.accept_label(),
+        parent.as_ref(),
+        options.choices(),
+    )?;
+    validate_path(
+        options.current_folder().map(AsRef::as_ref),
+        "current folder",
+    )?;
+    validate_save_file_paths(options.files())?;
     let names = options
         .files()
         .iter()
         .map(|path| path.as_ref().as_os_str().to_owned())
         .collect::<Vec<_>>();
-    validate_save_filenames(&names)?;
+    let initial_directory = accessible_folder(
+        options
+            .current_folder()
+            .map(|path| path.as_ref().to_path_buf()),
+    )
+    .await?;
     Ok(ChooserRequest {
-        token: token.to_string(),
+        token,
         title: request_title(title, "Save Files"),
         accept_label: options.accept_label().unwrap_or("Save").to_owned(),
         modal: options.modal().unwrap_or(true),
         parent,
-        initial_directory: accessible_folder(options.current_folder().map(AsRef::as_ref)),
+        initial_directory,
         kind: ChooserKind::SaveFiles { names },
         filters: Vec::new(),
         current_filter: None,
@@ -315,23 +404,190 @@ fn request_title(title: &str, fallback: &str) -> String {
     }
 }
 
-fn accessible_folder(suggestion: Option<&Path>) -> PathBuf {
-    suggestion
-        .filter(|path| path.is_absolute() && path.is_dir() && std::fs::read_dir(path).is_ok())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(crate::ui::home_directory)
+fn validate_common_request(
+    title: &str,
+    accept_label: Option<&str>,
+    parent: Option<&WindowIdentifierType>,
+    choices: &[Choice],
+) -> ashpd::backend::Result<()> {
+    validate_string(title, MAX_STRING_BYTES, "title")?;
+    if let Some(label) = accept_label {
+        validate_string(label, MAX_STRING_BYTES, "accept label")?;
+    }
+    if let Some(WindowIdentifierType::Wayland(handle)) = parent {
+        validate_string(handle, MAX_STRING_BYTES, "parent window handle")?;
+    }
+    validate_choices(choices)
 }
 
-fn save_file_suggestion(
-    current_file: Option<&Path>,
-    current_folder: Option<&Path>,
-    current_name: Option<&str>,
+fn validate_filters(
+    filters: &[FileFilter],
+    current: Option<&FileFilter>,
+) -> ashpd::backend::Result<()> {
+    if filters.len() > MAX_FILTERS
+        || current.is_some_and(|current| !filters.contains(current) && filters.len() == MAX_FILTERS)
+    {
+        return invalid_argument("too many file filters");
+    }
+    let mut total_rules = 0usize;
+    for filter in filters
+        .iter()
+        .chain(current.filter(|filter| !filters.contains(filter)))
+    {
+        validate_string(filter.label(), MAX_STRING_BYTES, "file filter label")?;
+        let patterns = filter.pattern_filters();
+        let mimetypes = filter.mimetype_filters();
+        let rules = patterns.len().saturating_add(mimetypes.len());
+        if rules > MAX_FILTER_RULES {
+            return invalid_argument("a file filter has too many rules");
+        }
+        total_rules = total_rules.saturating_add(rules);
+        if total_rules > MAX_TOTAL_FILTER_RULES {
+            return invalid_argument("file filters have too many rules");
+        }
+        for value in patterns.into_iter().chain(mimetypes) {
+            validate_string(value, MAX_STRING_BYTES, "file filter rule")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_choices(choices: &[Choice]) -> ashpd::backend::Result<()> {
+    if choices.len() > MAX_CHOICES {
+        return invalid_argument("too many file chooser choices");
+    }
+    let mut total_options = 0usize;
+    for choice in choices {
+        validate_string(choice.id(), MAX_STRING_BYTES, "choice identifier")?;
+        validate_string(choice.label(), MAX_STRING_BYTES, "choice label")?;
+        validate_string(
+            choice.initial_selection(),
+            MAX_STRING_BYTES,
+            "initial choice value",
+        )?;
+        let options = choice.pairs();
+        if options.len() > MAX_CHOICE_OPTIONS {
+            return invalid_argument("a file chooser choice has too many options");
+        }
+        total_options = total_options.saturating_add(options.len());
+        if total_options > MAX_TOTAL_CHOICE_OPTIONS {
+            return invalid_argument("file chooser choices have too many options");
+        }
+        for (id, label) in options {
+            validate_string(id, MAX_STRING_BYTES, "choice option identifier")?;
+            validate_string(label, MAX_STRING_BYTES, "choice option label")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_string(value: &str, limit: usize, field: &str) -> ashpd::backend::Result<()> {
+    if value.len() > limit || value.contains('\0') {
+        return invalid_argument(format!("{field} is too long or contains a NUL byte"));
+    }
+    Ok(())
+}
+
+fn validate_path(path: Option<&Path>, field: &str) -> ashpd::backend::Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() > MAX_STRING_BYTES || bytes.contains(&0) {
+        return invalid_argument(format!("{field} is too long or contains a NUL byte"));
+    }
+    Ok(())
+}
+
+fn invalid_argument<T>(message: impl Into<String>) -> ashpd::backend::Result<T> {
+    Err(PortalError::InvalidArgument(message.into()))
+}
+
+async fn run_on_main<T, F, Fut>(task: F) -> ashpd::backend::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = T> + 'static,
+{
+    let (send, receive) = oneshot::channel();
+    let context = glib::MainContext::ref_thread_default();
+    let task_context = context.clone();
+    context.invoke(move || {
+        let _task = task_context.spawn_local(async move {
+            let _result = send.send(task().await);
+        });
+    });
+    receive
+        .await
+        .map_err(|_| PortalError::Failed("portal UI context stopped responding".into()))
+}
+
+async fn accessible_folder(suggestion: Option<PathBuf>) -> ashpd::backend::Result<PathBuf> {
+    run_on_main(move || async move {
+        let home = crate::ui::home_directory();
+        let Some(path) = suggestion.filter(|path| path.is_absolute()) else {
+            return home;
+        };
+        match glib::future_with_timeout(PATH_IO_TIMEOUT, directory_is_accessible(&path)).await {
+            Ok(true) => path,
+            Ok(false) | Err(_) => home,
+        }
+    })
+    .await
+}
+
+async fn directory_is_accessible(path: &Path) -> bool {
+    gio::File::for_path(path)
+        .enumerate_children_future(
+            gio::FILE_ATTRIBUTE_STANDARD_TYPE,
+            gio::FileQueryInfoFlags::NONE,
+            glib::Priority::DEFAULT,
+        )
+        .await
+        .is_ok()
+}
+
+async fn save_file_suggestion(
+    current_file: Option<PathBuf>,
+    current_folder: Option<PathBuf>,
+    current_name: Option<String>,
+) -> ashpd::backend::Result<(PathBuf, Option<OsString>)> {
+    run_on_main(move || async move {
+        let home = crate::ui::home_directory();
+        let fallback = (home.clone(), None);
+        glib::future_with_timeout(
+            PATH_IO_TIMEOUT,
+            resolve_save_file_suggestion(current_file, current_folder, current_name),
+        )
+        .await
+        .unwrap_or(fallback)
+    })
+    .await
+}
+
+async fn resolve_save_file_suggestion(
+    current_file: Option<PathBuf>,
+    current_folder: Option<PathBuf>,
+    current_name: Option<String>,
 ) -> (PathBuf, Option<OsString>) {
     if let Some(file) = current_file {
-        if file.is_file()
+        let file_type = if file.is_absolute() {
+            gio::File::for_path(&file)
+                .query_info_future(
+                    gio::FILE_ATTRIBUTE_STANDARD_TYPE,
+                    gio::FileQueryInfoFlags::NONE,
+                    glib::Priority::DEFAULT,
+                )
+                .await
+                .ok()
+                .map(|info| info.file_type())
+        } else {
+            None
+        };
+        if file_type == Some(gio::FileType::Regular)
             && let (Some(parent), Some(name)) = (file.parent(), file.file_name())
             && safe_filename(name)
-            && accessible_folder(Some(parent)) == parent
+            && directory_is_accessible(parent).await
         {
             return (parent.to_path_buf(), Some(name.to_owned()));
         }
@@ -339,9 +595,17 @@ fn save_file_suggestion(
     }
 
     let name = current_name
+        .as_deref()
         .filter(|name| crate::services::validate_basename(name).is_ok())
         .map(OsString::from);
-    (accessible_folder(current_folder), name)
+    let folder = if let Some(folder) = current_folder.filter(|folder| folder.is_absolute())
+        && directory_is_accessible(&folder).await
+    {
+        folder
+    } else {
+        crate::ui::home_directory()
+    };
+    (folder, name)
 }
 
 pub(crate) fn safe_filename(name: &OsStr) -> bool {
@@ -359,15 +623,31 @@ pub(crate) fn writable_from_read_only(read_only: bool) -> bool {
 }
 
 fn validate_save_filenames(names: &[OsString]) -> ashpd::backend::Result<()> {
-    if names.is_empty() {
+    if names.is_empty() || names.len() > MAX_SAVE_FILES {
         return Err(PortalError::InvalidArgument(
-            "SaveFiles requires at least one filename".into(),
+            "SaveFiles requires a bounded, non-empty filename list".into(),
         ));
     }
-    if names.iter().any(|name| !safe_filename(name)) {
+    if names
+        .iter()
+        .any(|name| !safe_filename(name) || name.as_bytes().len() > MAX_FILENAME_BYTES)
+    {
         return Err(PortalError::InvalidArgument(
-            "SaveFiles filenames must be safe basenames".into(),
+            "SaveFiles filenames must be bounded safe basenames".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_save_file_paths(files: &[FilePath]) -> ashpd::backend::Result<()> {
+    if files.is_empty() || files.len() > MAX_SAVE_FILES {
+        return invalid_argument("SaveFiles requires a bounded, non-empty filename list");
+    }
+    for file in files {
+        let name = file.as_ref().as_os_str();
+        if !safe_filename(name) || name.as_bytes().len() > MAX_FILENAME_BYTES {
+            return invalid_argument("SaveFiles filenames must be bounded safe basenames");
+        }
     }
     Ok(())
 }
@@ -433,29 +713,64 @@ pub(crate) struct DestinationCheck {
     pub existing_files: bool,
 }
 
-pub(crate) fn check_destinations(
+pub(crate) async fn check_destinations(
     folder: &Path,
     names: &[OsString],
 ) -> Result<DestinationCheck, String> {
-    if !folder.is_absolute() || !folder.is_dir() {
+    if !folder.is_absolute() || folder.as_os_str().as_bytes().len() > MAX_STRING_BYTES {
+        return Err("Choose an accessible local folder".into());
+    }
+    validate_save_filenames(names).map_err(|_| "Enter bounded, safe filenames".to_owned())?;
+    glib::future_with_timeout(PATH_IO_TIMEOUT, inspect_destinations(folder, names))
+        .await
+        .map_err(|_| "Timed out while inspecting the destination".to_owned())?
+}
+
+async fn inspect_destinations(
+    folder: &Path,
+    names: &[OsString],
+) -> Result<DestinationCheck, String> {
+    if !directory_is_accessible(folder).await {
         return Err("Choose an accessible local folder".into());
     }
     let mut paths = Vec::with_capacity(names.len());
     let mut existing_files = false;
     for name in names {
-        if !safe_filename(name) {
-            return Err("Enter safe filenames without path separators".into());
-        }
         let path = folder.join(name);
-        match std::fs::symlink_metadata(&path) {
-            Ok(_) if path.is_dir() => {
+        let file = gio::File::for_path(&path);
+        match file
+            .query_info_future(
+                gio::FILE_ATTRIBUTE_STANDARD_TYPE,
+                gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+                glib::Priority::DEFAULT,
+            )
+            .await
+        {
+            Ok(info) if info.file_type() == gio::FileType::Directory => {
                 return Err(format!(
                     "A folder named “{}” already exists",
                     name.to_string_lossy()
                 ));
             }
+            Ok(info) if info.file_type() == gio::FileType::SymbolicLink => {
+                if file
+                    .query_info_future(
+                        gio::FILE_ATTRIBUTE_STANDARD_TYPE,
+                        gio::FileQueryInfoFlags::NONE,
+                        glib::Priority::DEFAULT,
+                    )
+                    .await
+                    .is_ok_and(|target| target.file_type() == gio::FileType::Directory)
+                {
+                    return Err(format!(
+                        "A folder named “{}” already exists",
+                        name.to_string_lossy()
+                    ));
+                }
+                existing_files = true;
+            }
             Ok(_) => existing_files = true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.matches(gio::IOErrorEnum::NotFound) => {}
             Err(error) => return Err(format!("Unable to inspect the destination: {error}")),
         }
         paths.push(path);

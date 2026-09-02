@@ -179,6 +179,7 @@ type SelectionChanged = Box<dyn Fn(usize)>;
 
 struct ChooserDropdown {
     button: gtk::MenuButton,
+    popover: gtk::Popover,
     selected: Rc<Cell<usize>>,
     changed: Rc<RefCell<Option<SelectionChanged>>>,
 }
@@ -230,6 +231,7 @@ impl ChooserDropdown {
 
         Self {
             button,
+            popover,
             selected,
             changed,
         }
@@ -241,6 +243,14 @@ impl ChooserDropdown {
 
     fn connect_selected(&self, callback: impl Fn(usize) + 'static) {
         self.changed.replace(Some(Box::new(callback)));
+    }
+
+    fn dismiss(&self) -> bool {
+        if !self.popover.is_mapped() {
+            return false;
+        }
+        self.popover.popdown();
+        true
     }
 }
 
@@ -258,6 +268,13 @@ impl ChoiceControl {
             ),
         }
     }
+
+    fn dismiss_dropdown(&self) -> bool {
+        match self {
+            Self::Boolean { .. } => false,
+            Self::Select { dropdown, .. } => dropdown.dismiss(),
+        }
+    }
 }
 
 struct ChooserState {
@@ -270,6 +287,7 @@ struct ChooserState {
     choices: Vec<ChoiceControl>,
     read_only: Option<gtk::CheckButton>,
     error: gtk::Label,
+    destination_check: Cell<bool>,
     completion: RefCell<Option<Completion>>,
 }
 
@@ -319,6 +337,13 @@ impl ChooserState {
 
     fn selected_choices(&self) -> Vec<(String, String)> {
         self.choices.iter().map(ChoiceControl::value).collect()
+    }
+
+    fn dismiss_dropdown(&self) -> bool {
+        self.filter_dropdown
+            .as_ref()
+            .is_some_and(ChooserDropdown::dismiss)
+            || self.choices.iter().any(ChoiceControl::dismiss_dropdown)
     }
 
     fn complete_paths(&self, paths: Vec<PathBuf>, writable: Option<bool>) {
@@ -373,7 +398,7 @@ impl ChooserState {
                         return;
                     }
                 };
-                self.accept_destinations(&folder, names);
+                self.accept_destinations(folder, names.clone());
             }
         }
     }
@@ -405,45 +430,50 @@ impl ChooserState {
             } if current.to_string_lossy() == name => current.clone(),
             _ => OsString::from(name),
         };
-        self.accept_destinations(&folder, &[name]);
+        self.accept_destinations(folder, vec![name]);
     }
 
-    fn accept_destinations(self: &Rc<Self>, folder: &Path, names: &[OsString]) {
-        let destinations = match check_destinations(folder, names) {
-            Ok(destinations) => destinations,
-            Err(message) => {
-                self.show_error(&message);
-                return;
-            }
-        };
-        if !destinations.existing_files {
-            self.complete_paths(destinations.paths, None);
+    fn accept_destinations(self: &Rc<Self>, folder: PathBuf, names: Vec<OsString>) {
+        if self.destination_check.replace(true) {
             return;
         }
-
-        let plural = destinations.paths.len() > 1;
-        let dialog = gtk::AlertDialog::builder()
-            .modal(true)
-            .message(if plural {
-                "Replace existing files?"
-            } else {
-                "Replace existing file?"
-            })
-            .detail(if plural {
-                "One or more destination files already exist. Continuing may overwrite them."
-            } else {
-                "A destination file already exists. Continuing may overwrite it."
-            })
-            .buttons(["Cancel", "Replace"])
-            .cancel_button(0)
-            .default_button(1)
-            .build();
         let weak = Rc::downgrade(self);
-        let window = self.window.clone();
-        glib::MainContext::default().spawn_local(async move {
-            if dialog.choose_future(Some(&window)).await == Ok(1)
-                && let Some(state) = weak.upgrade()
-            {
+        let _task = glib::MainContext::default().spawn_local(async move {
+            let result = check_destinations(&folder, &names).await;
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            state.destination_check.set(false);
+            let destinations = match result {
+                Ok(destinations) => destinations,
+                Err(message) => {
+                    state.show_error(&message);
+                    return;
+                }
+            };
+            if !destinations.existing_files {
+                state.complete_paths(destinations.paths, None);
+                return;
+            }
+
+            let plural = destinations.paths.len() > 1;
+            let dialog = gtk::AlertDialog::builder()
+                .modal(true)
+                .message(if plural {
+                    "Replace existing files?"
+                } else {
+                    "Replace existing file?"
+                })
+                .detail(if plural {
+                    "One or more destination files already exist. Continuing may overwrite them."
+                } else {
+                    "A destination file already exists. Continuing may overwrite it."
+                })
+                .buttons(["Cancel", "Replace"])
+                .cancel_button(0)
+                .default_button(1)
+                .build();
+            if dialog.choose_future(Some(&state.window)).await == Ok(1) {
                 state.complete_paths(destinations.paths, None);
             }
         });
@@ -466,7 +496,7 @@ impl ChooserState {
                 if let Some(filename) = self.filename.as_ref() {
                     filename.set_text(&name.to_string_lossy());
                 }
-                self.accept_destinations(&folder, &[name]);
+                self.accept_destinations(folder, vec![name]);
             }
             _ => {}
         }
@@ -681,6 +711,7 @@ pub(crate) fn present_chooser(
         choices,
         read_only,
         error,
+        destination_check: Cell::new(false),
         completion: RefCell::new(Some(Box::new(completion))),
     });
 
@@ -917,6 +948,9 @@ fn install_shortcuts(
             focused == &sidebar_widget || focused.is_ancestor(&sidebar_widget)
         });
         if key == gtk::gdk::Key::Escape {
+            if state.dismiss_dropdown() {
+                return glib::Propagation::Stop;
+            }
             if state.view.cancel_new_entry() {
                 return glib::Propagation::Stop;
             }
