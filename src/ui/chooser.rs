@@ -379,7 +379,8 @@ impl ChooserState {
                     self.show_error("Choose an accessible local folder");
                     return;
                 };
-                match open_selection(&browser.selected_entries(), &current, *directory, *multiple) {
+                let entries = eligible_open_entries(browser.selected_entries(), *directory);
+                match open_selection(&entries, &current, *directory, *multiple) {
                     Ok(paths) => self.complete_paths(
                         paths,
                         self.read_only
@@ -501,6 +502,13 @@ impl ChooserState {
             _ => {}
         }
     }
+}
+
+fn eligible_open_entries(entries: Vec<FileEntry>, directory: bool) -> Vec<FileEntry> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.is_directory() == directory)
+        .collect()
 }
 
 pub(crate) fn present_chooser(

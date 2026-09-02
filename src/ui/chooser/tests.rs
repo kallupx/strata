@@ -94,6 +94,21 @@ fn chooser_previews_supported_files_but_not_directories() {
 }
 
 #[test]
+fn chooser_selection_excludes_navigation_items() {
+    let file = entry("notes.txt", EntryKind::File);
+    let folder = entry("folder", EntryKind::Directory);
+
+    assert_eq!(
+        eligible_open_entries(vec![folder.clone(), file.clone()], false),
+        [file]
+    );
+    assert_eq!(
+        eligible_open_entries(vec![folder.clone(), folder.clone()], true),
+        [folder.clone(), folder]
+    );
+}
+
+#[test]
 fn folder_accept_shortcut_requires_control_and_enter() {
     let control = gtk::gdk::ModifierType::CONTROL_MASK;
     let shift = gtk::gdk::ModifierType::SHIFT_MASK;
