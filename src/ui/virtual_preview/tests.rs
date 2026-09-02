@@ -537,15 +537,28 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
     assert!(!source_state.bound.borrow().is_empty());
     for bound in source_state.bound.borrow().values() {
         let view = bound.view.upgrade().expect("bound source view");
-        assert!(view.height() > 0);
+        assert!(view.height_request() >= view.measure(gtk::Orientation::Vertical, view.width()).0);
         assert!(view.buffer().char_count() > 0);
     }
 
     let mut heading = unit("Mixed supported and unsupported HTML");
     heading.kind = DocumentUnitKind::Heading(1);
+    let code = DocumentUnit {
+        kind: DocumentUnitKind::Code {
+            list_depth: Some(0),
+            language: None,
+        },
+        text: "code inside a list\nwith a second line".to_owned(),
+        copy_text: "code inside a list\nwith a second line\n".to_owned(),
+        spans: Vec::new(),
+        wrap: false,
+        first: true,
+        last: true,
+    };
     let units = vec![
         PreviewUnit::Document(heading),
         PreviewUnit::Document(unit("Safe text remains visible.")),
+        PreviewUnit::Document(code),
     ];
     let (rendered_root, rendered_state) =
         super::virtual_preview(units, vec!["Unsupported content omitted".to_owned()], false);
@@ -558,7 +571,7 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
     assert!(!rendered_state.bound.borrow().is_empty());
     for bound in rendered_state.bound.borrow().values() {
         let view = bound.view.upgrade().expect("bound rendered view");
-        assert!(view.height() > 0);
+        assert!(view.height_request() >= view.measure(gtk::Orientation::Vertical, view.width()).0);
         assert!(view.buffer().char_count() > 0);
     }
     window.close();

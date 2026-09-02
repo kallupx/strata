@@ -9,9 +9,7 @@ use serde::Deserialize;
 
 use super::{
     DocumentBlock, parse_markdown,
-    release_channel::{
-        BuildKind, Channel, ReleaseSummary, Version, best_update, rollback_target,
-    },
+    release_channel::{BuildKind, Channel, ReleaseSummary, Version, best_update, rollback_target},
 };
 
 const API_ROOT: &str = "https://api.github.com/repos/lgse/strata/releases";

@@ -205,6 +205,9 @@ fn virtual_preview(
             state_for_bind.units.clone(),
             document_tags_for_bind.as_ref(),
         );
+        if !source && let Some(view) = bound.view.upgrade() {
+            schedule_document_view_size(&view, row.width());
+        }
         let mut bound_rows = state_for_bind.bound.borrow_mut();
         bound_rows.retain(|_, bound| {
             bound
@@ -257,6 +260,24 @@ fn virtual_preview(
         .hexpand(true)
         .vexpand(true)
         .build();
+    if !source {
+        let weak_state = Rc::downgrade(&state);
+        let measured_width = Cell::new(0);
+        scroll
+            .hadjustment()
+            .connect_page_size_notify(move |adjustment| {
+                let width = adjustment.page_size().round() as i32;
+                if width <= 0 || measured_width.replace(width) == width {
+                    return;
+                }
+                let Some(state) = weak_state.upgrade() else {
+                    return;
+                };
+                for bound in state.bound.borrow().values() {
+                    size_document_row(bound, width);
+                }
+            });
+    }
     install_pointer_selection(&list, &scroll, state.clone());
     install_keyboard_selection(&list, state.clone());
 
@@ -443,6 +464,40 @@ fn source_row_views(
     Some((numbers, view))
 }
 
+fn size_document_row(bound: &BoundRow, width: i32) {
+    if !bound.root.upgrade().is_some_and(|row| row.is_mapped()) {
+        return;
+    }
+    let Some(view) = bound.view.upgrade() else {
+        return;
+    };
+    size_document_text_view(&view, width);
+}
+
+fn schedule_document_view_size(view: &super::document_view::DocumentTextView, fallback_width: i32) {
+    let view = view.downgrade();
+    glib::idle_add_local_once(move || {
+        let Some(view) = view.upgrade().filter(|view| view.is_mapped()) else {
+            return;
+        };
+        let width = if view.width() > 0 {
+            view.width()
+        } else {
+            fallback_width
+        };
+        size_document_text_view(&view, width);
+    });
+}
+
+fn size_document_text_view(view: &super::document_view::DocumentTextView, width: i32) {
+    view.set_height_request(-1);
+    let (minimum, natural, _, _) = view.measure(
+        gtk::Orientation::Vertical,
+        if width > 0 { width } else { -1 },
+    );
+    view.set_height_request(minimum.max(natural));
+}
+
 fn source_line_numbers_view(unit: &SourceUnit) -> gtk::TextView {
     let text = source_line_numbers(unit);
     let buffer = gtk::TextBuffer::new(None);
@@ -516,6 +571,7 @@ fn document_text_view(
     ensure_document_text_tags(&buffer);
     super::theme::register_document_buffer(&buffer);
     let view = super::document_view::DocumentTextView::new(&buffer, Vec::new());
+    view.connect_map(|view| schedule_document_view_size(view, view.width()));
     view.set_editable(false);
     view.set_cursor_visible(false);
     view.set_accepts_tab(false);
@@ -564,8 +620,6 @@ fn bind_document_text_view(view: &super::document_view::DocumentTextView, unit: 
     } else {
         gtk::WrapMode::WordChar
     });
-    let (_, height) = view.create_pango_layout(Some(&text)).pixel_size();
-    view.set_height_request(height.max(VIRTUAL_ROW_MIN_HEIGHT));
     set_document_accessibility(view, unit);
 }
 
