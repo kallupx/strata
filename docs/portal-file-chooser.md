@@ -25,6 +25,10 @@ sed "s|@STRATA_EXECUTABLE@|$strata_replacement|" \
   portal/org.freedesktop.impl.portal.desktop.strata.service.in \
   > "$data_home/dbus-1/services/org.freedesktop.impl.portal.desktop.strata.service"
 chmod 644 "$data_home/dbus-1/services/org.freedesktop.impl.portal.desktop.strata.service"
+gdbus call --session \
+  --dest org.freedesktop.DBus \
+  --object-path /org/freedesktop/DBus \
+  --method org.freedesktop.DBus.ReloadConfig
 ```
 
 The generated D-Bus service must contain an absolute `Exec=` path. If that path contains whitespace, install Strata somewhere else; D-Bus service-file argument parsing is not shell quoting.
@@ -73,6 +77,10 @@ Remove the Strata metadata and activation service:
 data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
 rm -f "$data_home/xdg-desktop-portal/portals/strata.portal" \
   "$data_home/dbus-1/services/org.freedesktop.impl.portal.desktop.strata.service"
+gdbus call --session \
+  --dest org.freedesktop.DBus \
+  --object-path /org/freedesktop/DBus \
+  --method org.freedesktop.DBus.ReloadConfig
 ```
 
 Edit `${XDG_CONFIG_HOME:-$HOME/.config}/xdg-desktop-portal/portals.conf`, remove `strata;` from the FileChooser preference while retaining the previous backend, then restart the portal:
