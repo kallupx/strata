@@ -510,6 +510,37 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
         gtk::glib::MainContext::default().iteration(false);
     }
     assert!(weak_source.upgrade().is_none());
+
+    let stack = gtk::Stack::new();
+    stack.add_named(&gtk::Label::new(Some("rendered")), Some("rendered"));
+    stack.set_visible_child_name("rendered");
+    let window = gtk::Window::builder()
+        .default_width(500)
+        .default_height(500)
+        .child(&stack)
+        .build();
+    window.present();
+    while gtk::glib::MainContext::default().pending() {
+        gtk::glib::MainContext::default().iteration(false);
+    }
+
+    let content = "<table><tr><td>cell</td></tr></table>".repeat(300);
+    let (source, _) = source_units(&content);
+    let units = source.into_iter().map(PreviewUnit::Source).collect();
+    let (source_root, source_state) = super::virtual_preview(units, Vec::new(), true);
+    stack.add_named(&source_root, Some("source"));
+    stack.set_visible_child_name("source");
+    while gtk::glib::MainContext::default().pending() {
+        gtk::glib::MainContext::default().iteration(false);
+    }
+    assert!(source_root.is_mapped());
+    assert!(!source_state.bound.borrow().is_empty());
+    for bound in source_state.bound.borrow().values() {
+        let view = bound.view.upgrade().expect("bound source view");
+        assert!(view.height() > 0);
+        assert!(view.buffer().char_count() > 0);
+    }
+    window.close();
 }
 
 fn document(unit: &PreviewUnit) -> &DocumentUnit {

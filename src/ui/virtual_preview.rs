@@ -463,8 +463,8 @@ fn source_line_numbers_view(unit: &SourceUnit) -> gtk::TextView {
 
 fn set_text_view_content(view: &gtk::TextView, text: &str, padding: i32) {
     view.buffer().set_text(text);
-    let (width, _) = view.create_pango_layout(Some(text)).pixel_size();
-    view.set_size_request(width.saturating_add(padding), -1);
+    let (width, height) = view.create_pango_layout(Some(text)).pixel_size();
+    view.set_size_request(width.saturating_add(padding), height);
 }
 
 fn clear_box(box_: &gtk::Box) {
