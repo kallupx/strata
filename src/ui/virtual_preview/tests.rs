@@ -6,10 +6,10 @@ use gtk::prelude::*;
 
 use super::{
     DocumentSelection, PreviewUnit, SelectionPoint, SourceUnit, VirtualPreviewState,
-    bounded_text_prefix, code_block_copy_text, drag_threshold_crossed, highlighted_code_language,
-    local_selection, matching_link, plain_text_view, rendered_document, selection_text,
-    source_line_numbers, source_line_numbers_view, source_units, styled_markup, use_virtual_source,
-    vertical_distance,
+    bind_source_row, bounded_text_prefix, code_block_copy_text, drag_threshold_crossed,
+    highlighted_code_language, local_selection, matching_link, plain_text_view, rendered_document,
+    selection_text, source_document, source_line_numbers, source_line_numbers_view, source_units,
+    styled_markup, use_virtual_source, vertical_distance,
 };
 use crate::{
     services::{DocumentLayout, DocumentSpan, DocumentSpanStyle, DocumentUnit, DocumentUnitKind},
@@ -259,7 +259,7 @@ fn code_copy_reassembles_one_virtualized_block() {
 }
 
 #[test]
-fn rendered_preview_releases_its_widget_tree() {
+fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
     let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
         .lock()
         .expect("the async test lock should not be poisoned");
@@ -297,6 +297,40 @@ fn rendered_preview_releases_its_widget_tree() {
     );
     drop((numbers, source_view));
 
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let first = SourceUnit {
+        display: "first".to_owned(),
+        source: "first".to_owned(),
+        first_line: 1,
+        line_count: 1,
+        continuation: false,
+    };
+    let first_view = bind_source_row(&row, &first)
+        .view
+        .upgrade()
+        .expect("source row should contain a text view");
+    let second = SourceUnit {
+        display: "second".to_owned(),
+        source: "second".to_owned(),
+        first_line: 2,
+        line_count: 1,
+        continuation: false,
+    };
+    let second_view = bind_source_row(&row, &second)
+        .view
+        .upgrade()
+        .expect("source row should retain its text view");
+    assert_eq!(first_view, second_view);
+    assert_eq!(
+        second_view.buffer().text(
+            &second_view.buffer().start_iter(),
+            &second_view.buffer().end_iter(),
+            false
+        ),
+        "second"
+    );
+    drop((first_view, second_view, row));
+
     let threshold = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     assert!(!drag_threshold_crossed(&threshold, 10.0, 10.0, 10.0, 10.0));
     assert!(drag_threshold_crossed(&threshold, 10.0, 10.0, 100.0, 100.0));
@@ -324,6 +358,14 @@ fn rendered_preview_releases_its_widget_tree() {
     }
 
     assert!(weak.upgrade().is_none());
+
+    let source_root = source_document(&"x".repeat(1024 * 1024), false);
+    let weak_source = source_root.downgrade();
+    drop(source_root);
+    while gtk::glib::MainContext::default().pending() {
+        gtk::glib::MainContext::default().iteration(false);
+    }
+    assert!(weak_source.upgrade().is_none());
 }
 
 fn document(unit: &PreviewUnit) -> &DocumentUnit {

@@ -210,7 +210,9 @@ fn virtual_preview(
         let Some(row) = item.child().and_downcast::<gtk::Box>() else {
             return;
         };
-        clear_box(&row);
+        if !source {
+            clear_box(&row);
+        }
         let index = item.position() as usize;
         let Some(unit) = state_for_bind.units.get(index) else {
             return;
@@ -253,7 +255,11 @@ fn virtual_preview(
                     .upgrade()
                     .is_some_and(|bound_row| bound_row != row)
             });
-            clear_box(&row);
+            if source {
+                clear_source_row(&row);
+            } else {
+                clear_box(&row);
+            }
         }
     });
 
@@ -356,26 +362,63 @@ fn bind_unit(
             bound.view.set(Some(&view));
             bound
         }
-        PreviewUnit::Source(unit) => {
-            let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            line.add_css_class("preview-source-row");
-            let numbers = source_line_numbers_view(unit);
-            let view = plain_text_view(&unit.display, true);
-            line.append(&numbers);
-            line.append(&view);
-            row.append(&line);
-            let bound = BoundRow::default();
-            bound.root.set(Some(row));
-            bound.view.set(Some(&view));
-            bound
-        }
+        PreviewUnit::Source(unit) => bind_source_row(row, unit),
     }
+}
+
+fn bind_source_row(row: &gtk::Box, unit: &SourceUnit) -> BoundRow {
+    let view = if let Some((numbers, view)) = source_row_views(row) {
+        let numbers_text = source_line_numbers(unit);
+        set_text_view_content(
+            &numbers,
+            &numbers_text,
+            numbers.left_margin() + numbers.right_margin(),
+        );
+        let text = normalize_preview_text(&unit.display);
+        set_text_view_content(view.upcast_ref(), &text, view.right_margin());
+        view.set_selection_range(None);
+        view
+    } else {
+        clear_box(row);
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        line.add_css_class("preview-source-row");
+        let numbers = source_line_numbers_view(unit);
+        let view = plain_text_view(&unit.display, true);
+        line.append(&numbers);
+        line.append(&view);
+        row.append(&line);
+        view
+    };
+    let bound = BoundRow::default();
+    bound.root.set(Some(row));
+    bound.view.set(Some(&view));
+    bound
+}
+
+fn source_row_views(
+    row: &gtk::Box,
+) -> Option<(gtk::TextView, super::document_view::DocumentTextView)> {
+    let line = row.first_child()?.downcast::<gtk::Box>().ok()?;
+    let numbers = line.first_child()?.downcast::<gtk::TextView>().ok()?;
+    let view = numbers
+        .next_sibling()?
+        .downcast::<super::document_view::DocumentTextView>()
+        .ok()?;
+    Some((numbers, view))
+}
+
+fn clear_source_row(row: &gtk::Box) {
+    let Some((numbers, view)) = source_row_views(row) else {
+        return;
+    };
+    numbers.buffer().set_text("");
+    view.buffer().set_text("");
+    view.set_selection_range(None);
 }
 
 fn source_line_numbers_view(unit: &SourceUnit) -> gtk::TextView {
     let text = source_line_numbers(unit);
     let buffer = gtk::TextBuffer::new(None);
-    buffer.set_text(&text);
     let view = gtk::TextView::with_buffer(&buffer);
     view.set_editable(false);
     view.set_cursor_visible(false);
@@ -387,12 +430,14 @@ fn source_line_numbers_view(unit: &SourceUnit) -> gtk::TextView {
     view.add_css_class("preview-source-lines");
     view.set_left_margin(2);
     view.set_right_margin(6);
-    let (width, _) = view.create_pango_layout(Some(&text)).pixel_size();
-    view.set_size_request(
-        width.saturating_add(view.left_margin() + view.right_margin()),
-        -1,
-    );
+    set_text_view_content(&view, &text, view.left_margin() + view.right_margin());
     view
+}
+
+fn set_text_view_content(view: &gtk::TextView, text: &str, padding: i32) {
+    view.buffer().set_text(text);
+    let (width, _) = view.create_pango_layout(Some(text)).pixel_size();
+    view.set_size_request(width.saturating_add(padding), -1);
 }
 
 fn clear_box(box_: &gtk::Box) {
@@ -404,7 +449,6 @@ fn clear_box(box_: &gtk::Box) {
 fn plain_text_view(text: &str, source: bool) -> super::document_view::DocumentTextView {
     let text = normalize_preview_text(text);
     let buffer = gtk::TextBuffer::new(None);
-    buffer.set_text(&text);
     assert!(
         buffer
             .tag_table()
@@ -426,8 +470,7 @@ fn plain_text_view(text: &str, source: bool) -> super::document_view::DocumentTe
         "preview-document"
     });
     super::theme::register_document_view(&view);
-    let (text_width, _) = view.create_pango_layout(Some(&text)).pixel_size();
-    view.set_size_request(text_width.saturating_add(view.right_margin()), -1);
+    set_text_view_content(view.upcast_ref(), &text, view.right_margin());
     view.set_hexpand(true);
     view
 }
