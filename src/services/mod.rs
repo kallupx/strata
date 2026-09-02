@@ -9,12 +9,13 @@ mod update_install;
 
 pub use file_source::{
     DirectoryChange, DirectoryEvent, DirectoryRequest, FileSource, LoadHandle,
-    LocationValidationError, RequestId, backend_unavailable_message, uri_has_embedded_password,
+    LocationValidationError, RequestId, UriCredentials, backend_unavailable_message,
+    sanitize_uri_credentials, validate_uri_credentials,
 };
 pub use operations::{
-    ArchiveFormat, CompressRequest, CreateDirectoryRequest, CreateFileRequest, DeleteRequest,
-    ExtractRequest, OperationEvent, OperationProvider, OperationRequestId, PasteItem, PasteRequest,
-    RenameRequest, RestoreRequest, TransferConflict, validate_basename,
+    ArchiveFormat, CancelledOperation, CompressRequest, CreateDirectoryRequest, CreateFileRequest,
+    DeleteRequest, ExtractRequest, OperationEvent, OperationProvider, OperationRequestId,
+    PasteItem, PasteRequest, RenameRequest, RestoreRequest, TransferConflict, validate_basename,
 };
 pub use preview::{
     Preview, PreviewContent, PreviewEvent, PreviewProvider, PreviewRequest, PreviewRequestId,

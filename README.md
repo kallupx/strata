@@ -282,7 +282,8 @@ Plain-text and source previews are different: they stay in process because they 
 Build requirements are the latest stable Rust toolchain, a C toolchain, `pkg-config`, GTK 4.12+, GtkSourceView 5, Poppler GLib, and Fontconfig. On Arch:
 
 ```bash
-sudo pacman -S --needed base-devel rust bubblewrap fontconfig gtk4 gtksourceview5 poppler-glib
+sudo pacman -S --needed base-devel rust bubblewrap ffmpeg ffmpegthumbnailer fontconfig \
+  gst-libav gst-plugins-good gtk4 gtksourceview5 poppler-glib
 make start-dev        # rebuild and restart as files change
 ./scripts/check.sh    # format, compile, Clippy, tests, and optional policy checks
 ```

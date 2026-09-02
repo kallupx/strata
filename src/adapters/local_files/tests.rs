@@ -179,14 +179,35 @@ fn unmounted_network_shares_are_treated_as_directories() {
 #[test]
 fn native_files_are_located_by_their_real_path() {
     let file = gio::File::for_path("/tmp");
-    assert_eq!(location_for_file(&file), Location::local("/tmp"));
+    assert_eq!(location_for_file(&file), Some(Location::local("/tmp")));
 }
 
 #[test]
 fn gvfs_backed_files_use_their_uri_even_when_a_fuse_path_exists() {
     let file = gio::File::for_uri("smb://host/share");
     assert!(!file.is_native(), "smb:// should never be reported native");
-    assert_eq!(location_for_file(&file), Location::uri(file.uri()));
+    assert_eq!(location_for_file(&file), Some(Location::uri(file.uri())));
+}
+
+#[test]
+fn gio_files_with_embedded_credentials_are_sanitized() {
+    for uri in [
+        "smb://user%3Asecret@host/share",
+        "smb://user;password=secret@host/share",
+        "smb://user%3Bpassword=secret@host/share",
+        "smb://user:secret@host/share",
+    ] {
+        let location = location_for_file(&gio::File::for_uri(uri))
+            .expect("credential URI should produce a sanitized location");
+        assert_eq!(
+            location
+                .uri_value()
+                .expect("remote location should have a URI")
+                .trim_end_matches('/'),
+            "smb://user@host/share",
+            "did not sanitize {uri}"
+        );
+    }
 }
 
 #[test]
@@ -233,6 +254,30 @@ fn coalescing_preserves_a_move_when_metadata_follows_it() {
     );
 
     assert!(matches!(change, PendingMonitorChange::Move { .. }));
+}
+
+#[test]
+fn large_monitor_bursts_collapse_to_one_rescan() {
+    let mut pending = HashMap::new();
+    for index in 0..=MAX_PENDING_MONITOR_CHANGES {
+        let path = PathBuf::from(format!("/fixture/{index}"));
+        assert!(queue_monitor_change(
+            &mut pending,
+            path.clone(),
+            PendingMonitorChange::Upsert(path),
+        ));
+    }
+
+    assert_eq!(pending.len(), 1);
+    assert!(matches!(
+        pending.get(Path::new("")),
+        Some(PendingMonitorChange::Rescan)
+    ));
+    assert!(!queue_monitor_change(
+        &mut pending,
+        "/fixture/ignored".into(),
+        PendingMonitorChange::Remove("/fixture/ignored".into()),
+    ));
 }
 
 #[test]

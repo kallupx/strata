@@ -16,6 +16,12 @@ pub struct Location {
     kind: LocationKind,
 }
 
+pub(crate) fn uri_contains_credentials(uri: &gio::glib::Uri) -> bool {
+    uri.password().is_some()
+        || uri.auth_params().is_some()
+        || uri.user().is_some_and(|user| user.contains([':', ';']))
+}
+
 impl Location {
     pub fn local(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -122,7 +128,19 @@ impl Location {
     pub fn display_path(&self) -> String {
         match &self.kind {
             LocationKind::Native(path) => path.to_string_lossy().into_owned(),
-            LocationKind::Uri(uri) => uri.clone(),
+            LocationKind::Uri(uri) => gio::glib::Uri::parse(
+                uri,
+                gio::glib::UriFlags::HAS_PASSWORD | gio::glib::UriFlags::HAS_AUTH_PARAMS,
+            )
+            .map(|uri| {
+                let hidden = if uri_contains_credentials(&uri) {
+                    gio::glib::UriHideFlags::USERINFO
+                } else {
+                    gio::glib::UriHideFlags::empty()
+                };
+                uri.to_string_partial(hidden).to_string()
+            })
+            .unwrap_or_else(|_| "<invalid-uri>".into()),
         }
     }
 

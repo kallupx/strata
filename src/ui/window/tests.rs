@@ -5,7 +5,8 @@ use std::path::Path;
 use super::{
     MouseHistoryAction, PinStatus, is_sidebar_focus_shortcut, is_smb_location,
     is_standard_place_location, mouse_history_action, parse_pinned_places, pin_status,
-    remove_pinned_place, reorder_places, should_show_standard_place, vim_focus_direction,
+    remove_pinned_place, reorder_places, serialize_pinned_places, should_show_standard_place,
+    vim_focus_direction,
 };
 
 #[test]
@@ -98,6 +99,61 @@ fn gtk_bookmarks_become_native_and_remote_pinned_places() {
     );
     assert_eq!(places[1].1, "Remote");
     assert_eq!(places.len(), 2);
+}
+
+#[test]
+fn gtk_bookmarks_sanitize_uris_with_credentials() {
+    let places = parse_pinned_places(
+        "smb://alice@host/safe Safe\nsmb://alice:secret@host/private Password\nsmb://alice%3Asecret@host/private Encoded password delimiter\nsmb://alice;password=secret@host/private Auth\nsmb://alice%3Bpassword=secret@host/private Encoded auth delimiter\nsmb://alice;password=sec%72et@host/private Encoded value\nsmb://alice%ZZ@host/private Invalid\n",
+    );
+
+    assert_eq!(places.len(), 2);
+    assert_eq!(
+        places[0]
+            .0
+            .uri_value()
+            .expect("remote place should have a URI")
+            .trim_end_matches('/'),
+        "smb://alice@host/safe"
+    );
+    assert_eq!(
+        places[1]
+            .0
+            .uri_value()
+            .expect("remote place should have a URI")
+            .trim_end_matches('/'),
+        "smb://alice@host/private"
+    );
+}
+
+#[test]
+fn gtk_bookmark_serialization_sanitizes_uris_with_credentials() {
+    let places = vec![
+        (
+            crate::model::Location::uri("smb://alice@host/safe"),
+            "Safe".to_owned(),
+        ),
+        (
+            crate::model::Location::uri("smb://alice:secret@host/private"),
+            "Password".to_owned(),
+        ),
+        (
+            crate::model::Location::uri("smb://alice;password=secret@host/private"),
+            "Auth".to_owned(),
+        ),
+        (
+            crate::model::Location::uri("smb://alice%3Asecret@host/private"),
+            "Encoded".to_owned(),
+        ),
+    ];
+
+    assert_eq!(
+        serialize_pinned_places(&places),
+        "smb://alice@host/safe Safe\n\
+         smb://alice@host/private Password\n\
+         smb://alice@host/private Auth\n\
+         smb://alice@host/private Encoded\n"
+    );
 }
 
 #[test]

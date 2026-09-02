@@ -4,7 +4,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     io::ErrorKind,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -15,11 +15,12 @@ use crate::{
     model::{EntryKind, FileEntry, Location, MetadataValue},
     services::{
         DirectoryChange, DirectoryEvent, DirectoryRequest, FileSource, LoadHandle,
-        LocationValidationError, RequestId, backend_unavailable_message,
+        LocationValidationError, RequestId, backend_unavailable_message, sanitize_uri_credentials,
     },
 };
 
 const ATTRIBUTES: &str = "standard::display-name,standard::name,standard::type,standard::is-hidden,standard::is-symlink,standard::size,time::modified";
+const MAX_PENDING_MONITOR_CHANGES: usize = 256;
 
 #[derive(Default)]
 pub struct LocalFileSource;
@@ -45,13 +46,16 @@ fn map_validation_error(error: std::io::Error) -> LocationValidationError {
 /// SFTP, ...) can still return a `.path()` via its FUSE mirror even though the
 /// file isn't native; using that path would leak the mirror's opaque
 /// `/run/user/$UID/gvfs/...` location instead of the clean URI (lgse/strata#5).
-pub(crate) fn location_for_file(file: &gio::File) -> Location {
+/// Returns `None` when GIO provides a malformed URI.
+pub(crate) fn location_for_file(file: &gio::File) -> Option<Location> {
     if file.is_native()
         && let Some(path) = file.path()
     {
-        return Location::local(path);
+        return Some(Location::local(path));
     }
-    Location::uri(file.uri())
+    let uri = file.uri();
+    let (sanitized, _) = sanitize_uri_credentials(&uri).ok()?;
+    Some(Location::uri(sanitized))
 }
 
 fn uri_validation_result(
@@ -227,9 +231,9 @@ impl FileSource for LocalFileSource {
                         let entries: Vec<_> = files
                             .into_iter()
                             .filter(|info| request.include_hidden || !info_is_hidden(info))
-                            .map(|info| {
+                            .filter_map(|info| {
                                 let child = directory.child(info.name());
-                                entry_from_info(location_for_file(&child), info)
+                                Some(entry_from_info(location_for_file(&child)?, info))
                             })
                             .collect();
                         total_entries += entries.len();
@@ -305,6 +309,9 @@ impl FileSource for LocalFileSource {
         let timeout_for_change = timeout.clone();
         let cancelled_for_change = cancelled.clone();
         monitor.connect_changed(move |_, file, other_file, event| {
+            if pending_for_change.borrow().contains_key(Path::new("")) {
+                return;
+            }
             let path = file.path();
             let other_path = other_file.and_then(gio::File::path);
             let change = match event {
@@ -338,13 +345,9 @@ impl FileSource for LocalFileSource {
                 PendingMonitorChange::Move { to, .. } => to.clone(),
                 PendingMonitorChange::Rescan => PathBuf::new(),
             };
-            pending_for_change
-                .borrow_mut()
-                .entry(key)
-                .and_modify(|pending| {
-                    *pending = merge_pending_change(pending.clone(), change.clone());
-                })
-                .or_insert(change);
+            if !queue_monitor_change(&mut pending_for_change.borrow_mut(), key, change) {
+                return;
+            }
 
             if let Some(source) = timeout_for_change.take() {
                 source.remove();
@@ -382,6 +385,27 @@ fn log_directory_load_started(request_id: RequestId, location: &Location) {
         location = %location.diagnostic_path(),
         "directory load location"
     );
+}
+
+fn queue_monitor_change(
+    pending: &mut HashMap<PathBuf, PendingMonitorChange>,
+    key: PathBuf,
+    change: PendingMonitorChange,
+) -> bool {
+    if pending.contains_key(Path::new("")) {
+        return false;
+    }
+    pending
+        .entry(key)
+        .and_modify(|pending| {
+            *pending = merge_pending_change(pending.clone(), change.clone());
+        })
+        .or_insert(change);
+    if pending.len() > MAX_PENDING_MONITOR_CHANGES {
+        pending.clear();
+        pending.insert(PathBuf::new(), PendingMonitorChange::Rescan);
+    }
+    true
 }
 
 fn merge_pending_change(

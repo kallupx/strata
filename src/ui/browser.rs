@@ -2,6 +2,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashSet,
     future::Future,
     path::Path,
     pin::Pin,
@@ -16,9 +17,10 @@ use crate::{
     app::{Browser, BrowserEvent},
     model::{EntryKind, FileEntry, Location, SortDirection, SortKey},
     services::{
-        ArchiveFormat, FileSource, LocationValidationError, OperationProvider, PasteItem,
-        PreviewContent, TransferConflict, backend_unavailable_message, content_family,
-        has_plain_text_extension, validate_basename,
+        ArchiveFormat, FileSource, LoadHandle, LocationValidationError, OperationProvider,
+        PasteItem, PreviewContent, SearchEvent, TransferConflict, UriCredentials,
+        backend_unavailable_message, content_family, has_plain_text_extension, index_tree,
+        sanitize_uri_credentials, validate_basename,
     },
 };
 
@@ -68,6 +70,7 @@ struct ColumnView {
     bound_rows: Rc<RefCell<Vec<BoundRow>>>,
     entry_count: Rc<Cell<usize>>,
     spinner: gtk::Spinner,
+    empty_trash_button: Option<gtk::Button>,
     new_entry_row: gtk::Box,
     new_entry_icon: gtk::Image,
     new_entry_entry: gtk::Entry,
@@ -95,6 +98,12 @@ struct DeleteProgressView {
     status: gtk::Label,
 }
 
+struct TrashLoadingView {
+    layer: gtk::Box,
+    overlay: gtk::Overlay,
+    blurred_root: Option<BlurBin>,
+}
+
 struct PeekView {
     revealer: gtk::Revealer,
     location: Location,
@@ -105,17 +114,22 @@ struct PeekView {
     spinner: gtk::Spinner,
 }
 
+pub(super) fn loading_skeleton() -> gtk::Box {
+    let skeleton = gtk::Box::new(gtk::Orientation::Vertical, 9);
+    skeleton.add_css_class("loading-skeleton");
+    for width in [168, 124, 192, 148, 176, 112] {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        row.add_css_class("skeleton-row");
+        row.set_size_request(width, 10);
+        row.set_halign(gtk::Align::Start);
+        skeleton.append(&row);
+    }
+    skeleton
+}
+
 impl LoadPresentation {
     fn new(content: &impl IsA<gtk::Widget>, retry: Option<gtk::Button>) -> Self {
-        let skeleton = gtk::Box::new(gtk::Orientation::Vertical, 9);
-        skeleton.add_css_class("loading-skeleton");
-        for width in [168, 124, 192, 148, 176, 112] {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            row.add_css_class("skeleton-row");
-            row.set_size_request(width, 10);
-            row.set_halign(gtk::Align::Start);
-            skeleton.append(&row);
-        }
+        let skeleton = loading_skeleton();
 
         let feedback = gtk::Box::new(gtk::Orientation::Vertical, 8);
         feedback.add_css_class("directory-feedback");
@@ -196,7 +210,7 @@ impl Default for PeekBehavior {
         Self {
             open_delay: Duration::from_millis(180),
             close_delay: Duration::from_millis(80),
-            fade_duration: Duration::from_millis(100),
+            fade_duration: Duration::from_millis(150),
             item_limit: 8,
         }
     }
@@ -274,9 +288,13 @@ pub(super) struct ViewState {
     delete_progress: RefCell<Option<DeleteProgressView>>,
     pin_handler: RefCell<Option<PinHandler>>,
     pin_status_handler: RefCell<Option<PinStatusHandler>>,
-    pending_select: RefCell<Option<String>>,
+    pending_select: RefCell<Vec<String>>,
     pending_extract_retry: RefCell<Option<(FileEntry, Location)>>,
     pending_navigate: RefCell<Option<Location>>,
+    pending_location_credentials: RefCell<Option<MountCredentials>>,
+    pending_trash_summary: RefCell<Option<LoadHandle>>,
+    pending_empty_trash: RefCell<Option<LoadHandle>>,
+    trash_loading: RefCell<Option<TrashLoadingView>>,
     browser: Rc<Browser>,
 }
 
@@ -416,9 +434,13 @@ impl BrowserView {
             delete_progress: RefCell::new(None),
             pin_handler: RefCell::new(None),
             pin_status_handler: RefCell::new(None),
-            pending_select: RefCell::new(None),
+            pending_select: RefCell::new(Vec::new()),
             pending_extract_retry: RefCell::new(None),
             pending_navigate: RefCell::new(None),
+            pending_location_credentials: RefCell::new(None),
+            pending_trash_summary: RefCell::new(None),
+            pending_empty_trash: RefCell::new(None),
+            trash_loading: RefCell::new(None),
             browser,
         });
 
@@ -1029,7 +1051,6 @@ impl ViewState {
         sources: Vec<Location>,
         move_sources: bool,
     ) {
-        let clear_cut = move_sources && same_locations(&sources, &self.cut_locations.borrow());
         let mut accepted = Vec::new();
         let mut collisions = Vec::new();
         for source in sources {
@@ -1042,13 +1063,7 @@ impl ViewState {
                 });
             }
         }
-        self.resolve_transfer_collisions(
-            destination,
-            collisions,
-            accepted,
-            move_sources,
-            clear_cut,
-        );
+        self.resolve_transfer_collisions(destination, collisions, accepted, move_sources);
     }
 
     fn resolve_transfer_collisions(
@@ -1057,17 +1072,8 @@ impl ViewState {
         mut collisions: Vec<Location>,
         accepted: Vec<PasteItem>,
         move_sources: bool,
-        clear_cut: bool,
     ) {
         if collisions.is_empty() {
-            if clear_cut {
-                self.complete_cut_transfer(
-                    &accepted
-                        .iter()
-                        .map(|item| item.source.clone())
-                        .collect::<Vec<_>>(),
-                );
-            }
             self.browser.transfer(destination, accepted, move_sources);
             return;
         }
@@ -1111,7 +1117,7 @@ impl ViewState {
         let cancel = layout.cancel;
         let replace = layout.confirm;
 
-        let layer = modal_layer(&content);
+        let layer = modal_layer(&content, &window_overlay, blurred_root.clone(), None);
         window_overlay.add_overlay(&layer);
         let cancel_layer = layer.clone();
         let cancel_overlay = window_overlay.clone();
@@ -1139,7 +1145,6 @@ impl ViewState {
                 },
                 skipped_accepted.clone(),
                 move_sources,
-                clear_cut,
             );
         });
 
@@ -1169,24 +1174,28 @@ impl ViewState {
                 remaining,
                 accepted,
                 move_sources,
-                clear_cut,
             );
         });
 
         let escape = gtk::EventControllerKey::new();
+        escape.set_propagation_phase(gtk::PropagationPhase::Capture);
         let escaped_layer = layer.clone();
         let escaped_overlay = window_overlay;
         let escaped_root = blurred_root;
+        let enter_replace = replace.clone();
         escape.connect_key_pressed(move |_, key, _, _| {
             if key == gtk::gdk::Key::Escape {
                 dismiss_modal_layer(&escaped_layer, &escaped_overlay, escaped_root.as_ref());
+                glib::Propagation::Stop
+            } else if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
+                enter_replace.emit_clicked();
                 glib::Propagation::Stop
             } else {
                 glib::Propagation::Proceed
             }
         });
         layer.add_controller(escape);
-        cancel.grab_focus();
+        replace.grab_focus();
     }
 
     fn copy_entries(&self, entries: &[FileEntry]) {
@@ -1212,9 +1221,7 @@ impl ViewState {
     }
 
     fn complete_cut_transfer(&self, transferred: &[Location]) {
-        self.cut_locations
-            .borrow_mut()
-            .retain(|location| !transferred.contains(location));
+        retain_untransferred(&mut self.cut_locations.borrow_mut(), transferred);
         let remaining = self.cut_locations.borrow().clone();
         if remaining.is_empty() {
             if let Some(display) = gtk::gdk::Display::default() {
@@ -1231,6 +1238,7 @@ impl ViewState {
     fn refresh_cut_rows(&self) {
         let cut = self.cut_locations.borrow();
         self.mode_views.borrow().set_cut_locations(&cut);
+        let cut_lookup: HashSet<_> = cut.iter().collect();
         for (depth, column) in self.columns.borrow().iter().enumerate() {
             column.bound_rows.borrow_mut().retain(|bound| {
                 let (Some(item), Some(row)) = (bound.item.upgrade(), bound.row.upgrade()) else {
@@ -1242,7 +1250,7 @@ impl ViewState {
                     item.position(),
                 )
                 .and_then(|position| self.browser.entry_at(depth, position))
-                .is_some_and(|entry| cut.contains(&entry.location));
+                .is_some_and(|entry| cut_lookup.contains(&entry.location));
                 set_cut_path_style(&row, is_cut);
                 true
             });
@@ -1268,7 +1276,7 @@ impl ViewState {
             };
             let sources = files
                 .into_iter()
-                .map(|file| location_for_file(&file))
+                .filter_map(|file| location_for_file(&file))
                 .collect::<Vec<_>>();
             if let Some(state) = weak.upgrade() {
                 let move_sources = same_locations(&sources, &state.cut_locations.borrow());
@@ -1321,7 +1329,7 @@ impl ViewState {
         let field_label = form_label("Destination folder");
         let field = form_entry();
         field.set_hexpand(true);
-        field.set_placeholder_text(Some("Type a folder path…"));
+        field.set_placeholder_text(Some("Search for a folder…"));
         field.set_text(&folder_input_path(&base));
         field.set_position(-1);
         layout.body.append(&field_label);
@@ -1355,31 +1363,39 @@ impl ViewState {
         let pending_creation = Rc::new(RefCell::new(None::<std::path::PathBuf>));
         let creating_destination = Rc::new(Cell::new(false));
         let suggestions_box = suggestions.clone();
-        let suggestions_generation = generation.clone();
-        let suggestions_base = base.clone();
         let suggestions_error = error.clone();
         let changed_confirm = confirm.clone();
         let changed_creation = pending_creation.clone();
-        field.connect_changed(move |field| {
-            field.remove_css_class("error");
-            suggestions_error.set_visible(false);
-            suggestions_error.remove_css_class("warning");
-            suggestions_error.add_css_class("error");
-            changed_creation.borrow_mut().take();
-            changed_confirm.set_label(if move_sources {
-                "Move here"
-            } else {
-                "Copy here"
-            });
-            refresh_transfer_suggestions(
-                field,
-                &suggestions_box,
-                &suggestions_generation,
-                suggestions_base.clone(),
-            );
-        });
+        setup_transfer_search(
+            &field,
+            &suggestions_box,
+            &generation,
+            base.clone(),
+            move |field| {
+                field.remove_css_class("error");
+                suggestions_error.set_visible(false);
+                suggestions_error.remove_css_class("warning");
+                suggestions_error.add_css_class("error");
+                changed_creation.borrow_mut().take();
+                changed_confirm.set_label(if move_sources {
+                    "Move here"
+                } else {
+                    "Copy here"
+                });
+            },
+        );
 
-        let layer = modal_layer(&content);
+        let initial_text = folder_input_path(&base);
+        let dirty_field = field.clone();
+        let dirty_creating = creating_destination.clone();
+        let layer = modal_layer(
+            &content,
+            &window_overlay,
+            blurred_root.clone(),
+            Some(Rc::new(move || {
+                dirty_creating.get() || dirty_field.text() != initial_text
+            })),
+        );
         window_overlay.add_overlay(&layer);
         let cancel_layer = layer.clone();
         let cancel_overlay = window_overlay.clone();
@@ -1447,6 +1463,11 @@ impl ViewState {
                 transfer_state
                     .pending_navigate
                     .replace(Some(Location::local(path.clone())));
+                let names: Vec<String> = sources
+                    .iter()
+                    .filter_map(|s| s.native_path()?.file_name()?.to_str().map(String::from))
+                    .collect();
+                transfer_state.pending_select.borrow_mut().extend(names);
                 transfer_state.start_transfer(Location::local(path), sources.clone(), move_sources);
                 dismiss_modal_layer(&confirm_layer, &confirm_overlay, confirm_root.as_ref());
                 return;
@@ -1478,6 +1499,13 @@ impl ViewState {
                         created_state
                             .pending_navigate
                             .replace(Some(Location::local(path.clone())));
+                        let names: Vec<String> = created_sources
+                            .iter()
+                            .filter_map(|s| {
+                                s.native_path()?.file_name()?.to_str().map(String::from)
+                            })
+                            .collect();
+                        created_state.pending_select.borrow_mut().extend(names);
                         created_state.start_transfer(
                             Location::local(path),
                             created_sources,
@@ -1548,7 +1576,7 @@ impl ViewState {
         });
         layer.add_controller(escape);
 
-        refresh_transfer_suggestions(&field, &suggestions, &generation, base);
+        field.emit_by_name::<()>("changed", &[]);
         field.grab_focus();
     }
 
@@ -1558,6 +1586,7 @@ impl ViewState {
         icon: &str,
         title_text: &str,
         subtitle_text: &str,
+        on_cancel: Rc<dyn Fn()>,
     ) {
         self.dismiss_delete_progress();
         let Some(window_overlay) = self
@@ -1589,7 +1618,7 @@ impl ViewState {
         let content = layout.content;
         let cancel = layout.confirm;
 
-        let layer = modal_layer(&content);
+        let layer = modal_layer(&content, &window_overlay, blurred_root.clone(), None);
         window_overlay.add_overlay(&layer);
         self.delete_progress.replace(Some(DeleteProgressView {
             layer,
@@ -1598,13 +1627,13 @@ impl ViewState {
             progress,
             status,
         }));
-        let browser = self.browser.clone();
-        cancel.connect_clicked(move |_| browser.cancel_file_operation());
+        let cancel_action = on_cancel.clone();
+        cancel.connect_clicked(move |_| cancel_action());
         let escape = gtk::EventControllerKey::new();
-        let escape_browser = self.browser.clone();
+        let escape_action = on_cancel;
         escape.connect_key_pressed(move |_, key, _, _| {
             if key == gtk::gdk::Key::Escape {
-                escape_browser.cancel_file_operation();
+                escape_action();
                 glib::Propagation::Stop
             } else {
                 glib::Propagation::Proceed
@@ -1653,7 +1682,183 @@ impl ViewState {
         dismiss_modal_layer(&view.layer, &view.overlay, view.blurred_root.as_ref());
     }
 
+    /// The total item count isn't known upfront -- entries are deleted as they're enumerated,
+    /// one bounded batch at a time -- so this pulses rather than fills to a fraction.
+    fn show_empty_trash_progress(self: &Rc<Self>, on_cancel: Rc<dyn Fn()>) {
+        self.show_file_operation_progress(
+            0,
+            crate::assets::icons::TRASH,
+            "Emptying Trash",
+            "This may take a moment",
+            on_cancel,
+        );
+        self.update_empty_trash_progress(0);
+    }
+
+    fn update_empty_trash_progress(&self, processed: usize) {
+        let progress_view = self.delete_progress.borrow();
+        let Some(view) = progress_view.as_ref() else {
+            return;
+        };
+        view.status
+            .set_text(&format!("{} deleted", item_count_label(processed)));
+        view.progress.pulse();
+    }
+
+    /// Safe to call more than once: whichever of cancel or completion runs first leaves the
+    /// other a no-op.
+    fn clear_empty_trash(&self) {
+        self.pending_empty_trash.borrow_mut().take();
+        self.dismiss_delete_progress();
+    }
+
     fn load_trash_summary(self: &Rc<Self>) {
+        let trash_empty = self
+            .columns
+            .borrow()
+            .iter()
+            .find(|column| column.empty_trash_button.is_some())
+            .is_some_and(|column| column.entry_count.get() == 0);
+        if trash_empty {
+            return;
+        }
+        self.show_trash_loading_indicator();
+        let weak = Rc::downgrade(self);
+        let started = Instant::now();
+        let task = glib::MainContext::default().spawn_local(async move {
+            // Let GTK paint the loading dialog before beginning a walk whose GIO futures may be
+            // immediately ready for long stretches on a fast local trash backend.
+            glib::timeout_future(Duration::from_millis(16)).await;
+            let trash = gio::File::for_uri("trash:///");
+            match summarize_trash(&trash).await {
+                Ok(summary) if summary.item_count > 0 => {
+                    if summary.truncated {
+                        tracing::warn!(
+                            item_count = summary.item_count,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "trash summary truncated"
+                        );
+                    } else {
+                        tracing::info!(
+                            item_count = summary.item_count,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "trash summary built"
+                        );
+                    }
+                    if let Some(state) = weak.upgrade() {
+                        state.clear_trash_loading();
+                        state.show_empty_trash_confirmation(summary);
+                    }
+                }
+                Ok(_) => {
+                    if let Some(state) = weak.upgrade() {
+                        state.clear_trash_loading();
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error_domain = ?error.domain(),
+                        error_code = error.code(),
+                        "trash summary failed"
+                    );
+                    if let Some(state) = weak.upgrade() {
+                        state.clear_trash_loading();
+                        show_error_dialog(
+                            &state.overlay,
+                            "Unable to read Trash",
+                            &error.to_string(),
+                        );
+                    }
+                }
+            }
+        });
+        self.pending_trash_summary
+            .replace(Some(LoadHandle::new(move || {
+                tracing::debug!("trash summary cancelled");
+                task.abort();
+            })));
+    }
+
+    /// The walk is bounded but can still take a few seconds on a large trash, hence the indicator.
+    fn show_trash_loading_indicator(self: &Rc<Self>) {
+        self.dismiss_trash_loading();
+        let Some(window_overlay) = self
+            .overlay
+            .root()
+            .and_downcast::<gtk::Window>()
+            .and_then(|window| window.child())
+            .and_downcast::<gtk::Overlay>()
+        else {
+            return;
+        };
+        let blurred_root = window_overlay.child().and_downcast::<BlurBin>();
+        if let Some(root) = blurred_root.as_ref() {
+            root.set_blurred(true);
+        }
+
+        let layout = modal_layout(
+            crate::assets::icons::TRASH,
+            "Measuring Trash…",
+            "",
+            "Empty Trash",
+        );
+        layout.set_loading(true, Some("Measuring Trash…"));
+        layout.subtitle.set_visible(false);
+        layout.confirm.set_visible(false);
+        let explanation = message_dialog_description(
+            "Calculating the number and size of items. This may take a few seconds.",
+        );
+        layout.body.append(&explanation);
+        let content = layout.content;
+        let cancel = layout.cancel;
+
+        let layer = modal_layer(&content, &window_overlay, blurred_root.clone(), None);
+        window_overlay.add_overlay(&layer);
+        self.trash_loading.replace(Some(TrashLoadingView {
+            layer,
+            overlay: window_overlay,
+            blurred_root,
+        }));
+
+        let weak = Rc::downgrade(self);
+        cancel.connect_clicked(move |_| {
+            if let Some(state) = weak.upgrade() {
+                state.clear_trash_loading();
+            }
+        });
+        let escape = gtk::EventControllerKey::new();
+        let weak_escape = Rc::downgrade(self);
+        escape.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                if let Some(state) = weak_escape.upgrade() {
+                    state.clear_trash_loading();
+                }
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        if let Some(view) = self.trash_loading.borrow().as_ref() {
+            view.layer.add_controller(escape);
+        }
+        cancel.grab_focus();
+    }
+
+    fn dismiss_trash_loading(&self) {
+        let Some(view) = self.trash_loading.take() else {
+            return;
+        };
+        dismiss_modal_layer(&view.layer, &view.overlay, view.blurred_root.as_ref());
+    }
+
+    /// Safe to call more than once: whichever of cancel or completion runs first leaves the
+    /// other a no-op.
+    fn clear_trash_loading(&self) {
+        self.pending_trash_summary.borrow_mut().take();
+        self.dismiss_trash_loading();
+    }
+
+    fn show_empty_trash_confirmation(self: &Rc<Self>, summary: TrashSummary) {
         let Some(window_overlay) = self
             .overlay
             .root()
@@ -1671,25 +1876,26 @@ impl ViewState {
         let layout = message_dialog_layout(
             crate::assets::icons::TRASH,
             "Empty Trash?",
-            "Calculating items and size…",
+            &format!(
+                "{}{} · {}{} will be reclaimed",
+                if summary.truncated { "At least " } else { "" },
+                item_count_label(summary.item_count),
+                if summary.truncated { "at least " } else { "" },
+                format_file_size(summary.total_size)
+            ),
             "Empty Trash",
             ModalTone::Danger,
         );
         let explanation = message_dialog_description(
             "Everything in Trash will be permanently deleted. This action cannot be undone.",
         );
-        layout.set_loading(true, Some("Calculating Trash contents…"));
         layout.body.append(&explanation);
-        layout.confirm.set_sensitive(false);
-        let subtitle = layout.subtitle.clone();
-        let loading = layout.loading.clone();
         let content = layout.content;
         let close = layout.close;
         let cancel = layout.cancel;
         let empty = layout.confirm;
-        let entries = Rc::new(RefCell::new(None::<Vec<FileEntry>>));
 
-        let layer = modal_layer(&content);
+        let layer = modal_layer(&content, &window_overlay, blurred_root.clone(), None);
         window_overlay.add_overlay(&layer);
         let cancel_layer = layer.clone();
         let cancel_overlay = window_overlay.clone();
@@ -1710,17 +1916,72 @@ impl ViewState {
         let empty_layer = layer.clone();
         let empty_overlay = window_overlay.clone();
         let empty_root = blurred_root.clone();
-        let empty_entries = entries.clone();
         let browser = self.browser.clone();
+        let error_overlay = self.overlay.clone();
+        let weak_ui = Rc::downgrade(self);
         empty.connect_clicked(move |_| {
-            let Some(entries) = empty_entries.borrow().clone() else {
-                return;
-            };
             dismiss_modal_layer(&empty_layer, &empty_overlay, empty_root.as_ref());
-            if !entries.is_empty() {
-                browser.delete(entries, true);
-            }
             browser.focus_active();
+
+            let cancel_ui = weak_ui.clone();
+            let on_cancel: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(ui) = cancel_ui.upgrade() {
+                    ui.clear_empty_trash();
+                }
+            });
+            if let Some(ui) = weak_ui.upgrade() {
+                ui.show_empty_trash_progress(on_cancel);
+            }
+
+            let error_overlay = error_overlay.clone();
+            let progress_ui = weak_ui.clone();
+            let finish_ui = weak_ui.clone();
+            let finish_browser = browser.clone();
+            let task = glib::MainContext::default().spawn_local(async move {
+                let trash = gio::File::for_uri("trash:///");
+                let result = empty_trash(&trash, move |processed| {
+                    if let Some(ui) = progress_ui.upgrade() {
+                        ui.update_empty_trash_progress(processed);
+                    }
+                })
+                .await;
+                if let Some(ui) = finish_ui.upgrade() {
+                    ui.clear_empty_trash();
+                }
+                match result {
+                    Ok(outcome) => {
+                        // A wholesale refresh rather than tracking each deleted location, to
+                        // keep this operation's own state bounded too.
+                        finish_browser.refresh_columns_at(&Location::uri("trash:///"));
+                        if outcome.failed > 0 {
+                            show_error_dialog(
+                                &error_overlay,
+                                "Completed with errors",
+                                &empty_trash_error_summary(&outcome),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error_domain = ?error.domain(),
+                            error_code = error.code(),
+                            "empty trash failed"
+                        );
+                        show_error_dialog(
+                            &error_overlay,
+                            "Unable to empty Trash",
+                            &error.to_string(),
+                        );
+                    }
+                }
+            });
+            if let Some(ui) = weak_ui.upgrade() {
+                ui.pending_empty_trash
+                    .replace(Some(LoadHandle::new(move || {
+                        tracing::debug!("empty trash cancelled");
+                        task.abort();
+                    })));
+            }
         });
         let keys = gtk::EventControllerKey::new();
         let escape_layer = layer.clone();
@@ -1749,42 +2010,6 @@ impl ViewState {
             initial_focus.grab_focus();
             if let Some(window) = initial_focus.root().and_downcast::<gtk::Window>() {
                 window.set_focus_visible(true);
-            }
-        });
-
-        let result_layer = layer.clone();
-        let result_overlay = window_overlay;
-        let result_root = blurred_root;
-        let result_parent = self.overlay.clone();
-        glib::MainContext::default().spawn_local(async move {
-            let result = summarize_trash(&gio::File::for_uri("trash:///")).await;
-            if result_layer.parent().is_none() {
-                return;
-            }
-            loading.stop();
-            loading.set_visible(false);
-            match result {
-                Ok(summary) if summary.entries.is_empty() => {
-                    subtitle.set_text("Trash is empty");
-                    explanation.set_text("There is nothing to delete.");
-                    empty.set_label("Close");
-                    empty.remove_css_class("danger");
-                    entries.replace(Some(Vec::new()));
-                    empty.set_sensitive(true);
-                }
-                Ok(summary) => {
-                    subtitle.set_text(&format!(
-                        "{} · {} will be reclaimed",
-                        item_count_label(summary.item_count),
-                        format_file_size(summary.total_size)
-                    ));
-                    entries.replace(Some(summary.entries));
-                    empty.set_sensitive(true);
-                }
-                Err(error) => {
-                    dismiss_modal_layer(&result_layer, &result_overlay, result_root.as_ref());
-                    show_error_dialog(&result_parent, "Unable to read Trash", &error.to_string());
-                }
             }
         });
     }
@@ -1872,7 +2097,7 @@ impl ViewState {
         let cancel = layout.cancel;
         let confirm = layout.confirm;
 
-        let layer = modal_layer(&content);
+        let layer = modal_layer(&content, &window_overlay, blurred_root.clone(), None);
         window_overlay.add_overlay(&layer);
         let cancelled_layer = layer.clone();
         let cancelled_overlay = window_overlay.clone();
@@ -1908,6 +2133,7 @@ impl ViewState {
             browser.focus_active();
         });
         let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let escaped_layer = layer.clone();
         let escaped_overlay = window_overlay;
         let escaped_root = blurred_root;
@@ -1918,6 +2144,9 @@ impl ViewState {
             if key == gtk::gdk::Key::Escape {
                 dismiss_modal_layer(&escaped_layer, &escaped_overlay, escaped_root.as_ref());
                 escaped_browser.focus_active();
+                glib::Propagation::Stop
+            } else if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
+                focused_confirm.emit_clicked();
                 glib::Propagation::Stop
             } else if !modifiers
                 .intersects(gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::ALT_MASK)
@@ -1933,11 +2162,7 @@ impl ViewState {
             }
         });
         layer.add_controller(keys);
-        let initial_focus = if permanent {
-            cancel.clone()
-        } else {
-            confirm.clone()
-        };
+        let initial_focus = confirm.clone();
         glib::idle_add_local_once(move || {
             initial_focus.grab_focus();
             if let Some(window) = initial_focus.root().and_downcast::<gtk::Window>() {
@@ -1959,6 +2184,7 @@ impl ViewState {
         title: &str,
         subtitle: &str,
         confirm_label: &str,
+        block_dismiss: Option<Rc<dyn Fn() -> bool>>,
     ) -> (gtk::Box, gtk::Button, Rc<dyn Fn()>) {
         let Some(window_overlay) = self
             .overlay
@@ -1980,7 +2206,12 @@ impl ViewState {
             subtitle,
             confirm_label,
         );
-        let layer = modal_layer(&layout.content);
+        let layer = modal_layer(
+            &layout.content,
+            &window_overlay,
+            blurred_root.clone(),
+            block_dismiss,
+        );
         window_overlay.add_overlay(&layer);
 
         let dismiss: Rc<dyn Fn()> = Rc::new({
@@ -2007,6 +2238,109 @@ impl ViewState {
         (layout.body, layout.confirm, dismiss)
     }
 
+    fn start_compression(
+        self: &Rc<Self>,
+        entries: Vec<FileEntry>,
+        destination: Location,
+        archive_name: String,
+        format: ArchiveFormat,
+        password: Option<String>,
+    ) {
+        let final_name = format!("{archive_name}.{}", format.extension());
+        if !archive_has_collision(&destination, &final_name) {
+            self.browser.compress(
+                entries,
+                destination,
+                archive_name,
+                TransferConflict::FailIfExists,
+                format,
+                password,
+            );
+            return;
+        }
+        let Some(window_overlay) = self
+            .overlay
+            .root()
+            .and_downcast::<gtk::Window>()
+            .and_then(|window| window.child())
+            .and_downcast::<gtk::Overlay>()
+        else {
+            return;
+        };
+        let blurred_root = window_overlay.child().and_downcast::<BlurBin>();
+        if let Some(root) = blurred_root.as_ref() {
+            root.set_blurred(true);
+        }
+        let layout = message_dialog_layout(
+            crate::assets::icons::FILE_ARCHIVE,
+            "File already exists",
+            &final_name,
+            "Replace",
+            ModalTone::Danger,
+        );
+        layout.body.append(&message_dialog_description(&format!(
+            "An archive named “{final_name}” already exists in {}. Replacing it will overwrite its contents.",
+            compact_display_path(&destination)
+        )));
+        let content = layout.content;
+        let close = layout.close;
+        let cancel = layout.cancel;
+        let replace = layout.confirm;
+        let layer = modal_layer(&content, &window_overlay, blurred_root.clone(), None);
+        window_overlay.add_overlay(&layer);
+
+        for button in [&close, &cancel] {
+            let dismissed_layer = layer.clone();
+            let dismissed_overlay = window_overlay.clone();
+            let dismissed_root = blurred_root.clone();
+            let browser = self.browser.clone();
+            button.connect_clicked(move |_| {
+                dismiss_modal_layer(
+                    &dismissed_layer,
+                    &dismissed_overlay,
+                    dismissed_root.as_ref(),
+                );
+                browser.focus_active();
+            });
+        }
+
+        let replaced_layer = layer.clone();
+        let replaced_overlay = window_overlay.clone();
+        let replaced_root = blurred_root.clone();
+        let browser = self.browser.clone();
+        replace.connect_clicked(move |_| {
+            dismiss_modal_layer(&replaced_layer, &replaced_overlay, replaced_root.as_ref());
+            browser.compress(
+                entries.clone(),
+                destination.clone(),
+                archive_name.clone(),
+                TransferConflict::ReplaceExisting,
+                format,
+                password.clone(),
+            );
+        });
+
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let escaped_layer = layer.clone();
+        let escaped_overlay = window_overlay;
+        let escaped_root = blurred_root;
+        let enter_replace = replace.clone();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                dismiss_modal_layer(&escaped_layer, &escaped_overlay, escaped_root.as_ref());
+                glib::Propagation::Stop
+            } else if key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter {
+                enter_replace.emit_clicked();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        layer.add_controller(keys);
+        replace.grab_focus();
+    }
+
     fn show_compress_dialog(self: &Rc<Self>, entries: Vec<FileEntry>) {
         if entries.is_empty() {
             return;
@@ -2024,11 +2358,32 @@ impl ViewState {
 
         let title = format!("Compress {}", item_count_label(entries.len()));
         let subtitle = entry_kind_summary(&entries);
-        let (body, confirm, dismiss) = self.build_archive_modal(&title, &subtitle, "Compress");
 
-        let name_label = form_label("Archive name");
         let name_entry = form_entry();
         name_entry.set_text(&default_name);
+        name_entry.connect_changed(|field| {
+            update_basename_validation(field);
+        });
+        let password_entry = form_password_entry();
+        password_entry.set_show_peek_icon(true);
+        let confirm_entry = form_password_entry();
+        confirm_entry.set_show_peek_icon(true);
+        let compress_default_name = default_name.clone();
+        let dirty_name = name_entry.clone();
+        let dirty_password = password_entry.clone();
+        let dirty_confirm = confirm_entry.clone();
+        let (body, confirm, dismiss) = self.build_archive_modal(
+            &title,
+            &subtitle,
+            "Compress",
+            Some(Rc::new(move || {
+                dirty_name.text() != compress_default_name
+                    || !dirty_password.text().is_empty()
+                    || !dirty_confirm.text().is_empty()
+            })),
+        );
+
+        let name_label = form_label("Archive name");
         body.append(&name_label);
         body.append(&name_entry);
 
@@ -2046,11 +2401,7 @@ impl ViewState {
         let password_protected = protection_options[1].clone();
 
         let password_label = form_label("Password");
-        let password_entry = form_password_entry();
-        password_entry.set_show_peek_icon(true);
         let confirm_label = form_label("Confirm password");
-        let confirm_entry = form_password_entry();
-        confirm_entry.set_show_peek_icon(true);
         let password_fields = gtk::Box::new(gtk::Orientation::Vertical, 6);
         password_fields.append(&password_label);
         password_fields.append(&password_entry);
@@ -2095,7 +2446,7 @@ impl ViewState {
             });
         }
 
-        let browser = self.browser.clone();
+        let state = Rc::downgrade(self);
         let confirm_entries = entries.clone();
         let confirm_destination = destination.clone();
         let name_for_confirm = name_entry.clone();
@@ -2108,6 +2459,13 @@ impl ViewState {
         confirm.connect_clicked(move |_| {
             let name = name_for_confirm.text().to_string();
             let format = format_for_confirm.get();
+            let archive_name = normalized_archive_name(&name, format);
+            if let Err(message) = validate_basename(&archive_name) {
+                name_for_confirm.add_css_class("error");
+                name_for_confirm.set_tooltip_text(Some(message));
+                name_for_confirm.grab_focus();
+                return;
+            }
             let password = if format.supports_password() && protected_for_confirm.is_active() {
                 let pw = password_for_confirm.text().to_string();
                 if pw.is_empty() {
@@ -2131,19 +2489,16 @@ impl ViewState {
             } else {
                 None
             };
-            let archive_name = if name.ends_with(format.extension()) {
-                name.trim_end_matches(format.extension()).to_owned()
-            } else {
-                name
-            };
             dismiss_for_confirm();
-            browser.compress(
-                confirm_entries.clone(),
-                confirm_destination.clone(),
-                archive_name,
-                format,
-                password,
-            );
+            if let Some(state) = state.upgrade() {
+                state.start_compression(
+                    confirm_entries.clone(),
+                    confirm_destination.clone(),
+                    archive_name,
+                    format,
+                    password,
+                );
+            }
         });
         name_entry.grab_focus();
     }
@@ -2171,14 +2526,20 @@ impl ViewState {
             .parent()
             .and_then(|p| p.native_path().map(Path::to_path_buf))
             .unwrap_or_else(glib::home_dir);
-        let (body, confirm, dismiss) =
-            self.build_archive_modal("Extract to", &entry.display_name, "Extract here");
-        let field_label = form_label("Destination folder");
         let field = form_entry();
         field.set_hexpand(true);
-        field.set_placeholder_text(Some("Type a folder path…"));
+        field.set_placeholder_text(Some("Search for a folder…"));
         field.set_text(&folder_input_path(&base));
         field.set_position(-1);
+        let extract_initial_text = folder_input_path(&base);
+        let dirty_field = field.clone();
+        let (body, confirm, dismiss) = self.build_archive_modal(
+            "Extract to",
+            &entry.display_name,
+            "Extract here",
+            Some(Rc::new(move || dirty_field.text() != extract_initial_text)),
+        );
+        let field_label = form_label("Destination folder");
         body.append(&field_label);
         body.append(&field);
 
@@ -2204,17 +2565,17 @@ impl ViewState {
 
         let generation = Rc::new(Cell::new(0_u64));
         let suggestions_box = suggestions.clone();
-        let suggestions_generation = generation.clone();
-        let suggestions_base = base.clone();
-        field.connect_changed(move |field| {
-            field.remove_css_class("error");
-            refresh_transfer_suggestions(
-                field,
-                &suggestions_box,
-                &suggestions_generation,
-                suggestions_base.clone(),
-            );
-        });
+        let extract_error = error.clone();
+        setup_transfer_search(
+            &field,
+            &suggestions_box,
+            &generation,
+            base.clone(),
+            move |field| {
+                field.remove_css_class("error");
+                extract_error.set_visible(false);
+            },
+        );
 
         let extract_state = self.clone();
         let confirm_field = field.clone();
@@ -2258,12 +2619,17 @@ impl ViewState {
     }
 
     fn show_extract_password_dialog(self: &Rc<Self>, entry: FileEntry, destination: Location) {
-        let (body, confirm, dismiss) =
-            self.build_archive_modal("Extract", &entry.display_name, "Extract");
-
-        let password_label = form_label("Password");
         let password_entry = form_password_entry();
         password_entry.set_show_peek_icon(true);
+        let dirty_password = password_entry.clone();
+        let (body, confirm, dismiss) = self.build_archive_modal(
+            "Extract",
+            &entry.display_name,
+            "Extract",
+            Some(Rc::new(move || !dirty_password.text().is_empty())),
+        );
+
+        let password_label = form_label("Password");
         body.append(&password_label);
         body.append(&password_entry);
 
@@ -2404,7 +2770,7 @@ impl ViewState {
         layout.actions.prepend(&actions);
         let content = layout.content;
 
-        let layer = modal_layer(&content);
+        let layer = modal_layer(&content, &window_overlay, blurred_root.clone(), None);
         window_overlay.add_overlay(&layer);
         let closing_layer = layer.clone();
         let closing_overlay = window_overlay.clone();
@@ -2477,8 +2843,12 @@ impl ViewState {
                 };
                 match summary {
                     Ok(summary) => {
-                        size.set_text(&format_file_size(summary.total_size));
-                        size.set_tooltip_text(Some(&item_count_label(summary.item_count)));
+                        let prefix = if summary.truncated { "≥ " } else { "" };
+                        size.set_text(&format!("{prefix}{}", format_file_size(summary.total_size)));
+                        size.set_tooltip_text(Some(&format!(
+                            "{prefix}{}",
+                            item_count_label(summary.item_count)
+                        )));
                     }
                     Err(_) => size.set_text("Unavailable"),
                 }
@@ -2638,18 +3008,42 @@ impl ViewState {
 
     fn submit_location(self: &Rc<Self>) {
         let input = self.location_entry.text();
-        match self.browser.navigate_input(input.as_str()) {
+        let (input, credentials) = match credentials_from_location_input(input.as_str()) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.restore_location_text();
+                self.location_stack.set_visible_child_name("breadcrumbs");
+                show_error_dialog(&self.overlay, "Unable to open location", &error.to_string());
+                return;
+            }
+        };
+        if credentials.is_some() {
+            self.location_entry.set_text(&input);
+        }
+        self.pending_location_credentials.replace(credentials);
+        match self.browser.navigate_input(&input) {
             Ok(()) => {
                 self.location_stack.set_visible_child_name("breadcrumbs");
                 self.browser.focus_active();
             }
             Err(LocationValidationError::NotMounted(location)) => {
-                self.mount_then_navigate(location, MountStrategy::EnclosingVolume);
+                let credentials = self.pending_location_credentials.take();
+                self.mount_then_navigate_with_credentials(
+                    location,
+                    MountStrategy::EnclosingVolume,
+                    credentials,
+                );
             }
             Err(LocationValidationError::Mountable(location)) => {
-                self.mount_then_navigate(location, MountStrategy::Mountable);
+                let credentials = self.pending_location_credentials.take();
+                self.mount_then_navigate_with_credentials(
+                    location,
+                    MountStrategy::Mountable,
+                    credentials,
+                );
             }
             Err(error) => {
+                self.pending_location_credentials.take();
                 self.restore_location_text();
                 self.location_stack.set_visible_child_name("breadcrumbs");
                 show_error_dialog(&self.overlay, "Unable to open location", &error.to_string());
@@ -2677,10 +3071,6 @@ impl ViewState {
                 );
             }
         }
-    }
-
-    fn mount_then_navigate(self: &Rc<Self>, location: Location, strategy: MountStrategy) {
-        self.mount_then_navigate_with_credentials(location, strategy, None);
     }
 
     fn mount_then_navigate_with_credentials(
@@ -3053,6 +3443,7 @@ impl ViewState {
         self.mode_views.borrow_mut().handle(&event);
         match event {
             BrowserEvent::Reset => {
+                self.pending_location_credentials.take();
                 self.truncate(0);
             }
             BrowserEvent::ColumnsTruncated { len } => {
@@ -3070,7 +3461,7 @@ impl ViewState {
                     .map(|insertion| insertion.entries.len())
                     .sum();
                 if let Some(column) = self.columns.borrow().get(depth).cloned() {
-                    if entry_count > 0 {
+                    if entry_count > 0 && !column.spinner.is_spinning() {
                         column.presentation.show_content();
                     }
                     for insertion in insertions {
@@ -3082,6 +3473,7 @@ impl ViewState {
                     let count = column.entry_count.get() + entry_count;
                     column.entry_count.set(count);
                     set_filter_placeholder(&column, count);
+                    update_empty_trash_sensitivity(&column, count);
                     crate::metrics::mark_batch_rendered(entry_count, render_started);
                 }
             }
@@ -3097,6 +3489,7 @@ impl ViewState {
                     column.model.splice(0, column.model.n_items(), &labels);
                     column.entry_count.set(entries.len());
                     set_filter_placeholder(&column, entries.len());
+                    update_empty_trash_sensitivity(&column, entries.len());
                 }
             }
             BrowserEvent::SortingStarted { depth } => {
@@ -3145,10 +3538,14 @@ impl ViewState {
                     } else {
                         column.presentation.show_content();
                     }
+                    update_empty_trash_sensitivity(column, count);
                 }
             }
             BrowserEvent::ColumnReloaded { depth } => {
                 if let Some(column) = self.columns.borrow().get(depth) {
+                    column.syncing_selection.set(true);
+                    column.selection.set_model(None::<&gio::ListModel>);
+                    column.filtered_model.set_model(None::<&gio::ListModel>);
                     column.model.splice(0, column.model.n_items(), &[]);
                     column.entry_count.set(0);
                     set_filter_placeholder(column, 0);
@@ -3159,28 +3556,40 @@ impl ViewState {
             }
             BrowserEvent::LoadFinished { depth } => {
                 if let Some(column) = self.columns.borrow().get(depth) {
+                    if column.selection.model().is_none() {
+                        column.filtered_model.set_model(Some(&column.model));
+                        column.selection.set_model(Some(&column.filtered_model));
+                        column.syncing_selection.set(false);
+                    }
                     column.spinner.stop();
                     column.spinner.set_visible(false);
-                    if column.entry_count.get() == 0 {
+                    let count = column.entry_count.get();
+                    if count == 0 {
                         column.presentation.show_empty();
                     } else {
                         column.presentation.show_content();
                     }
+                    update_empty_trash_sensitivity(column, count);
                 }
-                if self.browser.active_depth() == Some(depth)
-                    && let Some(name) = self.pending_select.take()
-                {
-                    let weak = Rc::downgrade(self);
-                    let name = name.clone();
-                    glib::idle_add_local_once(move || {
-                        if let Some(state) = weak.upgrade() {
-                            state.browser.select_entry_by_name(&name);
-                        }
-                    });
+                if self.browser.active_depth() == Some(depth) {
+                    let names = self.pending_select.take();
+                    if !names.is_empty() {
+                        let weak = Rc::downgrade(self);
+                        glib::idle_add_local_once(move || {
+                            if let Some(state) = weak.upgrade() {
+                                state.browser.select_entries_by_name(&names);
+                            }
+                        });
+                    }
                 }
             }
             BrowserEvent::LoadFailed { depth, message } => {
                 if let Some(column) = self.columns.borrow().get(depth) {
+                    if column.selection.model().is_none() {
+                        column.filtered_model.set_model(Some(&column.model));
+                        column.selection.set_model(Some(&column.filtered_model));
+                        column.syncing_selection.set(false);
+                    }
                     column.spinner.stop();
                     column.spinner.set_visible(false);
                     column
@@ -3284,22 +3693,57 @@ impl ViewState {
                     rename.field.grab_focus();
                 }
             }
-            BrowserEvent::DeletionStarted { total } => self.show_file_operation_progress(
-                total,
-                crate::assets::icons::TRASH,
-                "Deleting items",
-                "This may take a moment",
-            ),
+            BrowserEvent::TransferStarted { total, moving } => {
+                let browser = self.browser.clone();
+                self.show_file_operation_progress(
+                    total,
+                    if moving {
+                        crate::assets::icons::FOLDER
+                    } else {
+                        crate::assets::icons::COPY
+                    },
+                    if moving {
+                        "Moving items"
+                    } else {
+                        "Copying items"
+                    },
+                    "Cancelling will not undo completed changes",
+                    Rc::new(move || browser.cancel_file_operation()),
+                );
+            }
+            BrowserEvent::TransferProgress { completed, total } => {
+                self.update_delete_progress(completed, total);
+            }
+            BrowserEvent::TransferFinished { moved_locations } => {
+                if !moved_locations.is_empty() {
+                    self.complete_cut_transfer(&moved_locations);
+                }
+                self.dismiss_delete_progress();
+            }
+            BrowserEvent::DeletionStarted { total } => {
+                let browser = self.browser.clone();
+                self.show_file_operation_progress(
+                    total,
+                    crate::assets::icons::TRASH,
+                    "Deleting items",
+                    "Cancelling will not undo completed changes",
+                    Rc::new(move || browser.cancel_file_operation()),
+                );
+            }
             BrowserEvent::DeletionProgress { completed, total } => {
                 self.update_delete_progress(completed, total);
             }
             BrowserEvent::DeletionFinished => self.dismiss_delete_progress(),
-            BrowserEvent::RestorationStarted { total } => self.show_file_operation_progress(
-                total,
-                crate::assets::icons::FOLDER,
-                "Restoring items",
-                "Items are being returned to their original locations",
-            ),
+            BrowserEvent::RestorationStarted { total } => {
+                let browser = self.browser.clone();
+                self.show_file_operation_progress(
+                    total,
+                    crate::assets::icons::FOLDER,
+                    "Restoring items",
+                    "Cancelling will not undo completed changes",
+                    Rc::new(move || browser.cancel_file_operation()),
+                );
+            }
             BrowserEvent::RestorationProgress { completed, total } => {
                 self.update_delete_progress(completed, total);
             }
@@ -3319,6 +3763,26 @@ impl ViewState {
             BrowserEvent::OperationCompletedWithErrors { message } => {
                 show_error_dialog(&self.overlay, "Completed with errors", &message);
             }
+            BrowserEvent::OperationCancelled {
+                completed,
+                failed,
+                not_attempted,
+                affected_locations,
+            } => {
+                let message = format!(
+                    "{} completed, {} failed, and {} not attempted.\n\nCompleted changes were not reverted.",
+                    item_count_label(completed),
+                    item_count_label(failed),
+                    item_count_label(not_attempted),
+                );
+                let browser = self.browser.clone();
+                show_error_dialog_after_close(
+                    &self.overlay,
+                    "Operation cancelled",
+                    &message,
+                    Rc::new(move || browser.refresh_after_cancellation(&affected_locations)),
+                );
+            }
             BrowserEvent::NavigationRejected {
                 parent_depth,
                 error,
@@ -3328,23 +3792,38 @@ impl ViewState {
             BrowserEvent::EmptyTrashRequested => {
                 self.load_trash_summary();
             }
-            BrowserEvent::LocationNavigationRejected { error } => match error {
-                LocationValidationError::NotMounted(location) => {
-                    self.mount_then_navigate(location, MountStrategy::EnclosingVolume);
+            BrowserEvent::LocationNavigationRejected { error } => {
+                let credentials = self.pending_location_credentials.take();
+                match error {
+                    LocationValidationError::NotMounted(location) => {
+                        self.mount_then_navigate_with_credentials(
+                            location,
+                            MountStrategy::EnclosingVolume,
+                            credentials,
+                        );
+                    }
+                    LocationValidationError::Mountable(location) => {
+                        self.mount_then_navigate_with_credentials(
+                            location,
+                            MountStrategy::Mountable,
+                            credentials,
+                        );
+                    }
+                    error => show_error_dialog(
+                        &self.overlay,
+                        "Unable to open location",
+                        &error.to_string(),
+                    ),
                 }
-                LocationValidationError::Mountable(location) => {
-                    self.mount_then_navigate(location, MountStrategy::Mountable);
-                }
-                error => {
-                    show_error_dialog(&self.overlay, "Unable to open location", &error.to_string())
-                }
-            },
+            }
             BrowserEvent::ArchiveStarted { total } => {
+                let browser = self.browser.clone();
                 self.show_file_operation_progress(
                     total,
                     crate::assets::icons::FILE_ARCHIVE,
                     "Working",
                     "This may take a moment",
+                    Rc::new(move || browser.cancel_file_operation()),
                 );
             }
             BrowserEvent::ArchiveProgress { completed, total } => {
@@ -3354,7 +3833,7 @@ impl ViewState {
                 self.dismiss_delete_progress();
                 self.pending_extract_retry.replace(None);
                 if !select_name.is_empty() {
-                    self.pending_select.replace(Some(select_name));
+                    self.pending_select.borrow_mut().push(select_name);
                 }
                 if let Some(dest) = self.pending_navigate.take() {
                     self.browser.navigate(dest);
@@ -3445,7 +3924,9 @@ impl ViewState {
         let header_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         header_actions.add_css_class("column-header-actions");
         let empty_trash = empty_trash_button(&self.browser);
-        empty_trash.set_visible(is_trash_root(location));
+        let is_trash = is_trash_root(location);
+        empty_trash.set_visible(is_trash);
+        empty_trash.set_sensitive(false);
         header_actions.append(&empty_trash);
         header_actions.append(&column_sort_direction_toggle(&self.browser, depth));
         header_actions.append(&column_sort_menu(&self.browser, depth));
@@ -3531,15 +4012,14 @@ impl ViewState {
                 return;
             }
             let filtered_positions = bitset_positions(&selection.selection());
-            let source_positions: Vec<_> = filtered_positions
+            let mapped_positions = source_positions_for_filtered(
+                &source_for_selection,
+                &filtered_for_selection,
+                &filtered_positions,
+            );
+            let source_positions: Vec<_> = mapped_positions
                 .iter()
-                .filter_map(|position| {
-                    source_position_for_filtered(
-                        &source_for_selection,
-                        &filtered_for_selection,
-                        *position,
-                    )
-                })
+                .map(|(_, source_position)| *source_position)
                 .collect();
             let changed_end = position.saturating_add(count);
             let focused = filtered_positions
@@ -3555,11 +4035,9 @@ impl ViewState {
                 .or_else(|| filtered_positions.last().copied());
             focused_filtered_changed.set(focused);
             let focused_source = focused.and_then(|position| {
-                source_position_for_filtered(
-                    &source_for_selection,
-                    &filtered_for_selection,
-                    position,
-                )
+                mapped_positions
+                    .iter()
+                    .find_map(|(filtered, source)| (*filtered == position).then_some(*source))
             });
             if let Some(browser) = weak_browser.upgrade() {
                 browser.set_selection(depth, &source_positions, focused_source);
@@ -3900,6 +4378,7 @@ impl ViewState {
                 })
                 .unwrap_or_default();
             size.set_label(&size_text);
+            size.set_visible(!size_text.is_empty());
         });
         factory.connect_unbind(|_, item| super::thumbnail::cancel_list_item_thumbnails(item));
 
@@ -4168,10 +4647,24 @@ impl ViewState {
         resize.set_button(1);
         let resize_start = Rc::new(Cell::new(COLUMN_WIDTH));
         let pointer_start = Rc::new(Cell::new(None));
+        let last_press = Rc::new(Cell::new(0u64));
         let shell_for_resize_start = shell.clone();
+        let shell_for_autofit = shell.clone();
+        let column_for_autofit = column.clone();
         let resize_start_for_begin = resize_start.clone();
         let pointer_start_for_begin = pointer_start.clone();
+        let last_press_for_begin = last_press.clone();
         resize.connect_drag_begin(move |gesture, _, _| {
+            let now = glib::monotonic_time() as u64;
+            let prev = last_press_for_begin.get();
+            last_press_for_begin.set(now);
+            if now.wrapping_sub(prev) <= 400_000 {
+                let max_natural =
+                    max_child_natural_width(column_for_autofit.upcast_ref::<gtk::Widget>());
+                shell_for_autofit.set_size_request(max_natural.max(COLUMN_WIDTH), -1);
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
             resize_start_for_begin.set(shell_for_resize_start.width().max(COLUMN_WIDTH));
             if let Some((pointer_x, _)) = gesture.current_event().and_then(|event| event.position())
             {
@@ -4219,6 +4712,7 @@ impl ViewState {
             bound_rows,
             entry_count,
             spinner,
+            empty_trash_button: is_trash.then_some(empty_trash),
             new_entry_row,
             new_entry_icon,
             new_entry_entry,
@@ -4390,21 +4884,24 @@ impl ViewState {
             return;
         };
         content.add_css_class("peek-popover");
-        let right = bounds.x() + bounds.width() + 4.0;
+        let gap = 8.0;
+        let right = bounds.x() + bounds.width() + gap;
         let left = (bounds.x() - 260.0).max(0.0);
-        let x = if right + 256.0 <= self.overlay.width() as f32 {
-            right
-        } else {
-            left
-        };
+        let positioned_right = right + 256.0 <= self.overlay.width() as f32;
+        let x = if positioned_right { right } else { left };
         let transition_duration = self
             .peek_behavior
             .fade_duration
             .as_millis()
             .min(u128::from(u32::MAX)) as u32;
+        let transition_type = if positioned_right {
+            gtk::RevealerTransitionType::SlideRight
+        } else {
+            gtk::RevealerTransitionType::SlideLeft
+        };
         let revealer = gtk::Revealer::builder()
             .child(&content)
-            .transition_type(gtk::RevealerTransitionType::Crossfade)
+            .transition_type(transition_type)
             .transition_duration(transition_duration)
             .reveal_child(false)
             .halign(gtk::Align::Start)
@@ -4553,14 +5050,34 @@ fn source_position_for_filtered(
     filtered: &gtk::FilterListModel,
     filtered_position: u32,
 ) -> Option<usize> {
-    let item = filtered.item(filtered_position)?;
-    (0..source.n_items())
-        .find(|position| {
-            source
-                .item(*position)
-                .is_some_and(|candidate| candidate == item)
+    source_positions_for_filtered(source, filtered, &[filtered_position])
+        .first()
+        .map(|(_, source)| *source)
+}
+
+fn source_positions_for_filtered(
+    source: &gtk::StringList,
+    filtered: &gtk::FilterListModel,
+    filtered_positions: &[u32],
+) -> Vec<(u32, usize)> {
+    let mut source_position = 0;
+    filtered_positions
+        .iter()
+        .filter_map(|filtered_position| {
+            let item = filtered.item(*filtered_position)?;
+            while source_position < source.n_items() {
+                let candidate_position = source_position;
+                source_position += 1;
+                if source
+                    .item(candidate_position)
+                    .is_some_and(|candidate| candidate == item)
+                {
+                    return Some((*filtered_position, candidate_position as usize));
+                }
+            }
+            None
         })
-        .map(|position| position as usize)
+        .collect()
 }
 
 fn set_column_selection(column: &ColumnView, position: u32) {
@@ -4730,6 +5247,8 @@ pub(super) fn install_folder_context_menu(
 pub(super) type ContextPickPosition = Rc<dyn Fn(&gtk::Widget) -> Option<u32>>;
 pub(super) type ContextSourcePosition = Rc<dyn Fn(u32) -> Option<usize>>;
 
+const ITEM_CONTEXT_SUMMARY_MAX_CHARS: i32 = 60;
+
 pub(super) fn install_item_context_menu(
     state: &Rc<ViewState>,
     widget: &gtk::Widget,
@@ -4750,10 +5269,12 @@ pub(super) fn install_item_context_menu(
     let heading = gtk::Label::new(None);
     heading.add_css_class("item-context-title");
     heading.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    heading.set_max_width_chars(ITEM_CONTEXT_SUMMARY_MAX_CHARS);
     heading.set_xalign(0.0);
     let summary = gtk::Label::new(None);
     summary.add_css_class("item-context-summary");
     summary.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    summary.set_max_width_chars(ITEM_CONTEXT_SUMMARY_MAX_CHARS);
     summary.set_xalign(0.0);
     header.append(&heading);
     header.append(&summary);
@@ -4995,13 +5516,6 @@ pub(super) fn install_item_context_menu(
         if !selection.is_selected(filtered_position) {
             selection.select_item(filtered_position, true);
         }
-        let selected_positions = bitset_positions(&selection.selection())
-            .into_iter()
-            .filter_map(|position| source_position(position))
-            .collect::<Vec<_>>();
-        state
-            .browser
-            .set_selection(depth, &selected_positions, Some(resolved_position));
         target.replace(Some((resolved_position, entry.clone())));
         let entries = state.browser.selected_entries();
         preview.set_visible(entry_supports_quick_preview(&entry));
@@ -5057,14 +5571,29 @@ pub(super) fn entry_supports_quick_preview(entry: &FileEntry) -> bool {
 }
 
 struct TrashSummary {
-    entries: Vec<FileEntry>,
     item_count: usize,
     total_size: u64,
+    /// `true` if measurement did not cover the full trash tree; `item_count`/`total_size` are
+    /// then a lower bound.
+    truncated: bool,
 }
 
 const TRASH_ATTRIBUTES: &str = "standard::display-name,standard::name,standard::type,standard::is-symlink,standard::size,time::modified";
 
+const MAX_TRASH_ENTRIES: usize = 200_000;
+const MAX_TRASH_DEPTH: usize = 64;
+const TRASH_TIME_BUDGET: Duration = Duration::from_secs(5);
+
 async fn summarize_trash(root: &gio::File) -> Result<TrashSummary, glib::Error> {
+    summarize_trash_with_budget(root, MAX_TRASH_ENTRIES, MAX_TRASH_DEPTH, TRASH_TIME_BUDGET).await
+}
+
+async fn summarize_trash_with_budget(
+    root: &gio::File,
+    max_entries: usize,
+    max_depth: usize,
+    time_budget: Duration,
+) -> Result<TrashSummary, glib::Error> {
     let enumerator = root
         .enumerate_children_future(
             TRASH_ATTRIBUTES,
@@ -5072,9 +5601,80 @@ async fn summarize_trash(root: &gio::File) -> Result<TrashSummary, glib::Error> 
             glib::Priority::DEFAULT,
         )
         .await?;
-    let mut entries = Vec::new();
     let mut item_count = 0_usize;
     let mut total_size = 0_u64;
+    let mut truncated = false;
+    let visited = Rc::new(Cell::new(0_usize));
+    let deadline = Instant::now() + time_budget;
+    'root: loop {
+        let children = enumerator
+            .next_files_future(64, glib::Priority::DEFAULT)
+            .await?;
+        if children.is_empty() {
+            break;
+        }
+        glib::timeout_future(Duration::from_millis(1)).await;
+        for info in children {
+            if visited.get() >= max_entries || Instant::now() >= deadline {
+                truncated = true;
+                break 'root;
+            }
+            let (count, size, entry_truncated) = measure_trash_entry(
+                root.child(info.name()),
+                info,
+                0,
+                visited.clone(),
+                deadline,
+                max_entries,
+                max_depth,
+            )
+            .await?;
+            item_count = item_count.saturating_add(count);
+            total_size = total_size.saturating_add(size);
+            truncated |= entry_truncated;
+        }
+        // Stop only when the shared budget is actually spent -- a child's own `truncated` (depth
+        // cap, discarded error) is branch-local and must not cut off its unrelated siblings.
+        if visited.get() >= max_entries || Instant::now() >= deadline {
+            truncated = true;
+            break;
+        }
+    }
+    Ok(TrashSummary {
+        item_count,
+        total_size,
+        truncated,
+    })
+}
+
+struct EmptyTrashOutcome {
+    deleted: usize,
+    failed: usize,
+    /// Capped at 8 messages regardless of `failed`, so a trash full of failures can't grow this
+    /// without bound.
+    errors: Vec<String>,
+}
+
+/// Empties `root` by enumerating and deleting one batch at a time -- unlike a listing that
+/// collects every top-level entry into a `Vec<FileEntry>` first, no per-entry list is ever
+/// retained here; only a running count and a capped error list, so memory stays flat no matter
+/// how large the trash is.
+async fn empty_trash(
+    root: &gio::File,
+    mut on_progress: impl FnMut(usize),
+) -> Result<EmptyTrashOutcome, glib::Error> {
+    let enumerator = root
+        .enumerate_children_future(
+            TRASH_ATTRIBUTES,
+            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+            glib::Priority::DEFAULT,
+        )
+        .await?;
+    let mut outcome = EmptyTrashOutcome {
+        deleted: 0,
+        failed: 0,
+        errors: Vec::new(),
+    };
     loop {
         let children = enumerator
             .next_files_future(64, glib::Priority::DEFAULT)
@@ -5084,80 +5684,148 @@ async fn summarize_trash(root: &gio::File) -> Result<TrashSummary, glib::Error> 
         }
         for info in children {
             let file = root.child(info.name());
-            let (count, size) = measure_trash_entry(file.clone(), info.clone()).await?;
-            item_count = item_count.saturating_add(count);
-            total_size = total_size.saturating_add(size);
-            entries.push(trash_file_entry(file, &info));
+            match file.delete_future(glib::Priority::DEFAULT).await {
+                Ok(_) => outcome.deleted += 1,
+                Err(error) => {
+                    outcome.failed += 1;
+                    if outcome.errors.len() < 8 {
+                        outcome
+                            .errors
+                            .push(format!("{}: {error}", info.display_name()));
+                    }
+                }
+            }
         }
+        on_progress(outcome.deleted + outcome.failed);
     }
-    Ok(TrashSummary {
-        entries,
-        item_count,
-        total_size,
-    })
+    Ok(outcome)
 }
 
-type TrashMeasurementFuture = Pin<Box<dyn Future<Output = Result<(usize, u64), glib::Error>>>>;
+fn empty_trash_error_summary(outcome: &EmptyTrashOutcome) -> String {
+    let mut summary = format!(
+        "{} could not be deleted. The remaining items were processed.",
+        item_count_label(outcome.failed)
+    );
+    for error in &outcome.errors {
+        summary.push_str("\n\n• ");
+        summary.push_str(error);
+    }
+    if outcome.failed > outcome.errors.len() {
+        summary.push_str(&format!(
+            "\n\n…and {} more",
+            outcome.failed - outcome.errors.len()
+        ));
+    }
+    summary
+}
 
-fn measure_trash_entry(file: gio::File, info: gio::FileInfo) -> TrashMeasurementFuture {
+type TrashMeasurementFuture =
+    Pin<Box<dyn Future<Output = Result<(usize, u64, bool), glib::Error>>>>;
+
+/// `visited` is shared across the whole walk, so the entry budget applies tree-wide rather than
+/// per-branch, and `deadline` is a fixed point so descending deeper can't reset the time budget.
+fn measure_trash_entry(
+    file: gio::File,
+    info: gio::FileInfo,
+    depth: usize,
+    visited: Rc<Cell<usize>>,
+    deadline: Instant,
+    max_entries: usize,
+    max_depth: usize,
+) -> TrashMeasurementFuture {
     Box::pin(async move {
+        visited.set(visited.get() + 1);
         let mut count = 1_usize;
         let mut size = if info.file_type() == gio::FileType::Regular {
             info.size().max(0) as u64
         } else {
             0
         };
+        let mut truncated = false;
         if info.file_type() == gio::FileType::Directory && !info.is_symlink() {
-            let enumerator = file
-                .enumerate_children_future(
-                    TRASH_ATTRIBUTES,
-                    gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
-                    glib::Priority::DEFAULT,
+            let budget_exhausted =
+                depth >= max_depth || visited.get() >= max_entries || Instant::now() >= deadline;
+            if budget_exhausted {
+                truncated = true;
+            } else {
+                // A directory can become unreadable or disappear before we measure it; degrade
+                // this branch to truncated rather than failing the whole walk.
+                match enumerate_trash_directory(
+                    &file,
+                    depth,
+                    visited.clone(),
+                    deadline,
+                    max_entries,
+                    max_depth,
                 )
-                .await?;
-            loop {
-                let children = enumerator
-                    .next_files_future(64, glib::Priority::DEFAULT)
-                    .await?;
-                if children.is_empty() {
-                    break;
-                }
-                for child in children {
-                    let (child_count, child_size) =
-                        measure_trash_entry(file.child(child.name()), child).await?;
-                    count = count.saturating_add(child_count);
-                    size = size.saturating_add(child_size);
+                .await
+                {
+                    Ok((child_count, child_size, child_truncated)) => {
+                        count = count.saturating_add(child_count);
+                        size = size.saturating_add(child_size);
+                        truncated |= child_truncated;
+                    }
+                    Err(_) => truncated = true,
                 }
             }
         }
-        Ok((count, size))
+        Ok((count, size, truncated))
     })
 }
 
-fn trash_file_entry(file: gio::File, info: &gio::FileInfo) -> FileEntry {
-    let kind = match (info.file_type(), info.is_symlink()) {
-        (gio::FileType::Directory, true) => EntryKind::DirectorySymbolicLink,
-        (gio::FileType::Regular, true) => EntryKind::FileSymbolicLink,
-        (gio::FileType::Directory, false) => EntryKind::Directory,
-        (gio::FileType::Regular, false) => EntryKind::File,
-        (gio::FileType::SymbolicLink, _) => EntryKind::SymbolicLink,
-        _ => EntryKind::Other,
-    };
-    FileEntry {
-        location: location_for_gio_file(&file),
-        native_name: info.name().into_os_string(),
-        display_name: info.display_name().to_string(),
-        kind,
-        size: if matches!(kind, EntryKind::File | EntryKind::FileSymbolicLink) {
-            crate::model::MetadataValue::Known(info.size().max(0) as u64)
-        } else {
-            crate::model::MetadataValue::Unknown
-        },
-        modified_unix_seconds: info
-            .modification_date_time()
-            .map(|time| crate::model::MetadataValue::Known(time.to_unix()))
-            .unwrap_or(crate::model::MetadataValue::Unavailable),
+async fn enumerate_trash_directory(
+    file: &gio::File,
+    depth: usize,
+    visited: Rc<Cell<usize>>,
+    deadline: Instant,
+    max_entries: usize,
+    max_depth: usize,
+) -> Result<(usize, u64, bool), glib::Error> {
+    let enumerator = file
+        .enumerate_children_future(
+            TRASH_ATTRIBUTES,
+            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+            glib::Priority::DEFAULT,
+        )
+        .await?;
+    let mut count = 0_usize;
+    let mut size = 0_u64;
+    let mut truncated = false;
+    'this_directory: loop {
+        let children = enumerator
+            .next_files_future(64, glib::Priority::DEFAULT)
+            .await?;
+        if children.is_empty() {
+            break;
+        }
+        glib::timeout_future(Duration::from_millis(1)).await;
+        for child in children {
+            if visited.get() >= max_entries || Instant::now() >= deadline {
+                truncated = true;
+                break 'this_directory;
+            }
+            let (child_count, child_size, child_truncated) = measure_trash_entry(
+                file.child(child.name()),
+                child,
+                depth + 1,
+                visited.clone(),
+                deadline,
+                max_entries,
+                max_depth,
+            )
+            .await?;
+            count = count.saturating_add(child_count);
+            size = size.saturating_add(child_size);
+            truncated |= child_truncated;
+        }
+        // Stop only when the shared budget is actually spent -- a child's own `truncated` (depth
+        // cap, discarded error) is branch-local and must not cut off its unrelated siblings.
+        if visited.get() >= max_entries || Instant::now() >= deadline {
+            truncated = true;
+            break;
+        }
     }
+    Ok((count, size, truncated))
 }
 
 fn selected_items_summary(entries: &[FileEntry]) -> String {
@@ -5169,6 +5837,11 @@ fn selected_items_summary(entries: &[FileEntry]) -> String {
         .join(", ");
     if entries.len() > 3 {
         names.push_str(", …");
+    }
+    let max_chars = ITEM_CONTEXT_SUMMARY_MAX_CHARS as usize;
+    if names.chars().count() > max_chars {
+        names = names.chars().take(max_chars - 1).collect();
+        names.push('…');
     }
     names
 }
@@ -5334,60 +6007,150 @@ fn connect_context_extract(
     });
 }
 
-fn refresh_transfer_suggestions(
+fn render_transfer_suggestions(
+    suggestions: &gtk::Box,
+    items: Vec<crate::services::SearchItem>,
+    field: &gtk::Entry,
+) {
+    while let Some(child) = suggestions.first_child() {
+        suggestions.remove(&child);
+    }
+    let mut dirs: Vec<_> = items.into_iter().filter(|item| item.is_directory).collect();
+    dirs.sort_by_key(|item| item.path.ancestors().count());
+    dirs.truncate(8);
+    if dirs.is_empty() {
+        let empty = gtk::Label::new(Some("No matching folders"));
+        empty.add_css_class("transfer-suggestions-empty");
+        empty.set_xalign(0.0);
+        suggestions.append(&empty);
+        return;
+    }
+    for item in dirs {
+        append_suggestion(suggestions, &item.path, field);
+    }
+}
+
+fn append_suggestion(suggestions: &gtk::Box, path: &Path, field: &gtk::Entry) {
+    let option = gtk::Button::new();
+    option.add_css_class("transfer-suggestion");
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
+    row.append(&crate::assets::primary_icon(
+        crate::assets::icons::FOLDER,
+        16,
+    ));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    let label = gtk::Label::new(Some(&name));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    row.append(&label);
+    if let Some(parent) = path.parent().map(compact_native_path) {
+        let parent_label = gtk::Label::new(Some(&parent));
+        parent_label.add_css_class("transfer-suggestion-parent");
+        parent_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        parent_label.set_xalign(1.0);
+        row.append(&parent_label);
+    }
+    option.set_child(Some(&row));
+    option.set_tooltip_text(Some(&path.to_string_lossy()));
+    let selected_field = field.clone();
+    let path = path.to_path_buf();
+    option.connect_clicked(move |_| {
+        selected_field.remove_css_class("error");
+        selected_field.set_text(&folder_input_path(&path));
+        selected_field.set_position(-1);
+        selected_field.grab_focus();
+    });
+    suggestions.append(&option);
+}
+
+fn setup_transfer_search(
     field: &gtk::Entry,
     suggestions: &gtk::Box,
     generation: &Rc<Cell<u64>>,
     base: std::path::PathBuf,
+    on_changed: impl Fn(&gtk::Entry) + 'static,
 ) {
-    let request = generation.get().saturating_add(1);
-    generation.set(request);
-    let input = field.text().to_string();
-    let home = glib::home_dir();
-    let field = field.clone();
-    let suggestions = suggestions.clone();
-    let generation = generation.clone();
-    glib::MainContext::default().spawn_local(async move {
-        let matches =
-            gio::spawn_blocking(move || directory_suggestions(&input, &base, &home)).await;
-        if generation.get() != request {
-            return;
-        }
-        while let Some(child) = suggestions.first_child() {
-            suggestions.remove(&child);
-        }
-        let Ok(matches) = matches else {
-            return;
+    let (search_handle, search_receiver) = index_tree(glib::home_dir());
+    let search_handle = Rc::new(search_handle);
+    let query_handle = Rc::downgrade(&search_handle);
+    let search_mode = Rc::new(Cell::new(false));
+    let poll_suggestions = suggestions.downgrade();
+    let poll_field = field.downgrade();
+    let poll_mode = search_mode.clone();
+    let _poll = glib::timeout_add_local(Duration::from_millis(16), move || {
+        let _keep_search_alive = &search_handle;
+        let (Some(suggestions), Some(field)) = (poll_suggestions.upgrade(), poll_field.upgrade())
+        else {
+            return glib::ControlFlow::Break;
         };
-        if matches.is_empty() {
-            let empty = gtk::Label::new(Some("No matching folders"));
-            empty.add_css_class("transfer-suggestions-empty");
-            empty.set_xalign(0.0);
-            suggestions.append(&empty);
+        if field.root().is_none() {
+            return glib::ControlFlow::Break;
         }
-        for path in matches {
-            let option = gtk::Button::new();
-            option.add_css_class("transfer-suggestion");
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 9);
-            row.append(&crate::assets::primary_icon(
-                crate::assets::icons::FOLDER,
-                16,
-            ));
-            let label = gtk::Label::new(Some(&compact_native_path(&path)));
-            label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-            label.set_xalign(0.0);
-            label.set_hexpand(true);
-            row.append(&label);
-            option.set_child(Some(&row));
-            option.set_tooltip_text(Some(&path.to_string_lossy()));
-            let selected_field = field.clone();
-            option.connect_clicked(move |_| {
-                selected_field.remove_css_class("error");
-                selected_field.set_text(&folder_input_path(&path));
-                selected_field.set_position(-1);
-                selected_field.grab_focus();
+        if !poll_mode.get() {
+            return glib::ControlFlow::Continue;
+        }
+        let mut latest = None;
+        for _ in 0..8 {
+            match search_receiver.try_recv() {
+                Ok(event) => latest = Some(event),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return glib::ControlFlow::Break;
+                }
+            }
+        }
+        if let Some(SearchEvent::Results { query, items, .. }) = latest
+            && query == field.text().trim()
+        {
+            render_transfer_suggestions(&suggestions, items, &field);
+        }
+        glib::ControlFlow::Continue
+    });
+    let suggestions_clone = suggestions.clone();
+    let generation_clone = generation.clone();
+    field.connect_changed(move |field| {
+        on_changed(field);
+        let input = field.text().to_string();
+        let request = generation_clone.get().saturating_add(1);
+        generation_clone.set(request);
+        let looks_like_path = input.trim().contains(std::path::MAIN_SEPARATOR)
+            || input.trim().starts_with('~')
+            || input.trim().is_empty();
+        if looks_like_path {
+            search_mode.set(false);
+            let gen_check = generation_clone.clone();
+            let home = glib::home_dir();
+            let base = base.clone();
+            let field_clone = field.clone();
+            let suggestions_clone = suggestions_clone.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let matches =
+                    gio::spawn_blocking(move || path_suggestions(&input, &base, &home)).await;
+                if gen_check.get() != request {
+                    return;
+                }
+                while let Some(child) = suggestions_clone.first_child() {
+                    suggestions_clone.remove(&child);
+                }
+                let Ok(paths) = matches else { return };
+                if paths.is_empty() {
+                    let empty = gtk::Label::new(Some("No matching folders"));
+                    empty.add_css_class("transfer-suggestions-empty");
+                    empty.set_xalign(0.0);
+                    suggestions_clone.append(&empty);
+                }
+                for path in paths {
+                    append_suggestion(&suggestions_clone, &path, &field_clone);
+                }
             });
-            suggestions.append(&option);
+        } else {
+            search_mode.set(true);
+            if let Some(search_handle) = query_handle.upgrade() {
+                search_handle.query(&input);
+            }
         }
     });
 }
@@ -5417,7 +6180,7 @@ fn resolve_destination_path(input: &str, base: &Path, home: &Path) -> std::path:
     }
 }
 
-fn directory_suggestions(input: &str, base: &Path, home: &Path) -> Vec<std::path::PathBuf> {
+fn path_suggestions(input: &str, base: &Path, home: &Path) -> Vec<std::path::PathBuf> {
     let resolved = resolve_destination_path(input, base, home);
     let trailing_separator = input.trim_end().ends_with(std::path::MAIN_SEPARATOR);
     let (directory, prefix) = if trailing_separator {
@@ -5489,6 +6252,18 @@ fn transfer_has_collision(source: &Location, destination: &Location) -> bool {
     target.query_exists(None::<&gio::Cancellable>)
 }
 
+fn normalized_archive_name(name: &str, format: ArchiveFormat) -> String {
+    name.strip_suffix(&format!(".{}", format.extension()))
+        .unwrap_or(name)
+        .to_owned()
+}
+
+fn archive_has_collision(destination: &Location, archive_name: &str) -> bool {
+    gio_file_for_location(destination)
+        .child(archive_name)
+        .query_exists(None::<&gio::Cancellable>)
+}
+
 fn transfer_dropped_files(
     state: &Rc<ViewState>,
     target: &gtk::DropTarget,
@@ -5530,13 +6305,9 @@ pub(super) fn locations_from_file_list_value(value: &glib::Value) -> Option<Vec<
     let locations = files
         .files()
         .iter()
-        .map(location_for_gio_file)
+        .filter_map(location_for_file)
         .collect::<Vec<_>>();
     (!locations.is_empty()).then_some(locations)
-}
-
-pub(super) fn location_for_gio_file(file: &gio::File) -> Location {
-    location_for_file(file)
 }
 
 pub(super) fn file_drag_content(entries: &[FileEntry]) -> Option<gtk::gdk::ContentProvider> {
@@ -5633,9 +6404,17 @@ fn new_folder_destination_depth(
 }
 
 fn same_locations(left: &[Location], right: &[Location]) -> bool {
-    !left.is_empty()
-        && left.len() == right.len()
-        && left.iter().all(|location| right.contains(location))
+    if left.is_empty() || left.len() != right.len() {
+        return false;
+    }
+    let left: HashSet<_> = left.iter().collect();
+    let right: HashSet<_> = right.iter().collect();
+    left.len() == right.len() && left == right
+}
+
+fn retain_untransferred(cut: &mut Vec<Location>, transferred: &[Location]) {
+    let transferred: HashSet<_> = transferred.iter().collect();
+    cut.retain(|location| !transferred.contains(location));
 }
 
 fn item_context_option(icon: &str, label: &str, accelerator: &str) -> gtk::Button {
@@ -5849,6 +6628,12 @@ fn sync_sort_direction_toggle(button: &gtk::Button, icon: &gtk::Image, direction
     } else {
         "Ascending — click to reverse"
     }));
+}
+
+fn update_empty_trash_sensitivity(column: &ColumnView, count: usize) {
+    if let Some(button) = &column.empty_trash_button {
+        button.set_sensitive(count > 0);
+    }
 }
 
 pub(super) fn empty_trash_button(browser: &Rc<Browser>) -> gtk::Button {
@@ -6092,6 +6877,20 @@ fn resized_column_width(initial_width: i32, horizontal_offset: f64) -> i32 {
         .max(f64::from(COLUMN_WIDTH)) as i32
 }
 
+pub(super) fn max_child_natural_width(widget: &gtk::Widget) -> i32 {
+    let (_, natural, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
+    let mut max_natural = natural;
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        let child_max = max_child_natural_width(&c);
+        if child_max > max_natural {
+            max_natural = child_max;
+        }
+        child = c.next_sibling();
+    }
+    max_natural
+}
+
 fn horizontal_reveal_target(
     current: f64,
     page_size: f64,
@@ -6188,7 +6987,16 @@ fn vim_focus_direction(key: gtk::gdk::Key) -> Option<gtk::DirectionType> {
     }
 }
 
-pub(super) fn modal_layer(content: &impl IsA<gtk::Widget>) -> gtk::Box {
+#[expect(
+    deprecated,
+    reason = "GTK 4.12 deprecated translate_coordinates and allocation without a replacement for click-in-bounds checks"
+)]
+pub(super) fn modal_layer(
+    content: &impl IsA<gtk::Widget>,
+    overlay: &gtk::Overlay,
+    root: Option<BlurBin>,
+    block_dismiss: Option<Rc<dyn Fn() -> bool>>,
+) -> gtk::Box {
     let layer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     layer.add_css_class("app-modal-layer");
     layer.add_css_class("modal-backdrop");
@@ -6201,10 +7009,69 @@ pub(super) fn modal_layer(content: &impl IsA<gtk::Widget>) -> gtk::Box {
     top.set_vexpand(true);
     let bottom = gtk::Box::new(gtk::Orientation::Vertical, 0);
     bottom.set_vexpand(true);
+    let left = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    left.set_hexpand(true);
+    let right = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    right.set_hexpand(true);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.append(&left);
+    row.append(content);
+    row.append(&right);
     layer.append(&top);
-    layer.append(content);
+    layer.append(&row);
     layer.append(&bottom);
+
+    let click = gtk::GestureClick::new();
+    let weak_layer = layer.downgrade();
+    let weak_content = content.downgrade();
+    let overlay = overlay.clone();
+    let root = root.clone();
+    let block = block_dismiss.clone();
+    click.connect_pressed(move |_, _, x, y| {
+        if let Some(block) = block.as_ref()
+            && block()
+        {
+            return;
+        }
+        let Some(layer) = weak_layer.upgrade() else {
+            return;
+        };
+        let Some(content) = weak_content.upgrade() else {
+            return;
+        };
+        let on_dialog = content
+            .translate_coordinates(&layer, 0.0, 0.0)
+            .is_some_and(|(cx, cy)| {
+                let alloc = content.allocation();
+                x >= cx
+                    && x < cx + alloc.width() as f64
+                    && y >= cy
+                    && y < cy + alloc.height() as f64
+            });
+        if !on_dialog {
+            dismiss_modal_layer(&layer, &overlay, root.as_ref());
+        }
+    });
+    layer.add_controller(click);
+    animate_in(&layer);
     layer
+}
+
+pub(super) fn animate_in(layer: &gtk::Box) {
+    layer.remove_css_class("dismissing");
+    layer.set_sensitive(true);
+    layer.add_css_class("modal-hidden");
+    let weak = layer.downgrade();
+    glib::timeout_add_local_once(Duration::from_millis(16), move || {
+        if let Some(layer) = weak.upgrade() {
+            layer.remove_css_class("modal-hidden");
+        }
+    });
+}
+
+pub(super) fn animate_out(layer: &gtk::Box, on_done: impl FnOnce() + 'static) {
+    layer.add_css_class("modal-hidden");
+    glib::timeout_add_local_once(Duration::from_millis(200), on_done);
 }
 
 pub(super) fn dismiss_modal_layer(
@@ -6212,10 +7079,34 @@ pub(super) fn dismiss_modal_layer(
     overlay: &gtk::Overlay,
     root: Option<&BlurBin>,
 ) {
-    overlay.remove_overlay(layer);
-    if let Some(root) = root {
-        root.set_blurred(false);
+    if layer.has_css_class("dismissing") {
+        return;
     }
+    layer.add_css_class("dismissing");
+    layer.set_sensitive(false);
+    let overlay = overlay.clone();
+    let layer_for_anim = layer.clone();
+    let layer = layer.clone();
+    let root = root.cloned();
+    animate_out(&layer_for_anim, move || {
+        overlay.remove_overlay(&layer);
+        if let Some(root) = root
+            && !overlay_has_modal_layer(&overlay)
+        {
+            root.set_blurred(false);
+        }
+    });
+}
+
+fn overlay_has_modal_layer(overlay: &gtk::Overlay) -> bool {
+    let mut child = overlay.first_child();
+    while let Some(widget) = child {
+        if widget.is_visible() && widget.has_css_class("app-modal-layer") {
+            return true;
+        }
+        child = widget.next_sibling();
+    }
+    false
 }
 
 fn gio_file_for_location(location: &Location) -> gio::File {
@@ -6373,7 +7264,19 @@ fn show_authentication_dialog(
         }
     });
 
-    let layer = modal_layer(&content);
+    let auth_user = username.clone();
+    let auth_domain = domain.clone();
+    let auth_password = password.clone();
+    let layer = modal_layer(
+        &content,
+        &window_overlay,
+        blurred_root.clone(),
+        Some(Rc::new(move || {
+            !auth_user.text().is_empty()
+                || !auth_domain.text().is_empty()
+                || !auth_password.text().is_empty()
+        })),
+    );
     window_overlay.add_overlay(&layer);
 
     let cancel_operation = operation.cloned();
@@ -6505,6 +7408,23 @@ fn password_save_for_selection(selected: u32) -> gio::PasswordSave {
     }
 }
 
+fn credentials_from_location_input(
+    input: &str,
+) -> Result<(String, Option<MountCredentials>), LocationValidationError> {
+    if !input.contains("://") {
+        return Ok((input.to_owned(), None));
+    }
+    let (sanitized, credentials) = sanitize_uri_credentials(input)?;
+    let credentials = credentials.map(|credentials: UriCredentials| MountCredentials {
+        anonymous: false,
+        username: credentials.username,
+        domain: String::new(),
+        password: credentials.password,
+        save: gio::PasswordSave::Never,
+    });
+    Ok((sanitized, credentials))
+}
+
 #[derive(Clone)]
 struct MountCredentials {
     anonymous: bool,
@@ -6532,7 +7452,9 @@ fn apply_mount_credentials(operation: &gio::MountOperation, credentials: &MountC
         return;
     }
     operation.set_username(Some(&credentials.username));
-    operation.set_domain(Some(&credentials.domain));
+    if !credentials.domain.is_empty() {
+        operation.set_domain(Some(&credentials.domain));
+    }
     operation.set_password(Some(&credentials.password));
     operation.set_password_save(credentials.save);
 }
@@ -6745,12 +7667,22 @@ pub(super) fn open_location(location: &Location, parent: &impl IsA<gtk::Widget>)
 }
 
 pub(super) fn show_error_dialog(parent: &impl IsA<gtk::Widget>, message: &str, detail: &str) {
+    show_error_dialog_after_close(parent, message, detail, Rc::new(|| {}));
+}
+
+fn show_error_dialog_after_close(
+    parent: &impl IsA<gtk::Widget>,
+    message: &str,
+    detail: &str,
+    on_close: Rc<dyn Fn()>,
+) {
     let Some(window_overlay) = parent
         .root()
         .and_downcast::<gtk::Window>()
         .and_then(|window| window.child())
         .and_downcast::<gtk::Overlay>()
     else {
+        on_close();
         return;
     };
     let blurred_root = window_overlay.child().and_downcast::<BlurBin>();
@@ -6777,13 +7709,19 @@ pub(super) fn show_error_dialog(parent: &impl IsA<gtk::Widget>, message: &str, d
     let close_icon = layout.close;
     let close = layout.confirm;
 
-    let layer = modal_layer(&content);
+    let layer = modal_layer(&content, &window_overlay, blurred_root.clone(), None);
     window_overlay.add_overlay(&layer);
     let close_layer = layer.clone();
     let close_overlay = window_overlay.clone();
     let close_root = blurred_root.clone();
+    let dismissed = Rc::new(Cell::new(false));
     let dismiss = move || {
+        if dismissed.replace(true) {
+            return;
+        }
         dismiss_modal_layer(&close_layer, &close_overlay, close_root.as_ref());
+        let on_close = on_close.clone();
+        glib::timeout_add_local_once(Duration::from_millis(250), move || on_close());
     };
     let dismiss = Rc::new(dismiss);
     let clicked_dismiss = dismiss.clone();

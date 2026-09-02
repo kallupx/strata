@@ -7,6 +7,11 @@
 - Write commits and pull request titles in Conventional Commits format: `<type>(optional-scope): <imperative description>`.
 - Keep commits focused. Use `!` and a `BREAKING CHANGE:` footer for breaking changes, and reference the issue in the pull request body.
 
+## Pre-push checks
+
+- Do not push until the full local CI suite passes: `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets --all-features`.
+- Fix failures before pushing rather than relying on CI for feedback. Keep tests portable across supported environments and avoid assertions that depend on platform-specific URI normalization or other incidental system behavior.
+
 ## Issues and pull requests
 
 - Automated agents must follow the same issue-first workflow and pull request template as human contributors; do not remove or bypass template sections.
@@ -21,6 +26,11 @@
 - Do not place test implementations inline with production code.
 - Put module unit tests in an adjacent test module, such as `src/app/navigation/tests.rs`, and declare it from the implementation with `#[cfg(test)] mod tests;`.
 - Use the top-level `tests/` directory for integration tests that exercise the crate through its public API.
+
+## Comments
+
+- Prefer self-explanatory names and structure. Do not add comments that narrate obvious code or restate a test's setup, actions, or assertions.
+- Use concise comments for non-obvious intent, invariants, safety requirements, external constraints, workarounds, or surprising behavior.
 
 ## Icons
 
