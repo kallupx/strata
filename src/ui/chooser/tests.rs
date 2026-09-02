@@ -70,3 +70,13 @@ fn chooser_locations_reject_remote_uris_before_io() {
     ));
     assert!(error.to_string().contains("local files and folders only"));
 }
+
+#[test]
+fn chooser_watches_local_directories() {
+    let root = tempfile::tempdir().expect("temporary directory");
+    let source = ChooserFileSource::new();
+
+    let watch = source.watch(Location::local(root.path()), true, Rc::new(|_| {}));
+
+    assert!(watch.is_some());
+}

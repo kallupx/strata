@@ -6791,7 +6791,7 @@ pub(super) fn empty_trash_button(browser: &Rc<Browser>) -> gtk::Button {
     button
 }
 
-fn column_menu_option(label: &str, selected: bool) -> (gtk::Button, gtk::Image) {
+pub(super) fn column_menu_option(label: &str, selected: bool) -> (gtk::Button, gtk::Image) {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     let check = crate::assets::primary_icon(crate::assets::icons::CHECK, 16);
     check.set_visible(selected);

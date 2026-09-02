@@ -4,7 +4,7 @@
 mod tests;
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     ffi::OsString,
     path::{Path, PathBuf},
@@ -29,11 +29,15 @@ use crate::{
         ChooserKind, ChooserRequest, check_destinations, local_uri, open_selection, safe_filename,
         writable_from_read_only,
     },
-    services::{DirectoryEvent, DirectoryRequest, FileSource, LoadHandle, LocationValidationError},
+    services::{
+        DirectoryChange, DirectoryEvent, DirectoryRequest, FileSource, LoadHandle,
+        LocationValidationError,
+    },
 };
 
 use super::{
-    browser::BrowserView,
+    browser::{BrowserView, column_menu_option},
+    controls::{form_check_button, form_entry, form_label},
     theme::ThemeManager,
     window::{build_appearance_menu, build_sidebar},
 };
@@ -94,6 +98,22 @@ impl FileSource for ChooserFileSource {
             }),
         )
     }
+
+    fn watch(
+        &self,
+        location: Location,
+        include_hidden: bool,
+        notify: Rc<dyn Fn(DirectoryChange)>,
+    ) -> Option<LoadHandle> {
+        let filter = self.filter.clone();
+        LocalFileSource.watch(
+            location,
+            include_hidden,
+            Rc::new(move |change| {
+                notify(filter_directory_change(filter.borrow().as_ref(), change));
+            }),
+        )
+    }
 }
 
 fn file_filter_matches(filter: &gtk::FileFilter, entry: &FileEntry) -> bool {
@@ -110,6 +130,25 @@ fn file_filter_matches(filter: &gtk::FileFilter, entry: &FileEntry) -> bool {
     filter.match_(&info)
 }
 
+fn filter_directory_change(
+    filter: Option<&gtk::FileFilter>,
+    change: DirectoryChange,
+) -> DirectoryChange {
+    match change {
+        DirectoryChange::Upsert(entry)
+            if filter.is_some_and(|filter| !file_filter_matches(filter, &entry)) =>
+        {
+            DirectoryChange::Remove(entry.location)
+        }
+        DirectoryChange::Move { from, entry }
+            if filter.is_some_and(|filter| !file_filter_matches(filter, &entry)) =>
+        {
+            DirectoryChange::Remove(from)
+        }
+        change => change,
+    }
+}
+
 #[derive(Clone)]
 struct PortalFilter {
     portal: FileFilter,
@@ -124,8 +163,77 @@ enum ChoiceControl {
     Select {
         id: String,
         values: Vec<String>,
-        dropdown: gtk::DropDown,
+        dropdown: ChooserDropdown,
     },
+}
+
+type SelectionChanged = Box<dyn Fn(usize)>;
+
+struct ChooserDropdown {
+    button: gtk::MenuButton,
+    selected: Rc<Cell<usize>>,
+    changed: Rc<RefCell<Option<SelectionChanged>>>,
+}
+
+impl ChooserDropdown {
+    fn new(labels: &[&str], selected: usize) -> Self {
+        let selected = selected.min(labels.len().saturating_sub(1));
+        let current = labels.get(selected).copied().unwrap_or_default();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        content.add_css_class("column-menu");
+        let popover = gtk::Popover::builder()
+            .child(&content)
+            .has_arrow(false)
+            .position(gtk::PositionType::Bottom)
+            .build();
+        popover.add_css_class("column-popover");
+        let button = gtk::MenuButton::builder()
+            .label(current)
+            .popover(&popover)
+            .build();
+        button.add_css_class("form-control");
+        button.set_halign(gtk::Align::Start);
+
+        let selected = Rc::new(Cell::new(selected));
+        let changed = Rc::new(RefCell::new(None::<SelectionChanged>));
+        let checks = Rc::new(RefCell::new(Vec::<gtk::Image>::new()));
+        for (index, label) in labels.iter().enumerate() {
+            let (option, check) = column_menu_option(label, index == selected.get());
+            checks.borrow_mut().push(check);
+            let selected = selected.clone();
+            let changed = changed.clone();
+            let checks = checks.clone();
+            let button = button.clone();
+            let popover = popover.clone();
+            let label = (*label).to_owned();
+            option.connect_clicked(move |_| {
+                selected.set(index);
+                button.set_label(&label);
+                for (check_index, check) in checks.borrow().iter().enumerate() {
+                    check.set_visible(check_index == index);
+                }
+                popover.popdown();
+                if let Some(changed) = changed.borrow().as_ref() {
+                    changed(index);
+                }
+            });
+            content.append(&option);
+        }
+
+        Self {
+            button,
+            selected,
+            changed,
+        }
+    }
+
+    fn selected(&self) -> usize {
+        self.selected.get()
+    }
+
+    fn connect_selected(&self, callback: impl Fn(usize) + 'static) {
+        self.changed.replace(Some(Box::new(callback)));
+    }
 }
 
 impl ChoiceControl {
@@ -138,10 +246,7 @@ impl ChoiceControl {
                 dropdown,
             } => (
                 id.clone(),
-                values
-                    .get(dropdown.selected() as usize)
-                    .cloned()
-                    .unwrap_or_default(),
+                values.get(dropdown.selected()).cloned().unwrap_or_default(),
             ),
         }
     }
@@ -152,7 +257,7 @@ struct ChooserState {
     window: gtk::Window,
     view: BrowserView,
     filename: Option<gtk::Entry>,
-    filter_dropdown: Option<gtk::DropDown>,
+    filter_dropdown: Option<ChooserDropdown>,
     filters: Vec<PortalFilter>,
     choices: Vec<ChoiceControl>,
     read_only: Option<gtk::CheckButton>,
@@ -200,7 +305,7 @@ impl ChooserState {
     fn selected_filter(&self) -> Option<FileFilter> {
         self.filter_dropdown
             .as_ref()
-            .and_then(|dropdown| self.filters.get(dropdown.selected() as usize))
+            .and_then(|dropdown| self.filters.get(dropdown.selected()))
             .map(|filter| filter.portal.clone())
     }
 
@@ -396,8 +501,6 @@ pub(crate) fn present_chooser(
         .default_height(720)
         .modal(request.modal)
         .build();
-    window.add_css_class("chooser-window");
-
     let header = gtk::HeaderBar::new();
     header.set_show_title_buttons(true);
     let sidebar_toggle = gtk::ToggleButton::builder()
@@ -437,11 +540,9 @@ pub(crate) fn present_chooser(
     let filename = match &request.kind {
         ChooserKind::SaveFile { current_name } => {
             let row = labeled_row("Name", None::<&gtk::Widget>);
-            let entry = gtk::Entry::builder()
-                .hexpand(true)
-                .placeholder_text("Enter a filename")
-                .build();
-            entry.add_css_class("chooser-control");
+            let entry = form_entry();
+            entry.set_hexpand(true);
+            entry.set_placeholder_text(Some("Enter a filename"));
             if let Some(name) = current_name {
                 entry.set_text(&name.to_string_lossy());
                 entry.select_region(0, -1);
@@ -457,6 +558,7 @@ pub(crate) fn present_chooser(
                 .collect::<Vec<_>>()
                 .join(", ");
             let label = gtk::Label::new(Some(&names));
+            label.add_css_class("action-dialog-description");
             label.set_xalign(0.0);
             label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
             label.set_tooltip_text(Some(&names));
@@ -474,19 +576,16 @@ pub(crate) fn present_chooser(
             .iter()
             .map(|filter| filter.portal.label())
             .collect::<Vec<_>>();
-        let dropdown = gtk::DropDown::from_strings(&labels);
-        dropdown.add_css_class("chooser-control");
-        dropdown.set_hexpand(true);
-        dropdown.set_selected(selected_filter.unwrap_or(0) as u32);
-        let row = labeled_row("Filter", Some(dropdown.upcast_ref()));
+        let dropdown = ChooserDropdown::new(&labels, selected_filter.unwrap_or(0));
+        let row = labeled_row("Filter", Some(dropdown.button.upcast_ref()));
         details.append(&row);
         let filters_for_change = filters.clone();
         let source_for_change = source.clone();
         let browser_for_change = browser.clone();
-        dropdown.connect_selected_notify(move |dropdown| {
+        dropdown.connect_selected(move |selected| {
             source_for_change.set_filter(
                 filters_for_change
-                    .get(dropdown.selected() as usize)
+                    .get(selected)
                     .map(|filter| filter.native.clone()),
             );
             if let Some(last) = browser_for_change.active_depth() {
@@ -500,25 +599,25 @@ pub(crate) fn present_chooser(
 
     let choices = build_choices(&request.choices, &details);
     let read_only = matches!(&request.kind, ChooserKind::Open { .. }).then(|| {
-        let check = gtk::CheckButton::with_label("Open files read-only");
-        check.add_css_class("chooser-check");
+        let check = form_check_button("Open files read-only");
         details.append(&check);
         check
     });
 
     let error = gtk::Label::new(None);
-    error.add_css_class("chooser-error");
+    error.add_css_class("form-message");
+    error.add_css_class("error");
     error.set_xalign(0.0);
     error.set_wrap(true);
     error.set_visible(false);
     details.append(&error);
 
     let new_folder = gtk::Button::with_label("New Folder");
-    new_folder.add_css_class("chooser-secondary");
+    new_folder.add_css_class("action-dialog-cancel");
     let cancel = gtk::Button::with_label("Cancel");
-    cancel.add_css_class("chooser-secondary");
+    cancel.add_css_class("action-dialog-cancel");
     let accept = gtk::Button::with_mnemonic(&request.accept_label);
-    accept.add_css_class("chooser-accept");
+    accept.add_css_class("action-dialog-confirm");
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.add_css_class("chooser-actions");
     actions.append(&new_folder);
@@ -677,8 +776,7 @@ fn build_choices(choices: &[Choice], parent: &gtk::Box) -> Vec<ChoiceControl> {
         .map(|choice| {
             let pairs = choice.pairs();
             if pairs.is_empty() {
-                let check = gtk::CheckButton::with_label(choice.label());
-                check.add_css_class("chooser-check");
+                let check = form_check_button(choice.label());
                 check.set_active(choice.initial_selection() == "true");
                 parent.append(&check);
                 ChoiceControl::Boolean {
@@ -691,16 +789,12 @@ fn build_choices(choices: &[Choice], parent: &gtk::Box) -> Vec<ChoiceControl> {
                     .iter()
                     .map(|(value, _)| (*value).to_owned())
                     .collect::<Vec<_>>();
-                let dropdown = gtk::DropDown::from_strings(&labels);
-                dropdown.add_css_class("chooser-control");
-                dropdown.set_hexpand(true);
-                dropdown.set_selected(
-                    values
-                        .iter()
-                        .position(|value| value == choice.initial_selection())
-                        .unwrap_or(0) as u32,
-                );
-                let row = labeled_row(choice.label(), Some(dropdown.upcast_ref()));
+                let selected = values
+                    .iter()
+                    .position(|value| value == choice.initial_selection())
+                    .unwrap_or(0);
+                let dropdown = ChooserDropdown::new(&labels, selected);
+                let row = labeled_row(choice.label(), Some(dropdown.button.upcast_ref()));
                 parent.append(&row);
                 ChoiceControl::Select {
                     id: choice.id().to_owned(),
@@ -714,9 +808,7 @@ fn build_choices(choices: &[Choice], parent: &gtk::Box) -> Vec<ChoiceControl> {
 
 fn labeled_row(label: &str, child: Option<&gtk::Widget>) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    let label = gtk::Label::new(Some(label));
-    label.add_css_class("chooser-label");
-    label.set_xalign(0.0);
+    let label = form_label(label);
     label.set_width_chars(12);
     row.append(&label);
     if let Some(child) = child {
