@@ -2,21 +2,25 @@
 
 use std::{
     ffi::OsStr,
+    ops::Range,
     path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use html5gum::{DefaultEmitter, Token, Tokenizer};
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::sandbox::Cancellation;
 
 pub const DOCUMENT_INPUT_LIMIT: usize = 1024 * 1024;
 pub const DOCUMENT_EVENT_LIMIT: usize = 20_000;
 pub const DOCUMENT_DEPTH_LIMIT: usize = 32;
-pub const DOCUMENT_WIDGET_LIMIT: usize = 512;
+pub const DOCUMENT_TABLE_CELL_LIMIT: usize = 512;
 pub const DOCUMENT_MARKUP_LIMIT: usize = 4 * 1024 * 1024;
 pub const DOCUMENT_TIME_LIMIT: Duration = Duration::from_millis(500);
+pub const DOCUMENT_UNIT_TARGET: usize = 32 * 1024;
+pub const DOCUMENT_UNIT_LINE_TARGET: usize = 2 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DocumentKind {
@@ -49,7 +53,10 @@ pub enum DocumentBlock {
         cells: Vec<DocumentTableCell>,
     },
     Quote(String),
-    Code(String),
+    Code {
+        markup: String,
+        language: Option<&'static str>,
+    },
     Rule,
     ContainerBoundary,
     TableRow {
@@ -68,12 +75,83 @@ pub enum DocumentListChildKind {
     Paragraph,
     Heading(u8),
     Quote,
-    Code,
+    Code(Option<&'static str>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Document {
     pub blocks: Vec<DocumentBlock>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentLayout {
+    pub units: Vec<DocumentUnit>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentUnit {
+    pub kind: DocumentUnitKind,
+    pub text: String,
+    pub copy_text: String,
+    pub spans: Vec<DocumentSpan>,
+    pub wrap: bool,
+    pub first: bool,
+    pub last: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DocumentUnitKind {
+    Heading(u8),
+    Paragraph,
+    ListItem {
+        depth: usize,
+    },
+    ListChild {
+        depth: usize,
+        kind: DocumentListChildKind,
+    },
+    Quote,
+    Code {
+        list_depth: Option<usize>,
+        language: Option<&'static str>,
+    },
+    Rule {
+        list_depth: Option<usize>,
+    },
+    Table {
+        list_depth: Option<usize>,
+        rows: Vec<Vec<DocumentTableCellLayout>>,
+    },
+    Gap,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentTableCellLayout {
+    pub header: bool,
+    pub text: String,
+    pub spans: Vec<DocumentSpan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentSpan {
+    pub range: Range<usize>,
+    pub style: DocumentSpanStyle,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DocumentSpanStyle {
+    Accent,
+    Bold,
+    Italic,
+    Strikethrough,
+    Monospace,
+    Underline,
+    Link(Arc<str>),
+}
+
+struct StyledText {
+    text: String,
+    spans: Vec<DocumentSpan>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,7 +164,7 @@ pub struct ParsedDocument {
 struct ParseLimits {
     events: usize,
     depth: usize,
-    widgets: usize,
+    table_cells: usize,
     markup: usize,
     time: Duration,
 }
@@ -96,7 +174,7 @@ impl Default for ParseLimits {
         Self {
             events: DOCUMENT_EVENT_LIMIT,
             depth: DOCUMENT_DEPTH_LIMIT,
-            widgets: DOCUMENT_WIDGET_LIMIT,
+            table_cells: DOCUMENT_TABLE_CELL_LIMIT,
             markup: DOCUMENT_MARKUP_LIMIT,
             time: DOCUMENT_TIME_LIMIT,
         }
@@ -121,7 +199,10 @@ enum ActiveBlock {
         markup: String,
     },
     Quote(String),
-    Code(String),
+    Code {
+        markup: String,
+        language: Option<&'static str>,
+    },
 }
 
 impl ActiveBlock {
@@ -132,7 +213,7 @@ impl ActiveBlock {
             | Self::ListItem { markup, .. }
             | Self::ListChild { markup, .. }
             | Self::Quote(markup)
-            | Self::Code(markup) => markup,
+            | Self::Code { markup, .. } => markup,
         }
     }
 
@@ -143,7 +224,7 @@ impl ActiveBlock {
             | Self::ListItem { markup, .. }
             | Self::ListChild { markup, .. }
             | Self::Quote(markup)
-            | Self::Code(markup) => markup,
+            | Self::Code { markup, .. } => markup,
         }
     }
 }
@@ -167,13 +248,18 @@ impl<'a> ParseBudget<'a> {
         }
     }
 
-    fn event(&mut self) -> Result<(), String> {
+    fn check(&self) -> Result<(), String> {
         if self.cancellation.is_cancelled() {
             return Err("Rendered preview was cancelled".to_owned());
         }
         if self.started.elapsed() >= self.limits.time {
             return Err("Rendered preview exceeded the 500 ms parsing limit".to_owned());
         }
+        Ok(())
+    }
+
+    fn event(&mut self) -> Result<(), String> {
+        self.check()?;
         self.events = self.events.saturating_add(1);
         if self.events > self.limits.events {
             return Err("Rendered preview exceeded the 20,000 parser-event limit".to_owned());
@@ -247,6 +333,14 @@ fn parse_document_with_limits(
     cancellation: &Cancellation,
     limits: ParseLimits,
 ) -> Result<ParsedDocument, String> {
+    if cancellation.is_cancelled() {
+        return Err("Rendered preview was cancelled".to_owned());
+    }
+    if source.contains('\0') {
+        return Err(
+            "Rendered preview is unavailable because the document contains NUL bytes".to_owned(),
+        );
+    }
     let parsed = match kind {
         DocumentKind::Markdown => parse_markdown_bounded(source, cancellation, limits, true),
         DocumentKind::Html => parse_html_bounded(source, cancellation, limits),
@@ -260,7 +354,7 @@ pub fn parse_markdown(markdown: &str) -> Document {
     let limits = ParseLimits {
         events: usize::MAX,
         depth: usize::MAX,
-        widgets: usize::MAX,
+        table_cells: usize::MAX,
         markup: usize::MAX,
         time: Duration::MAX,
     };
@@ -276,6 +370,7 @@ fn parse_markdown_bounded(
     document_features: bool,
 ) -> Result<ParsedDocument, String> {
     let mut budget = ParseBudget::new(cancellation, limits);
+    budget.check()?;
     let mut blocks = Vec::new();
     let mut active = None;
     let mut links = Vec::new();
@@ -503,7 +598,8 @@ fn parse_markdown_bounded(
                 append_markup(&mut active, &mut table_cell, "[Image: ");
             }
             Event::End(TagEnd::Image) => append_markup(&mut active, &mut table_cell, "]"),
-            Event::Start(Tag::CodeBlock(_)) => {
+            Event::Start(Tag::CodeBlock(kind)) => {
+                let language = markdown_code_language(kind);
                 if matches!(
                     active,
                     Some(
@@ -520,11 +616,14 @@ fn parse_markdown_bounded(
                     active = Some(if let Some(depth) = list_items.last() {
                         ActiveBlock::ListChild {
                             depth: *depth,
-                            kind: DocumentListChildKind::Code,
+                            kind: DocumentListChildKind::Code(language),
                             markup: String::new(),
                         }
                     } else {
-                        ActiveBlock::Code(String::new())
+                        ActiveBlock::Code {
+                            markup: String::new(),
+                            language,
+                        }
                     });
                 }
             }
@@ -532,9 +631,9 @@ fn parse_markdown_bounded(
                 if matches!(
                     active,
                     Some(
-                        ActiveBlock::Code(_)
+                        ActiveBlock::Code { .. }
                             | ActiveBlock::ListChild {
-                                kind: DocumentListChildKind::Code,
+                                kind: DocumentListChildKind::Code(_),
                                 ..
                             }
                     )
@@ -590,12 +689,19 @@ fn parse_markdown_bounded(
     })
 }
 
+#[derive(Clone)]
+enum HtmlLink {
+    External(String),
+    Underline,
+    Inert,
+}
+
 struct HtmlState {
     blocks: Vec<DocumentBlock>,
     active: Option<ActiveBlock>,
     lists: Vec<Option<u64>>,
     list_items: Vec<usize>,
-    links: Vec<Option<String>>,
+    links: Vec<HtmlLink>,
     stack: Vec<String>,
     skipped_depth: usize,
     quote_depth: usize,
@@ -606,6 +712,8 @@ struct HtmlState {
     markup_remaining: usize,
     markup_exceeded: bool,
     preformatted: bool,
+    pending_space: bool,
+    at_line_start: bool,
     warned: bool,
     malformed: bool,
 }
@@ -628,12 +736,20 @@ impl HtmlState {
             markup_remaining: markup_limit,
             markup_exceeded: false,
             preformatted: false,
+            pending_space: false,
+            at_line_start: true,
             warned: false,
             malformed: false,
         }
     }
 
-    fn start(&mut self, name: &str, href: Option<&str>, self_closing: bool) {
+    fn start(
+        &mut self,
+        name: &str,
+        href: Option<&str>,
+        language: Option<&'static str>,
+        self_closing: bool,
+    ) {
         let void = is_void_html_tag(name) || self_closing;
         if self.skipped_depth > 0 {
             if !void {
@@ -738,35 +854,48 @@ impl HtmlState {
                     markup: String::new(),
                 });
             }
-            "em" | "i" => self.append_markup("<i>"),
-            "strong" | "b" => self.append_markup("<b>"),
-            "s" | "del" => self.append_markup("<s>"),
+            "em" | "i" => self.start_inline("<i>"),
+            "strong" | "b" => self.start_inline("<b>"),
+            "s" | "del" => self.start_inline("<s>"),
             "a" => {
                 self.ensure_text_target();
-                let destination = href.filter(|href| has_web_scheme(href)).map(str::to_owned);
-                if href.is_some() && destination.is_none() {
+                self.flush_pending_space();
+                let link = if self.links.is_empty() {
+                    match href {
+                        Some(href) if has_web_scheme(href) => HtmlLink::External(href.to_owned()),
+                        Some(_) => {
+                            self.warned = true;
+                            HtmlLink::Underline
+                        }
+                        None => HtmlLink::Underline,
+                    }
+                } else {
                     self.warned = true;
-                }
-                self.append_link_open(destination.as_deref());
-                self.links.push(destination);
+                    HtmlLink::Inert
+                };
+                self.append_link_open(&link);
+                self.links.push(link);
             }
             "pre" => {
                 self.finish_list_parent();
                 self.start_active(if let Some(depth) = self.list_items.last() {
                     ActiveBlock::ListChild {
                         depth: *depth,
-                        kind: DocumentListChildKind::Code,
+                        kind: DocumentListChildKind::Code(None),
                         markup: String::new(),
                     }
                 } else {
-                    ActiveBlock::Code(String::new())
+                    ActiveBlock::Code {
+                        markup: String::new(),
+                        language: None,
+                    }
                 });
                 self.preformatted = true;
             }
             "code" if !self.preformatted => {
-                self.append_markup("<tt>");
+                self.start_inline("<tt>");
             }
-            "code" => {}
+            "code" => self.set_code_language(language),
             "hr" => {
                 self.finish_list_parent();
                 if let Some(depth) = self.list_items.last().copied() {
@@ -777,6 +906,8 @@ impl HtmlState {
             }
             "br" => {
                 self.ensure_text_target();
+                self.pending_space = false;
+                self.at_line_start = true;
                 self.append_markup("\n");
             }
             "table" => {
@@ -801,6 +932,8 @@ impl HtmlState {
             "th" | "td" => {
                 self.table_cell_header = name == "th";
                 self.table_cell = Some(String::new());
+                self.pending_space = false;
+                self.at_line_start = true;
                 self.append_link_openings();
             }
             "main" | "article" | "section" | "header" | "footer" | "nav" | "aside" | "div" => {
@@ -869,7 +1002,7 @@ impl HtmlState {
             "s" | "del" => self.append_markup("</s>"),
             "a" => {
                 if let Some(link) = self.links.pop() {
-                    self.append_link_close(link.is_some());
+                    self.append_link_close(&link);
                 }
             }
             "pre" => {
@@ -904,16 +1037,58 @@ impl HtmlState {
     }
 
     fn text(&mut self, text: &str) {
-        if self.skipped_depth > 0 || (self.active.is_none() && text.trim().is_empty()) {
+        if self.skipped_depth > 0
+            || (self.active.is_none()
+                && self.table_cell.is_none()
+                && text.chars().all(is_html_whitespace))
+        {
             return;
         }
         self.ensure_text_target();
-        self.append_escaped(text);
+        if self.preformatted {
+            self.append_escaped(text);
+            return;
+        }
+
+        let mut collapsed = String::with_capacity(text.len());
+        for character in text.chars() {
+            if is_html_whitespace(character) {
+                if !self.at_line_start {
+                    self.pending_space = true;
+                }
+            } else {
+                if self.pending_space {
+                    collapsed.push(' ');
+                    self.pending_space = false;
+                }
+                collapsed.push(character);
+                self.at_line_start = false;
+            }
+        }
+        self.append_escaped(&collapsed);
     }
 
     fn start_active(&mut self, active: ActiveBlock) {
         self.active = Some(active);
+        self.pending_space = false;
+        self.at_line_start = true;
         self.append_link_openings();
+    }
+
+    fn set_code_language(&mut self, language: Option<&'static str>) {
+        let Some(language) = language else {
+            return;
+        };
+        match self.active.as_mut() {
+            Some(ActiveBlock::Code {
+                language: current, ..
+            }) => *current = Some(language),
+            Some(ActiveBlock::ListChild {
+                kind: DocumentListChildKind::Code(current),
+                ..
+            }) => *current = Some(language),
+            _ => {}
+        }
     }
 
     fn ensure_text_target(&mut self) {
@@ -938,6 +1113,8 @@ impl HtmlState {
 
     fn finish_active(&mut self) {
         if self.active.is_some() {
+            self.pending_space = false;
+            self.at_line_start = true;
             self.append_link_closings();
             finish_block(&mut self.active, &mut self.blocks);
         }
@@ -945,6 +1122,8 @@ impl HtmlState {
 
     fn finish_list_parent(&mut self) {
         if self.active.is_some() {
+            self.pending_space = false;
+            self.at_line_start = true;
             self.append_link_closings();
             finish_parent_list_item(&mut self.active, &mut self.blocks);
         }
@@ -952,7 +1131,7 @@ impl HtmlState {
 
     fn append_link_openings(&mut self) {
         for link in self.links.clone() {
-            self.append_link_open(link.as_deref());
+            self.append_link_open(&link);
             if self.markup_exceeded {
                 break;
             }
@@ -961,7 +1140,8 @@ impl HtmlState {
 
     fn append_link_closings(&mut self) {
         for index in (0..self.links.len()).rev() {
-            self.append_link_close(self.links[index].is_some());
+            let link = self.links[index].clone();
+            self.append_link_close(&link);
             if self.markup_exceeded {
                 break;
             }
@@ -977,23 +1157,42 @@ impl HtmlState {
         append_markup(&mut self.active, &mut self.table_cell, markup);
     }
 
-    fn append_escaped(&mut self, text: &str) {
-        self.append_markup(&glib::markup_escape_text(text));
+    fn start_inline(&mut self, markup: &str) {
+        self.ensure_text_target();
+        self.flush_pending_space();
+        self.append_markup(markup);
     }
 
-    fn append_link_open(&mut self, destination: Option<&str>) {
-        if let Some(destination) = destination {
-            self.append_markup("<a href=\"");
-            self.append_escaped(destination);
-            self.append_markup("\">");
-        } else {
-            self.append_markup("<u>");
+    fn flush_pending_space(&mut self) {
+        if self.pending_space && !self.at_line_start {
+            self.pending_space = false;
+            self.append_escaped(" ");
         }
     }
 
-    fn append_link_close(&mut self, external: bool) {
+    fn append_escaped(&mut self, text: &str) {
+        self.append_markup(&escape_document_text(text));
+    }
+
+    fn append_link_open(&mut self, link: &HtmlLink) {
+        match link {
+            HtmlLink::External(destination) => {
+                self.append_markup("<a href=\"");
+                self.append_escaped(destination);
+                self.append_markup("\">");
+            }
+            HtmlLink::Underline => self.append_markup("<u>"),
+            HtmlLink::Inert => {}
+        }
+    }
+
+    fn append_link_close(&mut self, link: &HtmlLink) {
         if self.active.is_some() || self.table_cell.is_some() {
-            self.append_markup(if external { "</a>" } else { "</u>" });
+            match link {
+                HtmlLink::External(_) => self.append_markup("</a>"),
+                HtmlLink::Underline => self.append_markup("</u>"),
+                HtmlLink::Inert => {}
+            }
         }
     }
 
@@ -1066,6 +1265,7 @@ fn parse_html_bounded(
     limits: ParseLimits,
 ) -> Result<ParsedDocument, String> {
     let mut budget = ParseBudget::new(cancellation, limits);
+    budget.check()?;
     let mut state = HtmlState::new(limits.markup);
     let mut emitter = DefaultEmitter::default();
     emitter.naively_switch_states(true);
@@ -1076,15 +1276,21 @@ fn parse_html_bounded(
             Token::StartTag(tag) => {
                 let name = String::from_utf8_lossy(&tag.name).to_ascii_lowercase();
                 let mut href = None;
+                let mut language = None;
                 for (attribute, value) in &tag.attributes {
                     let attribute = String::from_utf8_lossy(attribute).to_ascii_lowercase();
                     if name == "a" && attribute == "href" {
                         href = Some(String::from_utf8_lossy(&value.value).into_owned());
+                    } else if name == "code" && attribute == "class" {
+                        language = html_code_language(&String::from_utf8_lossy(&value.value));
+                        if language.is_none() {
+                            state.warned = true;
+                        }
                     } else {
                         state.warned = true;
                     }
                 }
-                state.start(&name, href.as_deref(), tag.self_closing);
+                state.start(&name, href.as_deref(), language, tag.self_closing);
                 state.check_markup()?;
                 budget.nesting(state.stack.len())?;
             }
@@ -1126,20 +1332,8 @@ fn validate_document(
     if parsed.document.blocks.is_empty() {
         return Err("Rendered preview found no supported document content".to_owned());
     }
-    let widgets = parsed
-        .document
-        .blocks
-        .iter()
-        .map(|block| match block {
-            DocumentBlock::TableRow { cells, .. } | DocumentBlock::ListTableRow { cells, .. } => {
-                cells.len()
-            }
-            DocumentBlock::ContainerBoundary => 0,
-            _ => 1,
-        })
-        .sum::<usize>();
-    if widgets > limits.widgets {
-        return Err("Rendered preview exceeded the 512-widget limit".to_owned());
+    if !tables_within_cell_limit(&parsed.document.blocks, limits.table_cells) {
+        return Err("Rendered preview exceeded the 512-cell limit for one table".to_owned());
     }
     let markup = parsed
         .document
@@ -1161,6 +1355,505 @@ fn validate_document(
     Ok(parsed)
 }
 
+pub fn layout_document(
+    document: Document,
+    cancellation: &Cancellation,
+) -> Result<DocumentLayout, String> {
+    layout_document_bounded(document, cancellation, DOCUMENT_TIME_LIMIT)
+}
+
+fn layout_document_bounded(
+    document: Document,
+    cancellation: &Cancellation,
+    time_limit: Duration,
+) -> Result<DocumentLayout, String> {
+    let budget = LayoutBudget::new(cancellation, time_limit);
+    let mut units = Vec::new();
+    let mut blocks = document.blocks.into_iter().peekable();
+
+    while let Some(block) = blocks.next() {
+        budget.check()?;
+        match block {
+            DocumentBlock::Heading { level, markup } => push_styled_units(
+                &mut units,
+                DocumentUnitKind::Heading(level),
+                &markup,
+                None,
+                &budget,
+            )?,
+            DocumentBlock::Paragraph(markup) => push_styled_units(
+                &mut units,
+                DocumentUnitKind::Paragraph,
+                &markup,
+                None,
+                &budget,
+            )?,
+            DocumentBlock::ListItem {
+                marker,
+                depth,
+                markup,
+            } => {
+                let marker_chars = marker.chars().count();
+                push_styled_units(
+                    &mut units,
+                    DocumentUnitKind::ListItem { depth },
+                    &markup,
+                    Some((format!("{marker} "), marker_chars)),
+                    &budget,
+                )?;
+            }
+            DocumentBlock::ListChild {
+                depth,
+                kind,
+                markup,
+            } => push_styled_units(
+                &mut units,
+                match kind {
+                    DocumentListChildKind::Code(language) => DocumentUnitKind::Code {
+                        list_depth: Some(depth),
+                        language,
+                    },
+                    _ => DocumentUnitKind::ListChild { depth, kind },
+                },
+                &markup,
+                None,
+                &budget,
+            )?,
+            DocumentBlock::Quote(markup) => push_styled_units(
+                &mut units,
+                DocumentUnitKind::Quote,
+                &markup,
+                Some(("│ ".to_owned(), 0)),
+                &budget,
+            )?,
+            DocumentBlock::Code { markup, language } => push_styled_units(
+                &mut units,
+                DocumentUnitKind::Code {
+                    list_depth: None,
+                    language,
+                },
+                &markup,
+                None,
+                &budget,
+            )?,
+            DocumentBlock::Rule => units.push(rule_unit(None)),
+            DocumentBlock::ListRule { depth } => units.push(rule_unit(Some(depth))),
+            DocumentBlock::ContainerBoundary => {
+                if !matches!(
+                    units.last().map(|unit| &unit.kind),
+                    Some(DocumentUnitKind::Gap)
+                ) {
+                    units.push(DocumentUnit {
+                        kind: DocumentUnitKind::Gap,
+                        text: String::new(),
+                        copy_text: String::new(),
+                        spans: Vec::new(),
+                        wrap: false,
+                        first: true,
+                        last: true,
+                    });
+                }
+            }
+            DocumentBlock::TableRow { cells } => {
+                let mut rows = vec![layout_table_row(cells, &budget)?];
+                while matches!(blocks.peek(), Some(DocumentBlock::TableRow { .. })) {
+                    let Some(DocumentBlock::TableRow { cells }) = blocks.next() else {
+                        unreachable!();
+                    };
+                    rows.push(layout_table_row(cells, &budget)?);
+                    budget.check()?;
+                }
+                units.push(table_unit(None, rows));
+            }
+            DocumentBlock::ListTableRow { depth, cells } => {
+                let mut rows = vec![layout_table_row(cells, &budget)?];
+                while matches!(
+                    blocks.peek(),
+                    Some(DocumentBlock::ListTableRow { depth: next, .. }) if *next == depth
+                ) {
+                    let Some(DocumentBlock::ListTableRow { cells, .. }) = blocks.next() else {
+                        unreachable!();
+                    };
+                    rows.push(layout_table_row(cells, &budget)?);
+                    budget.check()?;
+                }
+                units.push(table_unit(Some(depth), rows));
+            }
+        }
+    }
+
+    budget.check()?;
+    Ok(DocumentLayout { units })
+}
+
+struct LayoutBudget<'a> {
+    cancellation: &'a Cancellation,
+    started: Instant,
+    time_limit: Duration,
+}
+
+impl<'a> LayoutBudget<'a> {
+    fn new(cancellation: &'a Cancellation, time_limit: Duration) -> Self {
+        Self {
+            cancellation,
+            started: Instant::now(),
+            time_limit,
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.cancellation.is_cancelled() {
+            Err("Rendered preview was cancelled".to_owned())
+        } else if self.started.elapsed() >= self.time_limit {
+            Err("Rendered preview exceeded the 500 ms layout limit".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn decode_document_markup(markup: &str, budget: &LayoutBudget<'_>) -> Result<StyledText, String> {
+    let mut text = String::with_capacity(markup.len());
+    let mut spans = Vec::new();
+    let mut active = Vec::<(&str, DocumentSpanStyle)>::new();
+    let mut characters = 0;
+    let mut remaining = markup;
+
+    while let Some(start) = remaining.find('<') {
+        budget.check()?;
+        append_styled_text(
+            &mut text,
+            &mut spans,
+            &active,
+            &remaining[..start],
+            &mut characters,
+            budget,
+        )?;
+        let Some(end) = remaining[start + 1..].find('>') else {
+            return Err("Rendered preview contains unsupported document structure".to_owned());
+        };
+        let tag = &remaining[start + 1..start + 1 + end];
+        if let Some(closing) = tag.strip_prefix('/') {
+            if active.pop().map(|(name, _)| name) != Some(closing) {
+                return Err("Rendered preview contains unsupported document structure".to_owned());
+            }
+        } else {
+            let (name, style) = match tag {
+                "b" => ("b", DocumentSpanStyle::Bold),
+                "i" => ("i", DocumentSpanStyle::Italic),
+                "s" => ("s", DocumentSpanStyle::Strikethrough),
+                "tt" => ("tt", DocumentSpanStyle::Monospace),
+                "u" => ("u", DocumentSpanStyle::Underline),
+                _ => {
+                    let Some(uri) = tag
+                        .strip_prefix("a href=\"")
+                        .and_then(|value| value.strip_suffix('"'))
+                        .map(decode_markup_text)
+                        .transpose()?
+                        .filter(|uri| has_web_scheme(uri))
+                    else {
+                        return Err(
+                            "Rendered preview contains unsupported document structure".to_owned()
+                        );
+                    };
+                    ("a", DocumentSpanStyle::Link(Arc::from(uri)))
+                }
+            };
+            active.push((name, style));
+        }
+        remaining = &remaining[start + end + 2..];
+    }
+    append_styled_text(
+        &mut text,
+        &mut spans,
+        &active,
+        remaining,
+        &mut characters,
+        budget,
+    )?;
+    if !active.is_empty() {
+        return Err("Rendered preview contains unsupported document structure".to_owned());
+    }
+    Ok(StyledText { text, spans })
+}
+
+fn decode_markup_text(markup: &str) -> Result<String, String> {
+    gtk::pango::parse_markup(markup, '\0')
+        .map(|(_, text, _)| text.to_string())
+        .map_err(|_| "Rendered preview contains unsupported document structure".to_owned())
+}
+
+fn append_styled_text(
+    output: &mut String,
+    spans: &mut Vec<DocumentSpan>,
+    active: &[(&str, DocumentSpanStyle)],
+    escaped: &str,
+    characters: &mut usize,
+    budget: &LayoutBudget<'_>,
+) -> Result<(), String> {
+    if escaped.is_empty() {
+        return Ok(());
+    }
+    budget.check()?;
+    let decoded = decode_markup_text(escaped)?;
+    budget.check()?;
+    let start = *characters;
+    output.push_str(&decoded);
+    let end = start + decoded.chars().count();
+    budget.check()?;
+    *characters = end;
+    for (index, (_, style)) in active.iter().enumerate() {
+        budget.check()?;
+        if start == end
+            || active[..index]
+                .iter()
+                .any(|(_, previous)| previous == style)
+        {
+            continue;
+        }
+        if let Some(previous) = spans.last_mut()
+            && previous.style == *style
+            && previous.range.end == start
+        {
+            previous.range.end = end;
+        } else {
+            spans.push(DocumentSpan {
+                range: start..end,
+                style: style.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn push_styled_units(
+    units: &mut Vec<DocumentUnit>,
+    kind: DocumentUnitKind,
+    markup: &str,
+    prefix: Option<(String, usize)>,
+    budget: &LayoutBudget<'_>,
+) -> Result<(), String> {
+    let mut styled = decode_document_markup(markup, budget)?;
+    if let Some((prefix, accent_chars)) = prefix {
+        let shift = prefix.chars().count();
+        for (index, span) in styled.spans.iter_mut().enumerate() {
+            if index % 256 == 0 {
+                budget.check()?;
+            }
+            span.range = span.range.start + shift..span.range.end + shift;
+        }
+        if accent_chars > 0 {
+            styled.spans.push(DocumentSpan {
+                range: 0..accent_chars,
+                style: DocumentSpanStyle::Accent,
+            });
+        }
+        styled.text.insert_str(0, &prefix);
+    }
+
+    styled
+        .spans
+        .sort_by_key(|span| (span.range.start, span.range.end));
+    budget.check()?;
+    let ranges = document_unit_ranges(&styled.text, budget)?;
+    let count = ranges.len();
+    let first_unit = units.len();
+    let mut unit_char_ranges = Vec::with_capacity(count);
+    let mut start_char = 0;
+    for (index, range) in ranges.into_iter().enumerate() {
+        budget.check()?;
+        let starts_midline = range.start > 0 && styled.text.as_bytes()[range.start - 1] != b'\n';
+        let ends_midline = range.end < styled.text.len()
+            && styled.text.as_bytes()[range.end.saturating_sub(1)] != b'\n';
+        let mut end = range.end;
+        let ended_with_newline = styled.text[range.clone()].ends_with('\n');
+        if ended_with_newline {
+            end -= 1;
+        }
+        let display = &styled.text[range.start..end];
+        let end_char = start_char + display.chars().count();
+        unit_char_ranges.push(start_char..end_char);
+        let last = index + 1 == count;
+        let mut copy_text = styled.text[range].to_owned();
+        if last && !copy_text.ends_with('\n') {
+            copy_text.push('\n');
+        }
+        units.push(DocumentUnit {
+            kind: kind.clone(),
+            text: display.to_owned(),
+            copy_text,
+            spans: Vec::new(),
+            wrap: !(starts_midline || ends_midline),
+            first: index == 0,
+            last,
+        });
+        start_char = end_char + usize::from(ended_with_newline);
+    }
+
+    let mut first_overlap = 0;
+    let mut work = 0usize;
+    for span in styled.spans {
+        if work.is_multiple_of(256) {
+            budget.check()?;
+        }
+        while first_overlap < unit_char_ranges.len()
+            && unit_char_ranges[first_overlap].end <= span.range.start
+        {
+            first_overlap += 1;
+        }
+        for (index, range) in unit_char_ranges.iter().enumerate().skip(first_overlap) {
+            if range.start >= span.range.end {
+                break;
+            }
+            let start = span.range.start.max(range.start);
+            let end = span.range.end.min(range.end);
+            if start < end {
+                units[first_unit + index].spans.push(DocumentSpan {
+                    range: start - range.start..end - range.start,
+                    style: span.style.clone(),
+                });
+            }
+            work = work.saturating_add(1);
+            if work.is_multiple_of(256) {
+                budget.check()?;
+            }
+        }
+    }
+    budget.check()
+}
+
+fn document_unit_ranges(
+    text: &str,
+    budget: &LayoutBudget<'_>,
+) -> Result<Vec<Range<usize>>, String> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut end = 0;
+    for line in text.split_inclusive('\n') {
+        budget.check()?;
+        let line_start = end;
+        let next = line_start + line.len();
+        let content_end = next - usize::from(line.ends_with('\n'));
+        if content_end - line_start > DOCUMENT_UNIT_LINE_TARGET {
+            if end > start {
+                ranges.push(start..end);
+            }
+            let mut chunk_start = line_start;
+            while content_end - chunk_start > DOCUMENT_UNIT_LINE_TARGET {
+                budget.check()?;
+                let remaining = content_end - chunk_start;
+                let chunk_bytes = if remaining < DOCUMENT_UNIT_LINE_TARGET * 2 {
+                    remaining.div_ceil(2)
+                } else {
+                    DOCUMENT_UNIT_LINE_TARGET
+                };
+                let mut chunk_end = chunk_start + chunk_bytes;
+                while !text.is_char_boundary(chunk_end) {
+                    chunk_end -= 1;
+                }
+                ranges.push(chunk_start..chunk_end);
+                chunk_start = chunk_end;
+            }
+            if chunk_start < next {
+                ranges.push(chunk_start..next);
+            }
+            start = next;
+            end = next;
+            continue;
+        }
+        if end > start && next - start > DOCUMENT_UNIT_TARGET {
+            ranges.push(start..end);
+            start = end;
+        }
+        end = next;
+    }
+    if start < text.len() {
+        ranges.push(start..text.len());
+    } else if ranges.is_empty() {
+        ranges.push(0..text.len());
+    }
+    Ok(ranges)
+}
+
+fn layout_table_row(
+    cells: Vec<DocumentTableCell>,
+    budget: &LayoutBudget<'_>,
+) -> Result<Vec<DocumentTableCellLayout>, String> {
+    cells
+        .into_iter()
+        .map(|cell| {
+            budget.check()?;
+            let styled = decode_document_markup(&cell.markup, budget)?;
+            Ok(DocumentTableCellLayout {
+                header: cell.header,
+                text: styled.text,
+                spans: styled.spans,
+            })
+        })
+        .collect()
+}
+
+fn table_unit(list_depth: Option<usize>, rows: Vec<Vec<DocumentTableCellLayout>>) -> DocumentUnit {
+    let copy_text = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\t")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    DocumentUnit {
+        kind: DocumentUnitKind::Table { list_depth, rows },
+        text: String::new(),
+        copy_text,
+        spans: Vec::new(),
+        wrap: false,
+        first: true,
+        last: true,
+    }
+}
+
+fn rule_unit(list_depth: Option<usize>) -> DocumentUnit {
+    let text = "────────────────────────".to_owned();
+    DocumentUnit {
+        kind: DocumentUnitKind::Rule { list_depth },
+        copy_text: format!("{text}\n"),
+        text,
+        spans: Vec::new(),
+        wrap: false,
+        first: true,
+        last: true,
+    }
+}
+
+fn tables_within_cell_limit(blocks: &[DocumentBlock], limit: usize) -> bool {
+    let mut table = None::<Option<usize>>;
+    let mut cells = 0usize;
+    for block in blocks {
+        let next = match block {
+            DocumentBlock::TableRow { cells } => Some((None, cells.len())),
+            DocumentBlock::ListTableRow { depth, cells } => Some((Some(*depth), cells.len())),
+            _ => None,
+        };
+        if let Some((depth, row_cells)) = next {
+            if table != Some(depth) {
+                cells = 0;
+                table = Some(depth);
+            }
+            cells = cells.saturating_add(row_cells);
+            if cells > limit {
+                return false;
+            }
+        } else {
+            table = None;
+        }
+    }
+    true
+}
+
 fn block_has_balanced_markup(block: &DocumentBlock) -> bool {
     match block {
         DocumentBlock::Heading { markup, .. }
@@ -1168,7 +1861,7 @@ fn block_has_balanced_markup(block: &DocumentBlock) -> bool {
         | DocumentBlock::ListItem { markup, .. }
         | DocumentBlock::ListChild { markup, .. }
         | DocumentBlock::Quote(markup)
-        | DocumentBlock::Code(markup) => has_balanced_markup(markup),
+        | DocumentBlock::Code { markup, .. } => has_balanced_markup(markup),
         DocumentBlock::TableRow { cells } | DocumentBlock::ListTableRow { cells, .. } => {
             cells.iter().all(|cell| has_balanced_markup(&cell.markup))
         }
@@ -1212,13 +1905,66 @@ fn block_markup_bytes(block: &DocumentBlock) -> usize {
         | DocumentBlock::ListItem { markup, .. }
         | DocumentBlock::ListChild { markup, .. }
         | DocumentBlock::Quote(markup)
-        | DocumentBlock::Code(markup) => markup.len(),
+        | DocumentBlock::Code { markup, .. } => markup.len(),
         DocumentBlock::TableRow { cells } | DocumentBlock::ListTableRow { cells, .. } => {
             cells.iter().map(|cell| cell.markup.len()).sum()
         }
         DocumentBlock::Rule | DocumentBlock::ListRule { .. } | DocumentBlock::ContainerBoundary => {
             0
         }
+    }
+}
+
+fn markdown_code_language(kind: &CodeBlockKind<'_>) -> Option<&'static str> {
+    match kind {
+        CodeBlockKind::Indented => None,
+        CodeBlockKind::Fenced(info) => info.split_ascii_whitespace().next().and_then(code_language),
+    }
+}
+
+fn html_code_language(classes: &str) -> Option<&'static str> {
+    classes.split_ascii_whitespace().find_map(|class| {
+        class
+            .to_ascii_lowercase()
+            .strip_prefix("language-")
+            .and_then(code_language)
+    })
+}
+
+fn code_language(hint: &str) -> Option<&'static str> {
+    match hint.trim().to_ascii_lowercase().as_str() {
+        "bash" | "shell" | "sh" => Some("sh"),
+        "c" => Some("c"),
+        "c++" | "cpp" => Some("cpp"),
+        "c#" | "csharp" | "cs" => Some("c-sharp"),
+        "css" => Some("css"),
+        "dart" => Some("dart"),
+        "diff" | "patch" => Some("diff"),
+        "docker" | "dockerfile" => Some("docker"),
+        "go" | "golang" => Some("go"),
+        "html" => Some("html"),
+        "java" => Some("java"),
+        "javascript" | "js" => Some("js"),
+        "json" => Some("json"),
+        "jsx" => Some("jsx"),
+        "kotlin" | "kt" => Some("kotlin"),
+        "lua" => Some("lua"),
+        "make" | "makefile" => Some("makefile"),
+        "markdown" | "md" => Some("markdown"),
+        "php" => Some("php"),
+        "powershell" | "ps1" => Some("powershell"),
+        "py" | "python" | "python3" => Some("python3"),
+        "rb" | "ruby" => Some("ruby"),
+        "rs" | "rust" => Some("rust"),
+        "sql" => Some("sql"),
+        "swift" => Some("swift"),
+        "toml" => Some("toml"),
+        "ts" | "typescript" => Some("typescript"),
+        "tsx" => Some("typescript-jsx"),
+        "vala" => Some("vala"),
+        "xml" => Some("xml"),
+        "yaml" | "yml" => Some("yaml"),
+        _ => None,
     }
 }
 
@@ -1252,6 +1998,9 @@ fn push_table_row(
     list_depth: Option<usize>,
     cells: Vec<DocumentTableCell>,
 ) {
+    if cells.is_empty() {
+        return;
+    }
     blocks.push(if let Some(depth) = list_depth {
         DocumentBlock::ListTableRow { depth, cells }
     } else {
@@ -1288,7 +2037,7 @@ fn finish_block(active: &mut Option<ActiveBlock>, blocks: &mut Vec<DocumentBlock
             markup,
         },
         ActiveBlock::Quote(markup) => DocumentBlock::Quote(markup),
-        ActiveBlock::Code(markup) => DocumentBlock::Code(markup),
+        ActiveBlock::Code { markup, language } => DocumentBlock::Code { markup, language },
     });
 }
 
@@ -1337,7 +2086,15 @@ fn append_markup(active: &mut Option<ActiveBlock>, cell: &mut Option<String>, ma
 }
 
 fn append_escaped(active: &mut Option<ActiveBlock>, cell: &mut Option<String>, text: &str) {
-    append_markup(active, cell, &glib::markup_escape_text(text));
+    append_markup(active, cell, &escape_document_text(text));
+}
+
+fn escape_document_text(text: &str) -> glib::GString {
+    if text.contains('\0') {
+        glib::markup_escape_text(&text.replace('\0', "�"))
+    } else {
+        glib::markup_escape_text(text)
+    }
 }
 
 fn html_start_implies_end(open: &str, incoming: &str) -> bool {
@@ -1391,6 +2148,10 @@ fn is_void_html_tag(name: &str) -> bool {
             | "track"
             | "wbr"
     )
+}
+
+fn is_html_whitespace(character: char) -> bool {
+    matches!(character, '\t' | '\n' | '\u{000C}' | '\r' | ' ')
 }
 
 fn is_omitted_html_tag(name: &str) -> bool {

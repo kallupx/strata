@@ -9,7 +9,8 @@ use crate::{
     sandbox::{Cancellation, ParseOperation},
     services::{
         LoadHandle, Preview, PreviewContent, PreviewEvent, PreviewProvider, PreviewRequest,
-        content_family, document_kind, has_plain_text_extension, parse_document,
+        content_family, document_kind, has_plain_text_extension, layout_document,
+        normalize_preview_text, parse_document,
     },
 };
 
@@ -117,7 +118,17 @@ impl PreviewProvider for LocalPreviewProvider {
                         });
                         return;
                     }
-                    Err(_) => return,
+                    Err(_) => {
+                        if cancellation_for_task.is_cancelled() {
+                            return;
+                        }
+                        emit(PreviewEvent::Failed {
+                            request_id,
+                            entry,
+                            message: "The preview worker stopped unexpectedly.".to_owned(),
+                        });
+                        return;
+                    }
                 };
             } else if matches!(
                 content,
@@ -137,25 +148,41 @@ impl PreviewProvider for LocalPreviewProvider {
                                     warnings: Vec::new(),
                                     truncated,
                                 }
-                            } else {
+                            } else if request.render_document {
                                 let cancellation = cancellation_for_task.clone();
                                 let parsed = gio::spawn_blocking(move || {
-                                    let parsed = parse_document(kind, &source, &cancellation);
+                                    let parsed = parse_document(kind, &source, &cancellation)
+                                        .and_then(|parsed| {
+                                            layout_document(parsed.document, &cancellation)
+                                                .map(|document| (document, parsed.warnings))
+                                        });
                                     (source, parsed)
                                 })
                                 .await;
-                                let Ok((source, parsed)) = parsed else {
-                                    return;
+                                let (source, parsed) = match parsed {
+                                    Ok(parsed) => parsed,
+                                    Err(_) => {
+                                        if cancellation_for_task.is_cancelled() {
+                                            return;
+                                        }
+                                        emit(PreviewEvent::Failed {
+                                            request_id,
+                                            entry,
+                                            message: "The preview worker stopped unexpectedly."
+                                                .to_owned(),
+                                        });
+                                        return;
+                                    }
                                 };
                                 if cancellation_for_task.is_cancelled() {
                                     return;
                                 }
                                 match parsed {
-                                    Ok(parsed) => PreviewContent::Document {
+                                    Ok((document, warnings)) => PreviewContent::Document {
                                         source,
-                                        document: Some(parsed.document),
+                                        document: Some(document),
                                         fallback_reason: None,
-                                        warnings: parsed.warnings,
+                                        warnings,
                                         truncated,
                                     },
                                     Err(reason) => PreviewContent::Document {
@@ -165,6 +192,14 @@ impl PreviewProvider for LocalPreviewProvider {
                                         warnings: Vec::new(),
                                         truncated,
                                     },
+                                }
+                            } else {
+                                PreviewContent::Document {
+                                    source,
+                                    document: None,
+                                    fallback_reason: None,
+                                    warnings: Vec::new(),
+                                    truncated,
                                 }
                             }
                         } else {
@@ -218,7 +253,11 @@ async fn read_text(file: &gio::File, byte_limit: usize) -> Result<(String, bool)
     let bytes = bytes.as_ref();
     let truncated = bytes.len() > byte_limit;
     let sample = &bytes[..bytes.len().min(byte_limit)];
-    Ok((String::from_utf8_lossy(sample).into_owned(), truncated))
+    Ok((decode_text_sample(sample), truncated))
+}
+
+fn decode_text_sample(sample: &[u8]) -> String {
+    normalize_preview_text(&String::from_utf8_lossy(sample)).into_owned()
 }
 
 #[cfg(test)]

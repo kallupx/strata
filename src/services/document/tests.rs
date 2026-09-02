@@ -3,8 +3,9 @@
 use std::time::Duration;
 
 use super::{
-    DocumentBlock, DocumentKind, DocumentListChildKind, DocumentTableCell, ParseLimits,
-    document_kind, parse_document, parse_document_with_limits, parse_markdown,
+    Document, DocumentBlock, DocumentKind, DocumentListChildKind, DocumentSpan, DocumentSpanStyle,
+    DocumentTableCell, DocumentUnitKind, LayoutBudget, ParseLimits, append_styled_text,
+    document_kind, layout_document, parse_document, parse_document_with_limits, parse_markdown,
 };
 use crate::sandbox::Cancellation;
 
@@ -38,7 +39,10 @@ fn multiline_formatting_and_code_stay_in_balanced_blocks() {
         parse_markdown("**first\nsecond**\n\n```text\none < two\n```").blocks,
         vec![
             DocumentBlock::Paragraph("<b>first\nsecond</b>".to_owned()),
-            DocumentBlock::Code("one &lt; two\n".to_owned()),
+            DocumentBlock::Code {
+                markup: "one &lt; two\n".to_owned(),
+                language: None,
+            },
         ]
     );
 }
@@ -183,10 +187,37 @@ fn html_supports_semantic_blocks_formatting_entities_lists_tables_and_breaks() {
     assert!(debug.contains("<b>Bold</b>\\n<i>line</i>"));
     assert!(debug.contains("marker: \"1.\""));
     assert!(debug.contains("Quote(\"quote\")"));
-    assert!(debug.contains("Code(\"x &lt; y\")"));
+    assert!(parsed.document.blocks.iter().any(|block| matches!(
+        block,
+        DocumentBlock::Code { markup, .. } if markup == "x &lt; y"
+    )));
     assert!(debug.contains("DocumentTableCell { header: true"));
     assert!(debug.contains("DocumentTableCell { header: false"));
     assert!(parsed.warnings.is_empty());
+}
+
+#[test]
+fn html_collapses_flow_whitespace_and_preserves_preformatted_text() {
+    let parsed = parse_document(
+        DocumentKind::Html,
+        "<p>\n  This paragraph has <strong>bold</strong>,\n  <em>emphasis</em>, a line break<br>\n  and <code>inline code</code>.\n</p><pre>  first\n    second\n</pre>",
+        &Cancellation::default(),
+    )
+    .expect("flow whitespace should render like HTML");
+
+    assert_eq!(
+        parsed.document.blocks,
+        vec![
+            DocumentBlock::Paragraph(
+                "This paragraph has <b>bold</b>, <i>emphasis</i>, a line break\nand <tt>inline code</tt>."
+                    .to_owned(),
+            ),
+            DocumentBlock::Code {
+                markup: "  first\n    second\n".to_owned(),
+                language: None,
+            },
+        ]
+    );
 }
 
 #[test]
@@ -222,6 +253,11 @@ fn html_contentless_and_malformed_documents_fall_back_to_source() {
         &Cancellation::default(),
     )
     .expect_err("active-only HTML has no trustworthy rendering");
+    assert!(contentless.contains("no supported document content"));
+
+    let empty_tables = "<table><tr></tr></table>".repeat(513);
+    let contentless = parse_document(DocumentKind::Html, &empty_tables, &Cancellation::default())
+        .expect_err("cell-less table rows must not create GTK grids");
     assert!(contentless.contains("no supported document content"));
 
     let malformed = parse_document(
@@ -280,7 +316,7 @@ fn html_accepts_optional_end_tags_and_omitted_document_closures() {
     assert_eq!(
         parsed.document.blocks,
         vec![
-            DocumentBlock::Paragraph("Hello, ".to_owned()),
+            DocumentBlock::Paragraph("Hello,".to_owned()),
             DocumentBlock::ListItem {
                 marker: "•".to_owned(),
                 depth: 0,
@@ -444,7 +480,7 @@ fn markdown_keeps_semantic_block_children_inside_list_items() {
     assert_eq!(
         parse_document(
             DocumentKind::Markdown,
-            "- outer\n\n  ## heading\n\n  > quote\n\n  ```\n  code\n  ```",
+            "- outer\n\n  ## heading\n\n  > quote\n\n  ```rust\n  code\n  ```",
             &Cancellation::default(),
         )
         .expect("Markdown block children should retain their list context")
@@ -468,7 +504,7 @@ fn markdown_keeps_semantic_block_children_inside_list_items() {
             },
             DocumentBlock::ListChild {
                 depth: 0,
-                kind: DocumentListChildKind::Code,
+                kind: DocumentListChildKind::Code(Some("rust")),
                 markup: "code\n".to_owned(),
             },
         ]
@@ -480,7 +516,7 @@ fn html_keeps_semantic_block_children_inside_list_items() {
     assert_eq!(
         parse_document(
             DocumentKind::Html,
-            "<ul><li>outer<h2>heading</h2><blockquote><p>quote</p></blockquote><pre><code>code</code></pre></li></ul>",
+            "<ul><li>outer<h2>heading</h2><blockquote><p>quote</p></blockquote><pre><code class=\"language-js\">code</code></pre></li></ul>",
             &Cancellation::default(),
         )
         .expect("HTML block children should retain their list context")
@@ -504,7 +540,7 @@ fn html_keeps_semantic_block_children_inside_list_items() {
             },
             DocumentBlock::ListChild {
                 depth: 0,
-                kind: DocumentListChildKind::Code,
+                kind: DocumentListChildKind::Code(Some("js")),
                 markup: "code".to_owned(),
             },
         ]
@@ -848,13 +884,61 @@ fn html_pre_code_is_supported_without_an_omission_warning() {
     .expect("canonical pre/code should render");
     assert_eq!(
         parsed.document.blocks,
-        vec![DocumentBlock::Code("x &lt; y".to_owned())]
+        vec![DocumentBlock::Code {
+            markup: "x &lt; y".to_owned(),
+            language: None,
+        }]
     );
     assert!(parsed.warnings.is_empty());
 }
 
 #[test]
-fn parser_enforces_input_event_depth_widget_markup_time_and_cancellation_limits() {
+fn code_language_hints_are_bounded_and_preserved_for_layout() {
+    let markdown = parse_document(
+        DocumentKind::Markdown,
+        "```rs title=ignored\nfn main() {}\n```\n\n```made-up\nplain\n```",
+        &Cancellation::default(),
+    )
+    .expect("fenced code should render");
+    assert!(matches!(
+        &markdown.document.blocks[0],
+        DocumentBlock::Code {
+            language: Some("rust"),
+            ..
+        }
+    ));
+    assert!(matches!(
+        &markdown.document.blocks[1],
+        DocumentBlock::Code { language: None, .. }
+    ));
+    let layout = layout_document(markdown.document, &Cancellation::default())
+        .expect("code layout should succeed");
+    assert!(matches!(
+        layout.units[0].kind,
+        DocumentUnitKind::Code {
+            language: Some("rust"),
+            ..
+        }
+    ));
+
+    let html = parse_document(
+        DocumentKind::Html,
+        "<pre><code class=\"language-js\">const safe = true;</code></pre>",
+        &Cancellation::default(),
+    )
+    .expect("HTML code language class should render");
+    assert!(html.warnings.is_empty());
+    assert!(matches!(
+        &html.document.blocks[0],
+        DocumentBlock::Code {
+            language: Some("js"),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn parser_enforces_input_event_depth_table_markup_time_and_cancellation_limits() {
     let cancellation = Cancellation::default();
     assert!(
         parse_document(
@@ -880,11 +964,36 @@ fn parser_enforces_input_event_depth_widget_markup_time_and_cancellation_limits(
             .contains("nesting-depth")
     );
 
-    let widgets = "x\n\n".repeat(513);
+    let many_blocks = "x\n\n".repeat(513);
+    let parsed = parse_document(DocumentKind::Markdown, &many_blocks, &cancellation)
+        .expect("ordinary blocks are virtualized");
+    assert_eq!(
+        layout_document(parsed.document, &cancellation)
+            .expect("many-block layout")
+            .units
+            .len(),
+        513
+    );
+
+    let many_tables = "<table><tr><td>x</td></tr></table>".repeat(257);
     assert!(
-        parse_document(DocumentKind::Markdown, &widgets, &cancellation)
-            .expect_err("widget-heavy input")
-            .contains("widget")
+        parse_document(DocumentKind::Html, &many_tables, &cancellation).is_ok(),
+        "separate tables are virtualized independently"
+    );
+
+    let table_at_limit = format!(
+        "<table><tr>{}</tr></table>",
+        "<td>x</td>".repeat(super::DOCUMENT_TABLE_CELL_LIMIT)
+    );
+    assert!(parse_document(DocumentKind::Html, &table_at_limit, &cancellation).is_ok());
+    let table_over_limit = format!(
+        "<table><tr>{}</tr></table>",
+        "<td>x</td>".repeat(super::DOCUMENT_TABLE_CELL_LIMIT + 1)
+    );
+    assert!(
+        parse_document(DocumentKind::Html, &table_over_limit, &cancellation)
+            .expect_err("one atomic table must keep a resident cell bound")
+            .contains("one table")
     );
 
     let markup = "&".repeat(1024 * 1024);
@@ -892,6 +1001,50 @@ fn parser_enforces_input_event_depth_widget_markup_time_and_cancellation_limits(
         parse_document(DocumentKind::Markdown, &markup, &cancellation)
             .expect_err("escaped markup expansion")
             .contains("markup")
+    );
+
+    let maximum_line = "x".repeat(super::DOCUMENT_INPUT_LIMIT);
+    let parsed = parse_document(DocumentKind::Markdown, &maximum_line, &cancellation)
+        .expect("a maximum-size logical line is virtualized");
+    let layout = layout_document(parsed.document, &cancellation).expect("maximum-line layout");
+    assert_eq!(layout.units.len(), 512);
+    assert!(
+        layout
+            .units
+            .iter()
+            .all(|unit| unit.text.len() <= super::DOCUMENT_UNIT_LINE_TARGET)
+    );
+    assert!(layout.units.iter().all(|unit| !unit.wrap));
+
+    let one_mib_long_lines = format!("{}\n", "x".repeat(64 * 1024 - 1)).repeat(16);
+    assert_eq!(one_mib_long_lines.len(), 1024 * 1024);
+    let parsed = parse_document(DocumentKind::Markdown, &one_mib_long_lines, &cancellation)
+        .expect("one MiB split into bounded logical lines");
+    let layout = layout_document(parsed.document, &cancellation).expect("bounded layout");
+    assert!(
+        layout
+            .units
+            .iter()
+            .all(|unit| unit.text.len() <= super::DOCUMENT_UNIT_LINE_TARGET)
+    );
+    assert_eq!(
+        layout
+            .units
+            .iter()
+            .map(|unit| unit.copy_text.as_str())
+            .collect::<String>(),
+        one_mib_long_lines
+    );
+
+    let monolithic_paragraph = format!("{}\n", "x".repeat(4 * 1024)).repeat(17);
+    let parsed = parse_document(DocumentKind::Markdown, &monolithic_paragraph, &cancellation)
+        .expect("large multiline paragraphs are virtualized");
+    assert!(layout_document(parsed.document, &cancellation).is_ok());
+
+    let large_code = format!("```text\n{}\n```", "x\n".repeat(40 * 1024));
+    assert!(
+        parse_document(DocumentKind::Markdown, &large_code, &cancellation).is_ok(),
+        "large code blocks are split into virtual units"
     );
 
     let zero_time = ParseLimits {
@@ -909,5 +1062,242 @@ fn parser_enforces_input_event_depth_widget_markup_time_and_cancellation_limits(
         parse_document(DocumentKind::Markdown, "text", &cancellation)
             .expect_err("cancelled parse")
             .contains("cancelled")
+    );
+}
+
+#[test]
+fn document_parsers_reject_nul_bytes_without_panicking() {
+    for (kind, source) in [
+        (DocumentKind::Markdown, "before\0after"),
+        (DocumentKind::Html, "<p>before\0after</p>"),
+    ] {
+        assert!(
+            parse_document(kind, source, &Cancellation::default())
+                .expect_err("NUL bytes must not reach GLib markup escaping")
+                .contains("NUL")
+        );
+    }
+
+    assert_eq!(
+        parse_markdown("before\0after").blocks,
+        vec![DocumentBlock::Paragraph("before�after".to_owned())]
+    );
+}
+
+#[test]
+fn pre_cancelled_html_stops_before_tokenization() {
+    let html = format!("<div {}>", "data-value='x' ".repeat(32_000));
+    let cancellation = Cancellation::default();
+    cancellation.cancel();
+
+    assert!(
+        parse_document(DocumentKind::Html, &html, &cancellation)
+            .expect_err("pre-cancelled HTML must stop before requesting a token")
+            .contains("cancelled")
+    );
+}
+
+#[test]
+fn document_layout_decodes_markup_and_bounds_pathological_lines() {
+    let uri = "https://example.test/large";
+    let markup = format!(
+        "<b>first</b>\n<a href=\"{uri}\">{}</a>\nlast",
+        "x".repeat(40 * 1024)
+    );
+    let layout = layout_document(
+        Document {
+            blocks: vec![DocumentBlock::Paragraph(markup)],
+        },
+        &Cancellation::default(),
+    )
+    .expect("bounded layout");
+
+    assert!(layout.units.len() > 3);
+    assert_eq!(layout.units[0].text, "first");
+    assert_eq!(layout.units.last().expect("last unit").text, "last");
+    assert!(layout.units[0].wrap);
+    assert!(layout.units.last().expect("last unit").wrap);
+    assert!(
+        layout.units[1..layout.units.len() - 1]
+            .iter()
+            .all(|unit| !unit.wrap)
+    );
+    assert!(
+        layout
+            .units
+            .iter()
+            .all(|unit| unit.text.len() <= super::DOCUMENT_UNIT_LINE_TARGET)
+    );
+    assert_eq!(
+        layout
+            .units
+            .iter()
+            .map(|unit| unit.copy_text.as_str())
+            .collect::<String>(),
+        format!("first\n{}\nlast\n", "x".repeat(40 * 1024))
+    );
+    assert!(
+        layout.units[0]
+            .spans
+            .iter()
+            .any(|span| span.style == DocumentSpanStyle::Bold)
+    );
+    assert!(layout.units.iter().any(|unit| {
+        unit.spans.iter().any(
+            |span| matches!(&span.style, DocumentSpanStyle::Link(link) if link.as_ref() == uri),
+        )
+    }));
+}
+
+#[test]
+fn redundant_nested_styles_emit_one_span() {
+    let markup = format!("<b>{}</b>", "<b>x</b>".repeat(10_000));
+    let layout = layout_document(
+        Document {
+            blocks: vec![DocumentBlock::Paragraph(markup)],
+        },
+        &Cancellation::default(),
+    )
+    .expect("redundant formatting should remain cheap to lay out");
+
+    assert!(
+        layout.units.len() > 1,
+        "the long line should be virtualized"
+    );
+    assert!(layout.units.iter().all(|unit| unit.spans.len() == 1));
+    assert!(
+        layout
+            .units
+            .iter()
+            .all(|unit| unit.spans[0].style == DocumentSpanStyle::Bold)
+    );
+}
+
+#[test]
+fn distinct_nested_html_links_are_inert_and_keep_spans_bounded() {
+    let links = (0..31)
+        .map(|index| format!("<a href=\"https://example.test/{index}\">"))
+        .collect::<String>();
+    let segments = 1_900;
+    let html = format!(
+        "{links}{}{}",
+        "<b>x</b>".repeat(segments),
+        "</a>".repeat(31)
+    );
+    let parsed = parse_document(DocumentKind::Html, &html, &Cancellation::default())
+        .expect("nested anchors should retain their visible content");
+    assert_eq!(
+        parsed.warnings,
+        ["Unsupported or active HTML content was omitted."]
+    );
+    let [DocumentBlock::Paragraph(markup)] = parsed.document.blocks.as_slice() else {
+        panic!("expected one paragraph");
+    };
+    assert_eq!(markup.matches("<a href=").count(), 1);
+
+    let layout = layout_document(parsed.document, &Cancellation::default())
+        .expect("nested anchors must not amplify layout work");
+    assert!(
+        layout
+            .units
+            .iter()
+            .map(|unit| unit.spans.len())
+            .sum::<usize>()
+            <= segments * 2
+    );
+    assert!(
+        layout
+            .units
+            .iter()
+            .flat_map(|unit| &unit.spans)
+            .all(|span| {
+                !matches!(
+                    &span.style,
+                    DocumentSpanStyle::Link(uri) if uri.as_ref() != "https://example.test/0"
+                )
+            })
+    );
+}
+
+#[test]
+fn document_layout_keeps_tables_atomic_and_copyable_as_tsv() {
+    let layout = layout_document(
+        Document {
+            blocks: vec![
+                DocumentBlock::TableRow {
+                    cells: vec![
+                        DocumentTableCell {
+                            header: true,
+                            markup: "<b>Name</b>".to_owned(),
+                        },
+                        DocumentTableCell {
+                            header: true,
+                            markup: "Value".to_owned(),
+                        },
+                    ],
+                },
+                DocumentBlock::TableRow {
+                    cells: vec![
+                        DocumentTableCell {
+                            header: false,
+                            markup: "Alice &amp; Bob".to_owned(),
+                        },
+                        DocumentTableCell {
+                            header: false,
+                            markup: "One".to_owned(),
+                        },
+                    ],
+                },
+            ],
+        },
+        &Cancellation::default(),
+    )
+    .expect("table layout");
+
+    assert_eq!(layout.units.len(), 1);
+    assert_eq!(layout.units[0].copy_text, "Name\tValue\nAlice & Bob\tOne\n");
+    assert!(matches!(
+        &layout.units[0].kind,
+        DocumentUnitKind::Table { rows, .. } if rows.len() == 2
+    ));
+}
+
+#[test]
+fn cancelled_document_layout_stops_before_publishing_units() {
+    let cancellation = Cancellation::default();
+    cancellation.cancel();
+    assert!(
+        layout_document(
+            Document {
+                blocks: vec![DocumentBlock::Paragraph("text".to_owned())],
+            },
+            &cancellation,
+        )
+        .expect_err("cancelled layout")
+        .contains("cancelled")
+    );
+}
+
+#[test]
+fn markup_decoding_rechecks_the_deadline_after_expensive_work() {
+    let escaped = "x".repeat(1024 * 1024);
+    let cancellation = Cancellation::default();
+    let budget = LayoutBudget::new(&cancellation, Duration::from_millis(1));
+    budget.check().expect("the budget starts live");
+    let mut output = String::new();
+    let mut spans = Vec::<DocumentSpan>::new();
+    let mut characters = 0;
+
+    assert!(
+        append_styled_text(
+            &mut output,
+            &mut spans,
+            &[],
+            &escaped,
+            &mut characters,
+            &budget,
+        )
+        .expect_err("the inner markup work must recheck its deadline")
+        .contains("500 ms")
     );
 }

@@ -630,7 +630,7 @@ fn set_release_note_blocks(notes: &gtk::Box, blocks: &[DocumentBlock]) {
                         copy.add_css_class(&format!("level-{level}"));
                         copy.set_markup(markup);
                     }
-                    services::DocumentListChildKind::Code => {
+                    services::DocumentListChildKind::Code(_) => {
                         copy.add_css_class("release-notes-code");
                         copy.set_markup(&format!("<tt>{markup}</tt>"));
                     }
@@ -639,7 +639,7 @@ fn set_release_note_blocks(notes: &gtk::Box, blocks: &[DocumentBlock]) {
                 }
                 notes.append(&copy);
             }
-            DocumentBlock::Code(markup) => {
+            DocumentBlock::Code { markup, .. } => {
                 let label = release_notes_label();
                 label.add_css_class("release-notes-code");
                 label.set_markup(&format!("<tt>{markup}</tt>"));

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use super::{
-    DocumentTextPosition, DocumentView, MEDIA_PLUGIN_INSTALL_COMMAND, PDF_MAX_ZOOM, PDF_MIN_ZOOM,
-    accepts_preview_event, document_selection_range, document_view_action, format_file_size,
-    initial_document_view, media_error_feedback, pdf_zoom_after_scroll,
-    preview_width_for_empty_space,
+    DocumentView, FOCUS_PREVIEW_DELAY, MEDIA_PLUGIN_INSTALL_COMMAND, PDF_MAX_ZOOM, PDF_MIN_ZOOM,
+    accepts_preview_event, document_view_action, format_file_size, initial_document_view,
+    media_error_feedback, pdf_zoom_after_scroll, preview_width_for_empty_space, source_chunk_end,
 };
 use crate::services::PreviewRequestId;
+use std::time::Duration;
 
 #[test]
 fn formats_preview_file_sizes() {
@@ -40,6 +40,11 @@ fn initial_preview_uses_most_of_the_unoccupied_width() {
 }
 
 #[test]
+fn focus_following_preview_waits_for_key_repeat_to_settle() {
+    assert_eq!(FOCUS_PREVIEW_DELAY, Duration::from_millis(75));
+}
+
+#[test]
 fn pdf_scroll_zoom_stays_within_its_supported_range() {
     assert!(pdf_zoom_after_scroll(1.0, -1.0) > 1.0);
     assert!(pdf_zoom_after_scroll(2.0, 1.0) < 2.0);
@@ -67,36 +72,23 @@ fn document_view_action_describes_its_destination() {
 }
 
 #[test]
-fn document_selection_spans_labels_in_both_directions() {
-    let first = DocumentTextPosition {
-        label: 0,
-        offset: 2,
-    };
-    let last = DocumentTextPosition {
-        label: 2,
-        offset: 1,
-    };
-    for (anchor, cursor) in [(first, last), (last, first)] {
-        assert_eq!(document_selection_range(0, 5, anchor, cursor), Some((2, 5)));
-        assert_eq!(document_selection_range(1, 6, anchor, cursor), Some((0, 6)));
-        assert_eq!(document_selection_range(2, 4, anchor, cursor), Some((0, 1)));
-        assert_eq!(document_selection_range(3, 3, anchor, cursor), None);
-    }
+fn incremental_source_chunks_keep_utf8_boundaries() {
+    let text = format!("{}é", "x".repeat(super::SOURCE_INSERT_CHUNK_BYTES - 1));
+    let end = source_chunk_end(&text, 0);
+    assert!(text.is_char_boundary(end));
     assert_eq!(
-        document_selection_range(
-            1,
-            6,
-            DocumentTextPosition {
-                label: 1,
-                offset: 5,
-            },
-            DocumentTextPosition {
-                label: 1,
-                offset: 2,
-            },
-        ),
-        Some((2, 5))
+        &text[..end],
+        "x".repeat(super::SOURCE_INSERT_CHUNK_BYTES - 1)
     );
+    assert_eq!(source_chunk_end(&text, end), text.len());
+
+    let lines = "x\n".repeat(super::SOURCE_INSERT_CHUNK_LINES + 1);
+    let end = source_chunk_end(&lines, 0);
+    assert_eq!(
+        lines[..end].lines().count(),
+        super::SOURCE_INSERT_CHUNK_LINES
+    );
+    assert!(end < lines.len());
 }
 
 #[test]

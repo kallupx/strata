@@ -11,10 +11,10 @@ use gtk::{gio, glib, prelude::*};
 use sourceview5::prelude::*;
 
 use crate::{
-    model::{FileEntry, Location, MetadataValue},
+    model::{FileEntry, MetadataValue},
     services::{
-        Document, DocumentBlock, DocumentListChildKind, LoadHandle, Preview, PreviewContent,
-        PreviewEvent, PreviewProvider, PreviewRequest, PreviewRequestId, has_web_scheme,
+        DocumentLayout, LoadHandle, Preview, PreviewContent, PreviewEvent, PreviewProvider,
+        PreviewRequest, PreviewRequestId, normalize_preview_text,
     },
 };
 
@@ -22,6 +22,11 @@ const DEFAULT_WIDTH: i32 = 520;
 const MIN_WIDTH: i32 = 280;
 const MAX_WIDTH: i32 = 3_000;
 const TEXT_BYTE_LIMIT: usize = 1024 * 1024;
+pub(super) const SOURCE_HIGHLIGHT_BYTE_LIMIT: usize = 128 * 1024;
+pub(super) const SOURCE_HIGHLIGHT_LINE_LIMIT: usize = 512;
+const SOURCE_INSERT_CHUNK_BYTES: usize = 4 * 1024;
+const SOURCE_INSERT_CHUNK_LINES: usize = 64;
+const FOCUS_PREVIEW_DELAY: Duration = Duration::from_millis(75);
 const TRANSITION: Duration = Duration::from_millis(260);
 const PDF_PAGE_GAP: i32 = 6;
 const PDF_MIN_ZOOM: f64 = 1.0;
@@ -34,16 +39,23 @@ enum DocumentView {
     Source,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DocumentTextPosition {
-    label: usize,
-    offset: usize,
+struct PendingSourcePreview {
+    entry: FileEntry,
+    content_type: String,
+    content: String,
+    truncated: bool,
 }
 
-struct DocumentSelectableLabel {
-    label: gtk::Label,
-    text: String,
-    chars: usize,
+struct SourcePreviewView {
+    view: sourceview5::View,
+    generation: Rc<Cell<u64>>,
+}
+
+struct DocumentPreview {
+    stack: gtk::Stack,
+    source: Option<PendingSourcePreview>,
+    rendered: Option<(DocumentLayout, Vec<String>)>,
+    render_pending: bool,
 }
 
 struct PreviewState {
@@ -58,11 +70,13 @@ struct PreviewState {
     document_view_button: gtk::Button,
     document_view_icon: gtk::Image,
     document_view: Cell<DocumentView>,
-    document_stack: RefCell<Option<gtk::Stack>>,
+    document_preview: RefCell<Option<DocumentPreview>>,
+    source_preview: SourcePreviewView,
     media: RefCell<Option<gtk::Video>>,
     split: RefCell<Option<gtk::Paned>>,
     occupied_width: RefCell<Option<Rc<dyn Fn() -> i32>>>,
     current: RefCell<Option<FileEntry>>,
+    pending_show: RefCell<Option<glib::SourceId>>,
     load: RefCell<Option<LoadHandle>>,
     pdf_loads: Rc<RefCell<HashMap<i32, LoadHandle>>>,
     current_request: Cell<Option<PreviewRequestId>>,
@@ -163,11 +177,13 @@ impl PreviewDrawer {
             document_view_button: document_view_button.clone(),
             document_view_icon,
             document_view: Cell::new(DocumentView::Rendered),
-            document_stack: RefCell::new(None),
+            document_preview: RefCell::new(None),
+            source_preview: SourcePreviewView::new(),
             media: RefCell::new(None),
             split: RefCell::new(None),
             occupied_width: RefCell::new(None),
             current: RefCell::new(None),
+            pending_show: RefCell::new(None),
             load: RefCell::new(None),
             pdf_loads: Rc::new(RefCell::new(HashMap::new())),
             current_request: Cell::new(None),
@@ -186,12 +202,7 @@ impl PreviewDrawer {
                 DocumentView::Rendered => DocumentView::Source,
                 DocumentView::Source => DocumentView::Rendered,
             };
-            let Some(stack) = state.document_stack.borrow().as_ref().cloned() else {
-                return;
-            };
-            stack.set_visible_child_name(document_view_name(next));
-            state.document_view.set(next);
-            state.update_document_view_action();
+            state.show_document_view(next);
         });
         let weak = Rc::downgrade(&state);
         open.connect_clicked(move |_| {
@@ -258,7 +269,35 @@ impl PreviewDrawer {
     }
 
     pub fn show(&self, entry: FileEntry) {
+        self.state.cancel_pending_show();
         self.state.show(entry);
+    }
+
+    pub fn show_after_focus_change(&self, entry: FileEntry) {
+        self.state.cancel_pending_show();
+        if self.state.current.borrow().as_ref() == Some(&entry) {
+            return;
+        }
+
+        let cancelled_request = self.state.current_request.replace(None).is_some();
+        let cancelled_load = self.state.load.borrow_mut().take().is_some();
+        let cancelled_pdf_load = !self.state.pdf_loads.borrow().is_empty();
+        self.state.pdf_loads.borrow_mut().clear();
+        if cancelled_request || cancelled_load || cancelled_pdf_load {
+            self.state.current.replace(None);
+        }
+
+        let weak = Rc::downgrade(&self.state);
+        let source = glib::timeout_add_local_once(FOCUS_PREVIEW_DELAY, move || {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            state.pending_show.borrow_mut().take();
+            if state.opened.get() {
+                state.load(entry, 0);
+            }
+        });
+        self.state.pending_show.replace(Some(source));
     }
 
     pub fn close(&self) {
@@ -275,6 +314,12 @@ impl PreviewDrawer {
 }
 
 impl PreviewState {
+    fn cancel_pending_show(&self) {
+        if let Some(source) = self.pending_show.borrow_mut().take() {
+            source.remove();
+        }
+    }
+
     fn show(self: &Rc<Self>, entry: FileEntry) {
         let was_open = self.opened.replace(true);
         let already_showing = self.current.borrow().as_ref() == Some(&entry);
@@ -352,6 +397,7 @@ impl PreviewState {
     }
 
     fn close(self: &Rc<Self>) {
+        self.cancel_pending_show();
         self.opened.set(false);
         self.animating.set(false);
         self.animation_generation
@@ -370,6 +416,16 @@ impl PreviewState {
     }
 
     fn load(self: &Rc<Self>, entry: FileEntry, pdf_page: i32) {
+        let render_document = super::theme::ThemeManager::shared().render_documents_by_default();
+        self.document_view.set(if render_document {
+            DocumentView::Rendered
+        } else {
+            DocumentView::Source
+        });
+        self.load_request(entry, pdf_page, render_document);
+    }
+
+    fn load_request(self: &Rc<Self>, entry: FileEntry, pdf_page: i32, render_document: bool) {
         self.current.replace(Some(entry.clone()));
         self.title.set_text(&entry.display_name);
         self.title
@@ -397,6 +453,7 @@ impl PreviewState {
                 id: request_id,
                 entry,
                 text_byte_limit: TEXT_BYTE_LIMIT,
+                render_document,
                 pdf_page,
             },
             emit,
@@ -437,7 +494,7 @@ impl PreviewState {
         self.clear_content();
         match preview.content {
             PreviewContent::Text { content, truncated } => {
-                self.content.append(&source_preview(
+                self.content.append(&self.source_preview.show(
                     &preview.entry,
                     &preview.content_type,
                     &content,
@@ -451,13 +508,16 @@ impl PreviewState {
                 warnings,
                 truncated,
             } => {
-                let source =
-                    source_preview(&preview.entry, &preview.content_type, &source, truncated);
                 self.render_document_preview(
-                    &source,
-                    document.as_ref(),
-                    fallback_reason.as_deref(),
-                    &warnings,
+                    PendingSourcePreview {
+                        entry: preview.entry,
+                        content_type: preview.content_type,
+                        content: source,
+                        truncated,
+                    },
+                    document,
+                    fallback_reason,
+                    warnings,
                 );
             }
             PreviewContent::Rasterized { png } => {
@@ -530,23 +590,21 @@ impl PreviewState {
     }
 
     fn render_document_preview(
-        &self,
-        source: &gtk::Box,
-        document: Option<&Document>,
-        fallback_reason: Option<&str>,
-        warnings: &[String],
+        self: &Rc<Self>,
+        source: PendingSourcePreview,
+        document: Option<DocumentLayout>,
+        fallback_reason: Option<String>,
+        warnings: Vec<String>,
     ) {
+        let render_pending = document.is_none() && fallback_reason.is_none();
+        let rendered_available = document.is_some() || render_pending;
         let initial = initial_document_view(
-            super::theme::ThemeManager::shared().render_documents_by_default(),
+            self.document_view.get() == DocumentView::Rendered,
             document.is_some(),
         );
 
-        if let Some(reason) = fallback_reason {
-            let notice = gtk::Label::new(Some(reason));
-            notice.add_css_class("preview-document-fallback");
-            notice.set_wrap(true);
-            notice.set_xalign(0.0);
-            self.content.append(&notice);
+        if let Some(reason) = fallback_reason.as_deref() {
+            self.content.append(&document_notice(reason));
         }
 
         let stack = gtk::Stack::builder()
@@ -555,16 +613,56 @@ impl PreviewState {
             .hexpand(true)
             .vexpand(true)
             .build();
-        if let Some(document) = document {
-            stack.add_named(&rendered_document(document, warnings), Some("rendered"));
-        }
-        stack.add_named(source, Some("source"));
-        stack.set_visible_child_name(document_view_name(initial));
-        self.document_view.set(initial);
-        self.document_stack.replace(Some(stack.clone()));
-        self.document_view_button.set_visible(document.is_some());
-        self.update_document_view_action();
+        self.document_preview.replace(Some(DocumentPreview {
+            stack: stack.clone(),
+            source: Some(source),
+            rendered: document.map(|document| (document, warnings)),
+            render_pending,
+        }));
         self.content.append(&stack);
+        self.show_document_view(initial);
+        self.document_view_button.set_visible(rendered_available);
+    }
+
+    fn show_document_view(self: &Rc<Self>, view: DocumentView) {
+        let mut preview_guard = self.document_preview.borrow_mut();
+        let Some(preview) = preview_guard.as_mut() else {
+            return;
+        };
+        if view == DocumentView::Rendered && preview.render_pending {
+            preview.render_pending = false;
+            drop(preview_guard);
+            self.document_view.set(DocumentView::Rendered);
+            self.update_document_view_action();
+            let entry = self.current.borrow().clone();
+            if let Some(entry) = entry {
+                self.load_request(entry, 0, true);
+            }
+            return;
+        }
+        let name = document_view_name(view);
+        if preview.stack.child_by_name(name).is_none() {
+            let child = match view {
+                DocumentView::Source => preview.source.take().map(|source| {
+                    self.source_preview.show(
+                        &source.entry,
+                        &source.content_type,
+                        &source.content,
+                        source.truncated,
+                    )
+                }),
+                DocumentView::Rendered => preview.rendered.take().map(|(document, warnings)| {
+                    super::virtual_preview::rendered_document(document, warnings)
+                }),
+            };
+            let Some(child) = child else {
+                return;
+            };
+            preview.stack.add_named(&child, Some(name));
+        }
+        preview.stack.set_visible_child_name(name);
+        self.document_view.set(view);
+        self.update_document_view_action();
     }
 
     fn render_pdf_viewer(
@@ -703,6 +801,7 @@ impl PreviewState {
                     id: request_id,
                     entry: entry_for_bind.clone(),
                     text_byte_limit: TEXT_BYTE_LIMIT,
+                    render_document: false,
                     pdf_page: page_index,
                 },
                 emit,
@@ -834,8 +933,9 @@ impl PreviewState {
     }
 
     fn clear_content(&self) {
+        self.source_preview.cancel();
         self.document_view_button.set_visible(false);
-        self.document_stack.borrow_mut().take();
+        self.document_preview.borrow_mut().take();
         if let Some(video) = self.media.borrow_mut().take()
             && let Some(stream) = video.media_stream()
         {
@@ -942,545 +1042,153 @@ fn document_view_action(view: DocumentView) -> (&'static str, &'static str) {
     }
 }
 
-fn source_preview(
-    entry: &FileEntry,
-    content_type: &str,
-    content: &str,
-    truncated: bool,
-) -> gtk::Box {
-    let buffer = sourceview5::Buffer::new(None);
-    let languages = sourceview5::LanguageManager::default();
-    let language = languages.guess_language(entry.location.native_path(), Some(content_type));
-    buffer.set_language(language.as_ref());
-    super::theme::register_source_buffer(&buffer);
-    buffer.set_highlight_syntax(true);
-    buffer.set_text(content);
-    let view = sourceview5::View::builder()
-        .buffer(&buffer)
-        .cursor_visible(false)
-        .editable(false)
-        .highlight_current_line(false)
-        .left_margin(14)
-        .right_margin(14)
-        .top_margin(12)
-        .bottom_margin(12)
-        .monospace(true)
-        .show_line_numbers(true)
-        .wrap_mode(gtk::WrapMode::None)
-        .build();
-    view.add_css_class("preview-text");
-    let scroll = gtk::ScrolledWindow::builder()
-        .child(&view)
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .hexpand(true)
-        .vexpand(true)
-        .build();
-    let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    container.set_vexpand(true);
-    container.append(&scroll);
-    if truncated {
-        let notice = gtk::Label::new(Some("Preview limited to the first 1 MB"));
-        notice.add_css_class("preview-note");
-        container.append(&notice);
-    }
-    container
-}
-
-fn rendered_document(document: &Document, warnings: &[String]) -> gtk::ScrolledWindow {
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    content.add_css_class("preview-document");
-    content.set_accessible_role(gtk::AccessibleRole::Document);
-
-    for warning in warnings {
-        let label = gtk::Label::new(Some(warning));
-        label.add_css_class("preview-document-warning");
-        label.set_wrap(true);
-        label.set_xalign(0.0);
-        content.append(&label);
-    }
-
-    let mut index = 0;
-    while index < document.blocks.len() {
-        match &document.blocks[index] {
-            DocumentBlock::ListItem { .. } => {
-                content.append(&rendered_list(&document.blocks, &mut index));
-            }
-            DocumentBlock::TableRow { .. } => {
-                content.append(&rendered_table(&document.blocks, &mut index, None));
-            }
-            DocumentBlock::Heading { level, markup } => {
-                let label = document_label(markup, "preview-document-heading");
-                label.add_css_class(&format!("level-{level}"));
-                label.set_accessible_role(gtk::AccessibleRole::Heading);
-                label.update_property(&[gtk::accessible::Property::Level(i32::from(*level))]);
-                content.append(&label);
-                index += 1;
-            }
-            DocumentBlock::Paragraph(markup) => {
-                content.append(&document_label(markup, "preview-document-copy"));
-                index += 1;
-            }
-            DocumentBlock::Quote(markup) => {
-                content.append(&document_label(markup, "preview-document-quote"));
-                index += 1;
-            }
-            DocumentBlock::Code(markup) => {
-                content.append(&document_label(
-                    &format!("<tt>{markup}</tt>"),
-                    "preview-document-code",
-                ));
-                index += 1;
-            }
-            DocumentBlock::Rule => {
-                let rule = gtk::Separator::new(gtk::Orientation::Horizontal);
-                rule.add_css_class("preview-document-rule");
-                content.append(&rule);
-                index += 1;
-            }
-            DocumentBlock::ContainerBoundary => index += 1,
-            DocumentBlock::ListChild { .. }
-            | DocumentBlock::ListRule { .. }
-            | DocumentBlock::ListTableRow { .. } => index += 1,
+impl SourcePreviewView {
+    fn new() -> Self {
+        let buffer = sourceview5::Buffer::new(None);
+        super::theme::register_source_buffer(&buffer);
+        let view = sourceview5::View::builder()
+            .buffer(&buffer)
+            .cursor_visible(false)
+            .editable(false)
+            .highlight_current_line(false)
+            .left_margin(14)
+            .right_margin(14)
+            .top_margin(12)
+            .bottom_margin(12)
+            .monospace(true)
+            .show_line_numbers(true)
+            .wrap_mode(gtk::WrapMode::None)
+            .build();
+        view.add_css_class("preview-text");
+        Self {
+            view,
+            generation: Rc::new(Cell::new(0)),
         }
     }
 
-    install_document_selection(&content);
-
-    gtk::ScrolledWindow::builder()
-        .child(&content)
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .hexpand(true)
-        .vexpand(true)
-        .build()
-}
-
-fn rendered_list(blocks: &[DocumentBlock], index: &mut usize) -> gtk::Box {
-    let root = document_list();
-    let mut lists = vec![root.clone()];
-    let mut bodies = Vec::<gtk::Box>::new();
-
-    loop {
-        match blocks.get(*index) {
-            Some(DocumentBlock::ListItem {
-                marker,
-                depth,
-                markup,
-            }) => {
-                lists.truncate(depth.saturating_add(1));
-                bodies.truncate(*depth);
-                while lists.len() <= *depth {
-                    let Some(parent) = bodies.get(lists.len().saturating_sub(1)) else {
-                        break;
-                    };
-                    let nested = document_list();
-                    parent.append(&nested);
-                    lists.push(nested);
-                }
-
-                let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                row.add_css_class("preview-document-list-item");
-                row.set_accessible_role(gtk::AccessibleRole::ListItem);
-                let bullet = gtk::Label::new(Some(marker));
-                bullet.add_css_class("preview-document-list-marker");
-                bullet.set_selectable(true);
-                bullet.set_valign(gtk::Align::Start);
-                let body = gtk::Box::new(gtk::Orientation::Vertical, 5);
-                body.append(&document_label(markup, "preview-document-copy"));
-                row.append(&bullet);
-                row.append(&body);
-                lists.last().unwrap_or(&root).append(&row);
-                bodies.push(body);
-                *index += 1;
-            }
-            Some(DocumentBlock::ListChild {
-                depth,
-                kind,
-                markup,
-            }) => {
-                bodies
-                    .get(*depth)
-                    .unwrap_or(&root)
-                    .append(&rendered_list_child(*kind, markup));
-                lists.truncate(depth.saturating_add(1));
-                bodies.truncate(depth.saturating_add(1));
-                *index += 1;
-            }
-            Some(DocumentBlock::ListRule { depth }) => {
-                let rule = gtk::Separator::new(gtk::Orientation::Horizontal);
-                rule.add_css_class("preview-document-rule");
-                bodies.get(*depth).unwrap_or(&root).append(&rule);
-                lists.truncate(depth.saturating_add(1));
-                bodies.truncate(depth.saturating_add(1));
-                *index += 1;
-            }
-            Some(DocumentBlock::ListTableRow { depth, .. }) => {
-                let depth = *depth;
-                let table = rendered_table(blocks, index, Some(depth));
-                bodies.get(depth).unwrap_or(&root).append(&table);
-                lists.truncate(depth.saturating_add(1));
-                bodies.truncate(depth.saturating_add(1));
-            }
-            Some(DocumentBlock::ContainerBoundary)
-                if matches!(
-                    blocks.get(index.saturating_add(1)),
-                    Some(DocumentBlock::ListTableRow { .. })
-                ) =>
-            {
-                *index += 1;
-            }
-            _ => break,
-        }
-    }
-
-    root
-}
-
-fn rendered_list_child(kind: DocumentListChildKind, markup: &str) -> gtk::Widget {
-    let label = match kind {
-        DocumentListChildKind::Paragraph => document_label(markup, "preview-document-copy"),
-        DocumentListChildKind::Heading(level) => {
-            let label = document_label(markup, "preview-document-heading");
-            label.add_css_class(&format!("level-{level}"));
-            label.set_accessible_role(gtk::AccessibleRole::Heading);
-            label.update_property(&[gtk::accessible::Property::Level(i32::from(level))]);
-            label
-        }
-        DocumentListChildKind::Quote => document_label(markup, "preview-document-quote"),
-        DocumentListChildKind::Code => {
-            document_label(&format!("<tt>{markup}</tt>"), "preview-document-code")
-        }
-    };
-    label.upcast()
-}
-
-fn rendered_table(
-    blocks: &[DocumentBlock],
-    index: &mut usize,
-    list_depth: Option<usize>,
-) -> gtk::Grid {
-    let table = gtk::Grid::builder()
-        .column_homogeneous(true)
-        .column_spacing(1)
-        .row_spacing(1)
-        .build();
-    table.add_css_class("preview-document-table");
-    table.set_accessible_role(gtk::AccessibleRole::Table);
-    let mut row = 0;
-    loop {
-        let cells = match blocks.get(*index) {
-            Some(DocumentBlock::TableRow { cells }) if list_depth.is_none() => cells,
-            Some(DocumentBlock::ListTableRow { depth, cells }) if Some(*depth) == list_depth => {
-                cells
-            }
-            _ => break,
-        };
-        for (column, cell) in cells.iter().enumerate() {
-            let label = document_label(&cell.markup, "preview-document-table-cell");
-            if cell.header {
-                label.add_css_class("header");
-                label.set_accessible_role(gtk::AccessibleRole::ColumnHeader);
+    fn show(
+        &self,
+        entry: &FileEntry,
+        content_type: &str,
+        content: &str,
+        truncated: bool,
+    ) -> gtk::Box {
+        self.cancel();
+        if let Some(parent) = self.view.parent() {
+            if let Ok(scroll) = parent.downcast::<gtk::ScrolledWindow>() {
+                scroll.set_child(None::<&gtk::Widget>);
             } else {
-                label.set_accessible_role(gtk::AccessibleRole::Cell);
+                self.view.unparent();
             }
-            table.attach(&label, i32::try_from(column).unwrap_or(i32::MAX), row, 1, 1);
         }
-        row += 1;
-        *index += 1;
+        if super::virtual_preview::use_virtual_source(content) {
+            return super::virtual_preview::source_document(content, truncated);
+        }
+        let display = normalize_preview_text(content).into_owned();
+        let buffer = sourceview5::Buffer::new(None);
+        super::theme::register_source_buffer(&buffer);
+        let languages = sourceview5::LanguageManager::default();
+        let language = languages.guess_language(entry.location.native_path(), Some(content_type));
+        let highlight_syntax = display.len() <= SOURCE_HIGHLIGHT_BYTE_LIMIT
+            && display.lines().count() <= SOURCE_HIGHLIGHT_LINE_LIMIT;
+        buffer.set_highlight_syntax(false);
+        buffer.set_language(language.as_ref());
+        self.view.set_buffer(Some(&buffer));
+        fill_source_buffer(
+            &buffer,
+            display,
+            self.generation.clone(),
+            self.generation.get(),
+            highlight_syntax,
+        );
+
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&self.view)
+            .hscrollbar_policy(gtk::PolicyType::Automatic)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        container.set_vexpand(true);
+        container.append(&scroll);
+        if truncated {
+            let notice = gtk::Label::new(Some("Preview limited to the first 1 MB."));
+            notice.add_css_class("preview-note");
+            notice.set_wrap(true);
+            container.append(&notice);
+        }
+        container
     }
-    table
+
+    fn cancel(&self) {
+        self.generation.set(self.generation.get().saturating_add(1));
+    }
 }
 
-fn document_list() -> gtk::Box {
-    let list = gtk::Box::new(gtk::Orientation::Vertical, 5);
-    list.add_css_class("preview-document-list");
-    list.set_accessible_role(gtk::AccessibleRole::List);
-    list
-}
-
-fn document_label(markup: &str, class: &str) -> gtk::Label {
-    let label = gtk::Label::new(None);
-    label.add_css_class(class);
-    label.set_use_markup(true);
-    label.set_markup(markup);
-    label.set_selectable(true);
-    label.set_wrap(true);
-    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    label.set_xalign(0.0);
-    label.set_yalign(0.0);
-    label.set_hexpand(true);
-    label.connect_activate_link(|label, uri| {
-        if has_web_scheme(uri) {
-            super::browser::open_location(&Location::uri(uri), label);
-        }
-        glib::Propagation::Stop
-    });
-    label
-}
-
-fn install_document_selection(content: &gtk::Box) {
-    let root: gtk::Widget = content.clone().upcast();
-    let labels = Rc::new(selectable_document_labels(&root));
-    if labels.len() < 2 {
+fn fill_source_buffer(
+    buffer: &sourceview5::Buffer,
+    text: String,
+    generation: Rc<Cell<u64>>,
+    expected_generation: u64,
+    highlight_syntax: bool,
+) {
+    let text = normalize_preview_text(&text).into_owned();
+    let first_end = source_chunk_end(&text, 0);
+    buffer.set_text(&text[..first_end]);
+    if first_end == text.len() {
+        buffer.set_modified(false);
+        buffer.set_highlight_syntax(highlight_syntax);
         return;
     }
 
-    let anchor = Rc::new(Cell::new(None::<DocumentTextPosition>));
-    let cursor = Rc::new(Cell::new(None::<DocumentTextPosition>));
-
-    let clear = gtk::GestureClick::new();
-    clear.set_button(1);
-    clear.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let labels_for_clear = labels.clone();
-    let anchor_for_clear = anchor.clone();
-    let cursor_for_clear = cursor.clone();
-    clear.connect_pressed(move |_, _, _, _| {
-        for item in labels_for_clear.iter() {
-            item.label.select_region(0, 0);
+    let weak_buffer = buffer.downgrade();
+    let mut offset = first_end;
+    glib::idle_add_local(move || {
+        if generation.get() != expected_generation {
+            return glib::ControlFlow::Break;
         }
-        anchor_for_clear.set(None);
-        cursor_for_clear.set(None);
-    });
-    content.add_controller(clear.clone());
-
-    let origin = Rc::new(Cell::new((0.0, 0.0)));
-    let drag = gtk::GestureDrag::new();
-    drag.set_button(1);
-    drag.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let root_for_begin = root.clone();
-    let labels_for_begin = labels.clone();
-    let anchor_for_begin = anchor.clone();
-    let cursor_for_begin = cursor.clone();
-    let origin_for_begin = origin.clone();
-    drag.connect_drag_begin(move |gesture, x, y| {
-        let position = document_text_position(
-            &root_for_begin,
-            &labels_for_begin,
-            gtk::graphene::Point::new(x as f32, y as f32),
-            false,
-        );
-        if position.is_some() {
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-        }
-        origin_for_begin.set((x, y));
-        anchor_for_begin.set(position);
-        cursor_for_begin.set(position);
-    });
-    let root_for_update = root.clone();
-    let labels_for_update = labels.clone();
-    let anchor_for_update = anchor.clone();
-    let cursor_for_update = cursor.clone();
-    drag.connect_drag_update(move |_, offset_x, offset_y| {
-        let Some(anchor) = anchor_for_update.get() else {
-            return;
+        let Some(buffer) = weak_buffer.upgrade() else {
+            return glib::ControlFlow::Break;
         };
-        let (start_x, start_y) = origin.get();
-        let Some(position) = document_text_position(
-            &root_for_update,
-            &labels_for_update,
-            gtk::graphene::Point::new((start_x + offset_x) as f32, (start_y + offset_y) as f32),
-            true,
-        ) else {
-            return;
-        };
-        apply_document_selection(&labels_for_update, anchor, position);
-        cursor_for_update.set(Some(position));
-    });
-    let root_for_end = root.clone();
-    let labels_for_end = labels.clone();
-    let anchor_for_end = anchor.clone();
-    let cursor_for_end = cursor.clone();
-    drag.connect_drag_end(move |_, _, _| {
-        let (Some(anchor), Some(cursor)) = (anchor_for_end.get(), cursor_for_end.get()) else {
-            return;
-        };
-        let text = document_selection_text(&labels_for_end, anchor, cursor);
-        if !text.is_empty() {
-            root_for_end.primary_clipboard().set_text(&text);
-        }
-    });
-    drag.group_with(&clear);
-    content.add_controller(drag);
-
-    let copy = gtk::EventControllerKey::new();
-    copy.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let root_for_copy = root;
-    copy.connect_key_pressed(move |_, key, _, modifiers| {
-        if !key
-            .to_unicode()
-            .is_some_and(|character| character.eq_ignore_ascii_case(&'c'))
-            || !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
-        {
-            return glib::Propagation::Proceed;
-        }
-        let (Some(anchor), Some(cursor)) = (anchor.get(), cursor.get()) else {
-            return glib::Propagation::Proceed;
-        };
-        let text = document_selection_text(&labels, anchor, cursor);
-        if text.is_empty() {
-            glib::Propagation::Proceed
+        let end = source_chunk_end(&text, offset);
+        buffer.insert(&mut buffer.end_iter(), &text[offset..end]);
+        offset = end;
+        if offset == text.len() {
+            buffer.set_modified(false);
+            buffer.set_highlight_syntax(highlight_syntax);
+            glib::ControlFlow::Break
         } else {
-            root_for_copy.clipboard().set_text(&text);
-            glib::Propagation::Stop
+            glib::ControlFlow::Continue
         }
     });
-    content.add_controller(copy);
 }
 
-fn selectable_document_labels(root: &gtk::Widget) -> Vec<DocumentSelectableLabel> {
-    fn collect(widget: &gtk::Widget, labels: &mut Vec<DocumentSelectableLabel>) {
-        if let Some(label) = widget.downcast_ref::<gtk::Label>()
-            && label.is_selectable()
-        {
-            let text = label.text().to_string();
-            labels.push(DocumentSelectableLabel {
-                label: label.clone(),
-                chars: text.chars().count(),
-                text,
-            });
-        }
-        let mut child = widget.first_child();
-        while let Some(current) = child {
-            child = current.next_sibling();
-            collect(&current, labels);
-        }
+fn source_chunk_end(text: &str, start: usize) -> usize {
+    let mut end = start
+        .saturating_add(SOURCE_INSERT_CHUNK_BYTES)
+        .min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
     }
-
-    let mut labels = Vec::new();
-    collect(root, &mut labels);
-    labels
+    if let Some(line_end) = text[start..end]
+        .match_indices('\n')
+        .nth(SOURCE_INSERT_CHUNK_LINES - 1)
+        .map(|(offset, _)| start + offset + 1)
+    {
+        end = line_end;
+    }
+    end
 }
 
-fn document_text_position(
-    root: &gtk::Widget,
-    labels: &[DocumentSelectableLabel],
-    point: gtk::graphene::Point,
-    nearest: bool,
-) -> Option<DocumentTextPosition> {
-    let mut candidate = None;
-    let mut candidate_distance = f32::MAX;
-    for (index, item) in labels.iter().enumerate() {
-        let Some(bounds) = item.label.compute_bounds(root) else {
-            continue;
-        };
-        let distance = distance_to_rect(&point, &bounds);
-        if distance == 0.0 {
-            candidate = Some((index, bounds));
-            break;
-        }
-        if nearest && distance < candidate_distance {
-            candidate = Some((index, bounds));
-            candidate_distance = distance;
-        }
-    }
-    let (label, bounds) = candidate?;
-    let point = gtk::graphene::Point::new(
-        point.x().clamp(bounds.x(), bounds.x() + bounds.width()),
-        point.y().clamp(bounds.y(), bounds.y() + bounds.height()),
-    );
-    let local = root.compute_point(&labels[label].label, &point)?;
-    let (layout_x, layout_y) = labels[label].label.layout_offsets();
-    let (_, byte, trailing) = labels[label].label.layout().xy_to_index(
-        ((local.x() - layout_x as f32) * gtk::pango::SCALE as f32) as i32,
-        ((local.y() - layout_y as f32) * gtk::pango::SCALE as f32) as i32,
-    );
-    let mut byte = usize::try_from(byte.max(0))
-        .unwrap_or(0)
-        .min(labels[label].text.len());
-    while !labels[label].text.is_char_boundary(byte) {
-        byte = byte.saturating_sub(1);
-    }
-    Some(DocumentTextPosition {
-        label,
-        offset: labels[label].text[..byte]
-            .chars()
-            .count()
-            .saturating_add(usize::try_from(trailing.max(0)).unwrap_or(0))
-            .min(labels[label].chars),
-    })
-}
-
-fn distance_to_rect(point: &gtk::graphene::Point, rect: &gtk::graphene::Rect) -> f32 {
-    let dx = if point.x() < rect.x() {
-        rect.x() - point.x()
-    } else if point.x() > rect.x() + rect.width() {
-        point.x() - rect.x() - rect.width()
-    } else {
-        0.0
-    };
-    let dy = if point.y() < rect.y() {
-        rect.y() - point.y()
-    } else if point.y() > rect.y() + rect.height() {
-        point.y() - rect.y() - rect.height()
-    } else {
-        0.0
-    };
-    dx.mul_add(dx, dy * dy)
-}
-
-fn apply_document_selection(
-    labels: &[DocumentSelectableLabel],
-    anchor: DocumentTextPosition,
-    cursor: DocumentTextPosition,
-) {
-    for (index, item) in labels.iter().enumerate() {
-        let (start, end) =
-            document_selection_range(index, item.chars, anchor, cursor).unwrap_or((0, 0));
-        item.label.select_region(
-            i32::try_from(start).unwrap_or(i32::MAX),
-            i32::try_from(end).unwrap_or(i32::MAX),
-        );
-    }
-}
-
-fn document_selection_text(
-    labels: &[DocumentSelectableLabel],
-    anchor: DocumentTextPosition,
-    cursor: DocumentTextPosition,
-) -> String {
-    labels
-        .iter()
-        .enumerate()
-        .filter_map(|(index, item)| {
-            let (start, end) = document_selection_range(index, item.chars, anchor, cursor)?;
-            (start < end).then(|| {
-                item.text
-                    .chars()
-                    .skip(start)
-                    .take(end - start)
-                    .collect::<String>()
-            })
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn document_selection_range(
-    label: usize,
-    length: usize,
-    anchor: DocumentTextPosition,
-    cursor: DocumentTextPosition,
-) -> Option<(usize, usize)> {
-    if anchor.label == cursor.label {
-        return (label == anchor.label).then(|| {
-            (
-                anchor.offset.min(cursor.offset),
-                anchor.offset.max(cursor.offset),
-            )
-        });
-    }
-    let (first, last) = if anchor.label < cursor.label {
-        (anchor, cursor)
-    } else {
-        (cursor, anchor)
-    };
-    match label {
-        _ if label < first.label || label > last.label => None,
-        _ if first.label == label => Some((first.offset, length)),
-        _ if last.label == label => Some((0, last.offset)),
-        _ => Some((0, length)),
-    }
+pub(super) fn document_notice(message: &str) -> gtk::Label {
+    let notice = gtk::Label::new(Some(message));
+    notice.add_css_class("preview-document-notice");
+    notice.set_hexpand(true);
+    notice.set_selectable(true);
+    notice.set_wrap(true);
+    notice.set_xalign(0.0);
+    notice
 }
 
 fn copyable_command(command: &str) -> gtk::Overlay {

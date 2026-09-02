@@ -4,8 +4,8 @@ use std::collections::HashSet;
 
 use super::{
     Preferences, Theme, azure_tokens, blend, builtins, is_omarchy_theme_event,
-    merge_builtin_and_custom_themes, slugify, sort_preferences, title_case_slug,
-    tokens_from_quattro, validate_tokens,
+    merge_builtin_and_custom_themes, slugify, sort_preferences, source_palette_from_quattro,
+    title_case_slug, tokens_from_quattro, validate_tokens,
 };
 use crate::{
     model::{SortDirection, SortKey, ViewPreferences},
@@ -131,6 +131,27 @@ color8 = "#123247"
     assert_eq!(theme.background, "#0d1b2a");
     assert_eq!(theme.accent, "#00aaff");
     assert_eq!(theme.border, "#487089");
+}
+
+#[test]
+fn quattro_syntax_colors_remain_theme_native() {
+    let palette = source_palette_from_quattro(
+        r##"
+blue = "#111111"
+cyan = "#222222"
+green = "#333333"
+yellow = "#444444"
+orange = "#555555"
+magenta = "#666666"
+"##,
+    )
+    .expect("complete Quattro syntax palette");
+
+    assert_eq!(palette.statement, "#666666");
+    assert_eq!(palette.string, "#333333");
+    assert_eq!(palette.constant, "#555555");
+    assert_eq!(palette.type_color, "#222222");
+    assert_eq!(palette.preprocessor, "#444444");
 }
 
 #[test]
