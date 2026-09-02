@@ -8,7 +8,7 @@ use super::{
     DocumentSelection, PreviewUnit, SelectionPoint, SourceUnit, VirtualPreviewState,
     bounded_text_prefix, code_block_copy_text, drag_threshold_crossed, highlighted_code_language,
     local_selection, matching_link, plain_text_view, rendered_document, selection_text,
-    source_units, styled_markup, use_virtual_source, vertical_distance,
+    source_line_numbers_view, source_units, styled_markup, use_virtual_source, vertical_distance,
 };
 use crate::{
     services::{DocumentLayout, DocumentSpan, DocumentSpanStyle, DocumentUnit, DocumentUnitKind},
@@ -275,6 +275,24 @@ fn rendered_preview_releases_its_widget_tree() {
     assert!(long_view.hexpands());
     assert!(long_view.measure(gtk::Orientation::Horizontal, -1).0 > 16);
     drop(long_view);
+
+    let source = (1..=200)
+        .map(|line| format!("source line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let source_view = plain_text_view(&source, true);
+    let numbers = source_line_numbers_view(&SourceUnit {
+        display: source.clone(),
+        source,
+        first_line: 1,
+        line_count: 200,
+        continuation: false,
+    });
+    assert_eq!(
+        numbers.measure(gtk::Orientation::Vertical, -1).0,
+        source_view.measure(gtk::Orientation::Vertical, -1).0
+    );
+    drop((numbers, source_view));
 
     let threshold = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     assert!(!drag_threshold_crossed(&threshold, 10.0, 10.0, 10.0, 10.0));

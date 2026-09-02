@@ -359,11 +359,7 @@ fn bind_unit(
         PreviewUnit::Source(unit) => {
             let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             line.add_css_class("preview-source-row");
-            let numbers = gtk::Label::new(Some(&source_line_numbers(unit)));
-            numbers.add_css_class("preview-source-lines");
-            numbers.set_xalign(1.0);
-            numbers.set_yalign(0.0);
-            numbers.set_selectable(false);
+            let numbers = source_line_numbers_view(unit);
             let view = plain_text_view(&unit.display, true);
             line.append(&numbers);
             line.append(&view);
@@ -374,6 +370,24 @@ fn bind_unit(
             bound
         }
     }
+}
+
+fn source_line_numbers_view(unit: &SourceUnit) -> gtk::TextView {
+    let text = source_line_numbers(unit);
+    let buffer = gtk::TextBuffer::new(None);
+    buffer.set_text(&text);
+    let view = gtk::TextView::with_buffer(&buffer);
+    view.set_editable(false);
+    view.set_cursor_visible(false);
+    view.set_accepts_tab(false);
+    view.set_wrap_mode(gtk::WrapMode::None);
+    view.set_can_target(false);
+    view.set_focusable(false);
+    view.set_accessible_role(gtk::AccessibleRole::Presentation);
+    view.add_css_class("preview-source-lines");
+    let (width, _) = view.create_pango_layout(Some(&text)).pixel_size();
+    view.set_size_request(width, -1);
+    view
 }
 
 fn clear_box(box_: &gtk::Box) {

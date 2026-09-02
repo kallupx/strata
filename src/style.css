@@ -1524,9 +1524,14 @@ paned > separator {
   padding: 0 14px;
 }
 
-.preview-source-lines {
+.preview-source-lines,
+.preview-source-lines text {
+  background: @theme_surface;
   color: @theme_dim_text;
   font-family: "JetBrains Mono", "JetBrainsMono Nerd Font", monospace;
+}
+
+.preview-source-lines {
   padding: 0 6px 0 0;
 }
 
