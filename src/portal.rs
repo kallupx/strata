@@ -41,6 +41,8 @@ const MAX_TOTAL_CHOICE_OPTIONS: usize = 128;
 const MAX_FILTERS: usize = 32;
 const MAX_FILTER_RULES: usize = 64;
 const MAX_TOTAL_FILTER_RULES: usize = 256;
+const MAX_GLOB_BYTES: usize = 256;
+const MAX_GLOB_STAR_RUNS: usize = 2;
 const MAX_SAVE_FILES: usize = 256;
 const MAX_STRING_BYTES: usize = 4_096;
 const MAX_FILENAME_BYTES: usize = 255;
@@ -445,9 +447,28 @@ fn validate_filters(
         if total_rules > MAX_TOTAL_FILTER_RULES {
             return invalid_argument("file filters have too many rules");
         }
-        for value in patterns.into_iter().chain(mimetypes) {
-            validate_string(value, MAX_STRING_BYTES, "file filter rule")?;
+        for pattern in patterns {
+            validate_glob(pattern)?;
         }
+        for mimetype in mimetypes {
+            validate_string(mimetype, MAX_STRING_BYTES, "MIME filter rule")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_glob(pattern: &str) -> ashpd::backend::Result<()> {
+    validate_string(pattern, MAX_GLOB_BYTES, "glob filter rule")?;
+    let mut star_runs = 0usize;
+    let mut previous_star = false;
+    for byte in pattern.bytes() {
+        if byte == b'*' && !previous_star {
+            star_runs += 1;
+            if star_runs > MAX_GLOB_STAR_RUNS {
+                return invalid_argument("glob filter rule has too many wildcard groups");
+            }
+        }
+        previous_star = byte == b'*';
     }
     Ok(())
 }

@@ -241,6 +241,22 @@ fn untrusted_request_inputs_are_bounded() {
         filter.glob(&format!("*.{index}"))
     });
     assert!(validate_filters(&[filter], None).is_err());
+    assert!(
+        validate_filters(&[FileFilter::new("Filter").glob("*a*a*a*z")], None).is_err(),
+        "backtracking-heavy globs must be rejected"
+    );
+    assert!(
+        validate_filters(&[FileFilter::new("Filter").glob("*a*.txt")], None).is_ok(),
+        "two wildcard groups remain supported"
+    );
+    assert!(
+        validate_filters(
+            &[FileFilter::new("Filter").glob(&"a".repeat(MAX_GLOB_BYTES + 1))],
+            None,
+        )
+        .is_err(),
+        "glob length must be bounded"
+    );
 
     let filenames = vec![OsString::from("file"); MAX_SAVE_FILES + 1];
     assert!(validate_save_filenames(&filenames).is_err());
