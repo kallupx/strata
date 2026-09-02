@@ -220,24 +220,6 @@ impl FileChooserImpl for FileChooserBackend {
 }
 
 pub(crate) fn run() -> glib::ExitCode {
-    if let Err(error) = gtk::init() {
-        eprintln!("Unable to initialize the Strata portal UI: {error}");
-        return glib::ExitCode::FAILURE;
-    }
-    crate::metrics::initialize();
-    if let Err(error) = tracing_subscriber::fmt::try_init() {
-        eprintln!("Unable to initialize logging: {error}");
-    }
-    tracing::info!(
-        version = FILE_CHOOSER_VERSION,
-        "starting Strata FileChooser portal backend"
-    );
-    if let Err(error) = crate::assets::prepare() {
-        eprintln!("Unable to prepare bundled assets: {error}");
-    }
-    crate::assets::register_icon_theme();
-    crate::ui::prepare_portal_ui();
-
     let main_loop = glib::MainLoop::new(None, false);
     let service_loop = main_loop.clone();
     let service_failed = Arc::new(AtomicBool::new(false));
@@ -263,6 +245,28 @@ pub(crate) fn run() -> glib::ExitCode {
             glib::MainContext::default().invoke(move || service_loop.quit());
         }
     });
+
+    if let Err(error) = gtk::init() {
+        eprintln!("Unable to initialize the Strata portal UI: {error}");
+        return glib::ExitCode::FAILURE;
+    }
+    crate::metrics::initialize();
+    if let Err(error) = tracing_subscriber::fmt::try_init() {
+        eprintln!("Unable to initialize logging: {error}");
+    }
+    tracing::info!(
+        version = FILE_CHOOSER_VERSION,
+        "starting Strata FileChooser portal backend"
+    );
+    if let Err(error) = crate::assets::prepare() {
+        eprintln!("Unable to prepare bundled assets: {error}");
+    }
+    crate::assets::register_icon_theme();
+    crate::ui::prepare_portal_ui();
+
+    if service_failed.load(Ordering::SeqCst) {
+        return glib::ExitCode::FAILURE;
+    }
     main_loop.run();
     if service_failed.load(Ordering::SeqCst) {
         glib::ExitCode::FAILURE
