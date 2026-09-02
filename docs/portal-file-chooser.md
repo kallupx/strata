@@ -6,7 +6,19 @@ The first release is deliberately limited to local files and folders. X11 parent
 
 ## Per-user installation
 
-Install Strata at a stable absolute path. The commands below use the default XDG locations and an existing installation at `~/.local/bin/strata`:
+Install Strata at a stable absolute path, then run:
+
+```bash
+strata --install-portal
+```
+
+This installs the portal metadata and D-Bus activation service below `$XDG_DATA_HOME`, makes Strata the preferred FileChooser while retaining the active backends as fallbacks, reloads D-Bus, and restarts the portal frontend. If no user portal configuration exists, Strata copies the active desktop configuration before changing the FileChooser preference. The command records whether that user override was created or modified so it can be removed safely later.
+
+The generated D-Bus service contains the absolute path of the command being run. Move Strata to its permanent location before installing the portal. D-Bus service-file argument parsing is not shell quoting, so the installer rejects executable paths containing whitespace, quotes, or backslashes.
+
+### Manual installation
+
+The equivalent commands below use the default XDG locations and an existing installation at `~/.local/bin/strata`:
 
 ```bash
 data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -31,7 +43,7 @@ gdbus call --session \
   --method org.freedesktop.DBus.ReloadConfig
 ```
 
-The generated D-Bus service must contain an absolute `Exec=` path. If that path contains whitespace, install Strata somewhere else; D-Bus service-file argument parsing is not shell quoting.
+The generated D-Bus service must contain an absolute `Exec=` path. If that path contains whitespace, quotes, or backslashes, install Strata somewhere else; D-Bus service-file argument parsing is not shell quoting.
 
 Open `$config_home/xdg-desktop-portal/portals.conf`, preserve its existing `[preferred]` section and settings, and merge Strata into the FileChooser preference:
 
@@ -71,12 +83,26 @@ Portal backend selection happens before a request is sent. Keeping the existing 
 
 ## Uninstall
 
+Run the matching per-user command:
+
+```bash
+strata --uninstall-portal
+```
+
+It removes Strata's metadata and activation service and restores the previous user portal configuration. If the configuration changed after installation, it preserves those changes and removes only Strata from the FileChooser preference. It then reloads D-Bus and restarts the portal frontend. If the frontend cannot be restarted automatically, log out and back in.
+
+For a complete Strata uninstall, also remove the application binary and desktop entry as described in the main installation guide.
+
+### Manual uninstall
+
 Remove the Strata metadata and activation service:
 
 ```bash
 data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
 rm -f "$data_home/xdg-desktop-portal/portals/strata.portal" \
-  "$data_home/dbus-1/services/org.freedesktop.impl.portal.desktop.strata.service"
+  "$data_home/dbus-1/services/org.freedesktop.impl.portal.desktop.strata.service" \
+  "$data_home/strata/portal-install/state.toml"
+rmdir "$data_home/strata/portal-install" 2>/dev/null || true
 gdbus call --session \
   --dest org.freedesktop.DBus \
   --object-path /org/freedesktop/DBus \
@@ -88,5 +114,3 @@ Edit `${XDG_CONFIG_HOME:-$HOME/.config}/xdg-desktop-portal/portals.conf`, remove
 ```bash
 systemctl --user restart xdg-desktop-portal.service
 ```
-
-For a complete Strata uninstall, also remove the application binary and desktop entry as described in the main installation guide.

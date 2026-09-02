@@ -7,6 +7,7 @@ mod build_info;
 mod metrics;
 mod model;
 mod portal;
+mod portal_setup;
 mod sandbox;
 mod sandbox_helper;
 mod services;
@@ -46,6 +47,18 @@ fn main() -> gtk::glib::ExitCode {
     if arguments.get(1).is_some_and(|value| value == "--portal") {
         return portal::run();
     }
+    if arguments
+        .get(1)
+        .is_some_and(|value| value == "--install-portal")
+    {
+        return finish_portal_setup(portal_setup::install());
+    }
+    if arguments
+        .get(1)
+        .is_some_and(|value| value == "--uninstall-portal")
+    {
+        return finish_portal_setup(portal_setup::uninstall());
+    }
 
     fall_back_if_gvfs_is_unresponsive();
 
@@ -69,6 +82,19 @@ fn main() -> gtk::glib::ExitCode {
         ui::present_location(application, location);
     });
     application.run()
+}
+
+fn finish_portal_setup(result: Result<String, String>) -> gtk::glib::ExitCode {
+    match result {
+        Ok(message) => {
+            println!("{message}");
+            gtk::glib::ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            gtk::glib::ExitCode::FAILURE
+        }
+    }
 }
 
 fn fall_back_if_gvfs_is_unresponsive() {
