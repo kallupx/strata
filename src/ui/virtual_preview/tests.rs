@@ -10,8 +10,9 @@ use super::{
     local_selection, matching_link, plain_text_view, rendered_document, selection_text,
     source_units, styled_markup, use_virtual_source, vertical_distance,
 };
-use crate::services::{
-    DocumentLayout, DocumentSpan, DocumentSpanStyle, DocumentUnit, DocumentUnitKind,
+use crate::{
+    services::{DocumentLayout, DocumentSpan, DocumentSpanStyle, DocumentUnit, DocumentUnitKind},
+    test_support::ASYNC_MAIN_CONTEXT_DEFAULT,
 };
 
 #[test]
@@ -256,6 +257,9 @@ fn code_copy_reassembles_one_virtualized_block() {
 
 #[test]
 fn rendered_preview_releases_its_widget_tree() {
+    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .expect("the async test lock should not be poisoned");
     if gtk::init().is_err() {
         return;
     }
