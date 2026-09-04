@@ -6,12 +6,12 @@ use super::*;
 fn thumbnail_counters_are_monotonic() {
     let before = thumbnail_counts();
     mark_thumbnail_eligible(2);
-    mark_thumbnail_requested("file:///a");
-    mark_thumbnail_started("file:///a");
-    mark_thumbnail_completed("file:///a");
-    mark_thumbnail_applied("file:///a");
-    mark_thumbnail_cancelled("file:///b");
-    mark_thumbnail_stale("file:///b");
+    mark_thumbnail_requested();
+    mark_thumbnail_started();
+    mark_thumbnail_completed();
+    mark_thumbnail_applied();
+    mark_thumbnail_cancelled();
+    mark_thumbnail_stale();
     let after = thumbnail_counts();
     assert_eq!(after.eligible, before.eligible + 2);
     assert_eq!(after.requested, before.requested + 1);

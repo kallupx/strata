@@ -508,7 +508,7 @@ fn park_thumbnail(
     target: PendingTarget,
     wait_for_metadata: bool,
 ) {
-    crate::metrics::mark_thumbnail_requested(&key.path.display().to_string());
+    crate::metrics::mark_thumbnail_requested();
     let viewport = target.image.upgrade().and_then(|image| viewport_of(&image));
     let group = group_address(viewport.as_ref());
     let viewport_ref = glib::WeakRef::new();
@@ -753,15 +753,13 @@ fn push_metadata_waiter(group: usize, park: SettledPark) {
 }
 
 pub(super) fn note_metadata(path: &Path, modified: Option<i64>, file_size: Option<u64>) {
-    let Some(mtime) = modified else {
-        return;
-    };
-    // Metadata may arrive on either side of the settle gate; update both so no thumbnail strands.
+    // A completed metadata attempt releases thumbnail work even when mtime is unavailable.
+    // Such renders remain memory-only because the shared cache cannot validate them.
     SETTLE_VIEWS.with(|views| {
         for settle in views.borrow_mut().values_mut() {
             for park in &mut settle.pending {
                 if park.wait_for_metadata && park.key.path == path {
-                    park.key.modified = Some(mtime);
+                    park.key.modified = modified;
                     park.key.file_size = file_size.or(park.key.file_size);
                     park.wait_for_metadata = false;
                 }
@@ -775,7 +773,7 @@ pub(super) fn note_metadata(path: &Path, modified: Option<i64>, file_size: Optio
             .filter_map(|active| active.deferred.as_mut())
         {
             if deferred.key.path == path {
-                deferred.key.modified = Some(mtime);
+                deferred.key.modified = modified;
                 deferred.key.file_size = file_size.or(deferred.key.file_size);
             }
         }
@@ -789,7 +787,7 @@ pub(super) fn note_metadata(path: &Path, modified: Option<i64>, file_size: Optio
         }
         let key = ThumbnailKey {
             path: path.to_path_buf(),
-            modified: Some(mtime),
+            modified,
             file_size: file_size.or(waiter.file_size),
             thumbnail_size: waiter.thumbnail_size,
         };
@@ -797,13 +795,14 @@ pub(super) fn note_metadata(path: &Path, modified: Option<i64>, file_size: Optio
     }
 }
 pub(super) fn note_metadata_entry(entry: &FileEntry) {
-    let (Some(path), Some(mtime)) = (
-        entry.location.native_path(),
-        known_metadata(&entry.modified_unix_seconds),
-    ) else {
+    let Some(path) = entry.location.native_path() else {
         return;
     };
-    note_metadata(path, Some(mtime), known_metadata(&entry.size));
+    note_metadata(
+        path,
+        known_metadata(&entry.modified_unix_seconds),
+        known_metadata(&entry.size),
+    );
 }
 
 fn park_into_group(
@@ -874,7 +873,7 @@ fn start_thumbnail_jobs() {
             THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().finish());
             continue;
         };
-        crate::metrics::mark_thumbnail_started(&job.key.path.display().to_string());
+        crate::metrics::mark_thumbnail_started();
         glib::MainContext::default().spawn_local(run_thumbnail_job(job));
     }
 }
@@ -901,24 +900,22 @@ async fn run_thumbnail_job(job: ThumbnailJob) {
     .await;
     let targets = take_pending_targets(&key, job_id);
     THUMBNAIL_QUEUE.with(|queue| queue.borrow_mut().finish());
-    let uri = key.path.display().to_string();
-
     if let Some(targets) = targets {
         match result {
             Ok(Ok((png, rendered))) => {
-                crate::metrics::mark_thumbnail_completed(&uri);
+                crate::metrics::mark_thumbnail_completed();
                 let bytes = glib::Bytes::from_owned(png.clone());
                 THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().insert(key.clone(), bytes.clone()));
-                finish_thumbnail_targets(targets, Some(&bytes), thumbnail_size, &uri);
+                finish_thumbnail_targets(targets, Some(&bytes), thumbnail_size);
                 // Unverifiable keys (unknown mtime) skip persistence: nothing validates them later.
                 if rendered && let Some(mtime) = key.modified {
                     enqueue_persist(key.path.clone(), mtime, png);
                 }
             }
             Ok(Err(_)) | Err(_) => {
-                crate::metrics::mark_thumbnail_cancelled(&uri);
+                crate::metrics::mark_thumbnail_cancelled();
                 THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().insert_failure(key));
-                finish_thumbnail_targets(targets, None, thumbnail_size, &uri);
+                finish_thumbnail_targets(targets, None, thumbnail_size);
             }
         }
     }
@@ -1002,7 +999,6 @@ fn finish_thumbnail_targets(
     targets: Vec<PendingTarget>,
     bytes: Option<&glib::Bytes>,
     thumbnail_size: i32,
-    uri: &str,
 ) {
     for target in targets {
         let is_current = ACTIVE_REQUESTS.with(|requests| {
@@ -1018,18 +1014,18 @@ fn finish_thumbnail_targets(
             }
         });
         if !is_current {
-            crate::metrics::mark_thumbnail_stale(uri);
+            crate::metrics::mark_thumbnail_stale();
             continue;
         }
         let Some(bytes) = bytes else {
             continue;
         };
         let Some(image) = target.image.upgrade() else {
-            crate::metrics::mark_thumbnail_stale(uri);
+            crate::metrics::mark_thumbnail_stale();
             continue;
         };
         apply_thumbnail(&image, bytes, thumbnail_size);
-        crate::metrics::mark_thumbnail_applied(uri);
+        crate::metrics::mark_thumbnail_applied();
     }
 }
 
@@ -1087,6 +1083,12 @@ fn set_fallback_icon(image: &gtk::Image, icon: &str, size: i32) -> (usize, u64) 
 fn cancel_thumbnail(image_id: usize) {
     ACTIVE_REQUESTS.with(|requests| {
         requests.borrow_mut().remove(&image_id);
+    });
+    METADATA_WAITERS.with(|waiters| {
+        waiters.borrow_mut().retain(|_, targets| {
+            targets.retain(|waiter| waiter.target.image_id != image_id);
+            !targets.is_empty()
+        });
     });
     SETTLE_VIEWS.with(|views| {
         views.borrow_mut().retain(|_, settle| {

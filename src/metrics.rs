@@ -99,55 +99,49 @@ pub fn mark_thumbnail_eligible(count: u64) {
     );
 }
 
-pub fn mark_thumbnail_requested(uri: &str) {
+pub fn mark_thumbnail_requested() {
     THUMB_REQUESTED.fetch_add(1, Ordering::Relaxed);
     tracing::debug!(
-        uri,
         total = THUMB_REQUESTED.load(Ordering::Relaxed),
         "thumbnail requested"
     );
 }
 
-pub fn mark_thumbnail_started(uri: &str) {
+pub fn mark_thumbnail_started() {
     THUMB_STARTED.fetch_add(1, Ordering::Relaxed);
     tracing::debug!(
-        uri,
         total = THUMB_STARTED.load(Ordering::Relaxed),
         "thumbnail started"
     );
 }
 
-pub fn mark_thumbnail_completed(uri: &str) {
+pub fn mark_thumbnail_completed() {
     THUMB_COMPLETED.fetch_add(1, Ordering::Relaxed);
     tracing::debug!(
-        uri,
         total = THUMB_COMPLETED.load(Ordering::Relaxed),
         "thumbnail completed"
     );
 }
 
-pub fn mark_thumbnail_applied(uri: &str) {
+pub fn mark_thumbnail_applied() {
     THUMB_APPLIED.fetch_add(1, Ordering::Relaxed);
     tracing::debug!(
-        uri,
         total = THUMB_APPLIED.load(Ordering::Relaxed),
         "thumbnail applied"
     );
 }
 
-pub fn mark_thumbnail_cancelled(uri: &str) {
+pub fn mark_thumbnail_cancelled() {
     THUMB_CANCELLED.fetch_add(1, Ordering::Relaxed);
     tracing::debug!(
-        uri,
         total = THUMB_CANCELLED.load(Ordering::Relaxed),
         "thumbnail cancelled"
     );
 }
 
-pub fn mark_thumbnail_stale(uri: &str) {
+pub fn mark_thumbnail_stale() {
     THUMB_STALE.fetch_add(1, Ordering::Relaxed);
     tracing::debug!(
-        uri,
         total = THUMB_STALE.load(Ordering::Relaxed),
         "thumbnail stale"
     );
