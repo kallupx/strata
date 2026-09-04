@@ -83,14 +83,14 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
     let preview_for_selection = preview.clone();
     let weak_controller = Rc::downgrade(&controller);
     controller.observe(move |event| match event {
-        BrowserEvent::PreviewRequested { entry } => preview_for_selection.show(entry),
+        BrowserEvent::PreviewRequested { entry } => preview_for_selection.show(entry.clone()),
         BrowserEvent::FocusChanged {
             depth,
             position: Some(position),
         } if preview_for_selection.is_open() => {
             if let Some(entry) = weak_controller
                 .upgrade()
-                .and_then(|browser| browser.entry_at(depth, position))
+                .and_then(|browser| browser.entry_at(*depth, *position))
             {
                 if entry.is_directory() {
                     preview_for_selection.close();
@@ -2041,7 +2041,7 @@ fn build_sidebar(view: BrowserView, theme_manager: Rc<super::theme::ThemeManager
         // The active place follows the active location only: batch,
         // metadata, sort-progress, and operation traffic never moves it,
         // so syncing on every event is pure overhead per listing batch.
-        if !SidebarState::event_changes_active_place(&event) {
+        if !SidebarState::event_changes_active_place(event) {
             return;
         }
         if let Some(state) = weak.upgrade() {

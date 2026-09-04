@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::{cmp::Ordering, collections::HashSet};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+};
 
 use crate::{
     app::peek::PeekState,
     model::{FileEntry, Location, MetadataValue, SortDirection, SortKey, ViewPreferences},
-    services::{DirectoryChange, RequestId},
+    services::{DirectoryChange, MetadataUpdate, RequestId},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -287,6 +290,106 @@ impl NavigationState {
         Some((depth, insertions))
     }
 
+    /// Installs a complete staged snapshot for a native initial load,
+    /// entries arrive pre-sorted, so no merge walk runs. Restores the pending
+    /// selection target and first-on-load selection exactly like a batch
+    /// would; the caller marks the load finished and publishes afterwards.
+    pub fn install_snapshot(
+        &mut self,
+        request_id: RequestId,
+        entries: Vec<FileEntry>,
+    ) -> Option<usize> {
+        let (depth, column) = self.column_for_request_mut(request_id)?;
+        column.entries = entries;
+        if let Some(selected_location) = column.selection_target.clone() {
+            column.selected = column
+                .entries
+                .iter()
+                .position(|entry| entry.location == selected_location);
+            if column.selected.is_some() {
+                column.selection_target = None;
+            }
+        }
+        if column.select_first_on_load && !column.entries.is_empty() {
+            let location = column.entries[0].location.clone();
+            column.selected = Some(0);
+            column.selected_locations.clear();
+            column.selected_locations.insert(location.clone());
+            column.selection_anchor = Some(location);
+            column.select_first_on_load = false;
+        }
+        Some(depth)
+    }
+
+    /// Depth of a still-open native load, if `request_id` belongs to one.
+    /// Finished, failed, peek, and unknown requests report `None`.
+    pub fn open_load_depth(&self, request_id: RequestId) -> Option<usize> {
+        self.columns.iter().enumerate().find_map(|(depth, column)| {
+            (column.request_id == request_id && column.load_state == LoadState::Loading)
+                .then_some(depth)
+        })
+    }
+    /// Returns the depth and the changed positions so views can refresh those
+    /// rows in place; the order never changes here. Fills for a superseded
+    /// load match no column and are dropped. Fields arrive independently: a
+    /// fill that only learned the mtime must not clobber a known size with
+    /// a placeholder, and rows whose values did not change are not reported.
+    pub fn apply_metadata(
+        &mut self,
+        request_id: RequestId,
+        updates: Vec<MetadataUpdate>,
+    ) -> Option<(usize, Vec<usize>)> {
+        let (depth, column) = self.column_for_request_mut(request_id)?;
+        let updates: HashMap<&Location, &MetadataUpdate> = updates
+            .iter()
+            .map(|update| (&update.location, update))
+            .collect();
+        let mut positions = Vec::new();
+        for (position, entry) in column.entries.iter_mut().enumerate() {
+            if let Some(update) = updates.get(&entry.location)
+                && apply_metadata_update(entry, update)
+            {
+                positions.push(position);
+            }
+        }
+        if positions.is_empty() {
+            return None;
+        }
+        Some((depth, positions))
+    }
+
+    /// Applies fill updates captured with stable `(position, Location)`
+    /// tokens, in O(number of requested rows). Each token is validated: the
+    /// same location must still occupy the position, otherwise the row moved
+    /// under the fill and the update is reported stale. Stale rows keep
+    /// their placeholders and are re-requested on their next bind, so only
+    /// stale rows retry. Returns the depth, the applied positions, and the
+    /// stale locations.
+    pub fn apply_positioned_metadata(
+        &mut self,
+        request_id: RequestId,
+        updates: Vec<(usize, MetadataUpdate)>,
+    ) -> Option<(usize, Vec<usize>, Vec<Location>)> {
+        let (depth, column) = self.column_for_request_mut(request_id)?;
+        let mut positions = Vec::new();
+        let mut stale = Vec::new();
+        for (position, update) in &updates {
+            let current = column.entries.get(*position);
+            if current.is_some_and(|entry| entry.location == update.location) {
+                let entry = column.entries.get_mut(*position).expect("position checked");
+                if apply_metadata_update(entry, update) {
+                    positions.push(*position);
+                }
+            } else {
+                stale.push(update.location.clone());
+            }
+        }
+        if positions.is_empty() && stale.is_empty() {
+            return None;
+        }
+        Some((depth, positions, stale))
+    }
+
     pub fn apply_directory_change(
         &mut self,
         depth: usize,
@@ -422,11 +525,11 @@ impl NavigationState {
         self.columns.get(depth).map(|column| column.preferences)
     }
 
-    pub fn set_column_preferences(
+    pub fn apply_sort_preferences(
         &mut self,
         depth: usize,
         preferences: ViewPreferences,
-    ) -> Option<(Vec<FileEntry>, Option<usize>, Vec<usize>)> {
+    ) -> Option<(Option<usize>, Vec<usize>)> {
         if depth >= self.columns.len() {
             return None;
         }
@@ -439,6 +542,8 @@ impl NavigationState {
             .and_then(|position| column.entries.get(position))
             .map(|entry| entry.location.clone());
         column.preferences = preferences;
+        // Unstable, matching sort-once publication: display-name and location
+        // tie-breakers in `compare_entries` keep distinct entries ordered.
         column
             .entries
             .sort_unstable_by(|left, right| compare_entries(left, right, preferences));
@@ -459,7 +564,7 @@ impl NavigationState {
                     .then_some(position)
             })
             .collect();
-        Some((column.entries.clone(), column.selected, selected_positions))
+        Some((column.selected, selected_positions))
     }
 
     pub fn active_focus(&self) -> Option<(usize, Option<usize>)> {
@@ -670,6 +775,18 @@ impl NavigationState {
             })
             .collect()
     }
+    /// Number of selected entries in the active column. Clone-free: the
+    /// hot selection paths log and gate on this instead of materializing
+    /// `selected_entries()` just to take its length.
+    pub fn selected_count(&self) -> usize {
+        let Some(depth) = self.active_column else {
+            return 0;
+        };
+        let Some(column) = self.columns.get(depth) else {
+            return 0;
+        };
+        column.selected_locations.len()
+    }
 
     pub fn selected_entries(&self) -> Vec<FileEntry> {
         let Some(depth) = self.active_column else {
@@ -818,7 +935,50 @@ impl NavigationState {
         let entry = column.entries.get(position)?.clone();
         Some((depth, position, entry))
     }
+    /// Depth and current entry count for an owned in-flight load. Callers
+    /// use the count to tell first paint (applies at once) from later
+    /// batches (which coalesce), and the depth to accumulate per column.
+    pub fn loading_column(&self, request_id: RequestId) -> Option<(usize, usize)> {
+        self.columns.iter().enumerate().find_map(|(depth, column)| {
+            (column.request_id == request_id).then_some((depth, column.entries.len()))
+        })
+    }
 
+    /// Positions and locations of listed entries still missing size or
+    /// modification time. Directories qualify for their modification time;
+    /// directory size stays unknown by design and never qualifies.
+    pub fn column_unknown_metadata(&self, depth: usize) -> Option<Vec<(usize, Location)>> {
+        let column = self.columns.get(depth)?;
+        let gap: Vec<(usize, Location)> = column
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.modified_unix_seconds == MetadataValue::Unknown
+                    || (!entry.is_directory() && entry.size == MetadataValue::Unknown)
+            })
+            .map(|(position, entry)| (position, entry.location.clone()))
+            .collect();
+        if gap.is_empty() {
+            return None;
+        }
+        Some(gap)
+    }
+
+    /// Current load request for a depth, for follow-up requests (metadata
+    /// fills) that must die with a reload.
+    pub fn request_id_for_depth(&self, depth: usize) -> Option<RequestId> {
+        self.columns.get(depth).map(|column| column.request_id)
+    }
+
+    /// Depth currently owned by a load request, for routing fill terminals
+    /// back to their column. Returns `None` for superseded loads whose
+    /// columns reloaded or truncated away.
+    pub fn depth_for_request(&self, request_id: RequestId) -> Option<usize> {
+        self.columns
+            .iter()
+            .position(|column| column.request_id == request_id)
+    }
     fn column_for_request_mut(
         &mut self,
         request_id: RequestId,
@@ -828,6 +988,23 @@ impl NavigationState {
             .enumerate()
             .find(|(_, column)| column.request_id == request_id)
     }
+}
+
+/// Applies one fill update to an entry without clobbering known fields with
+/// placeholders. Returns whether any field actually changed.
+fn apply_metadata_update(entry: &mut FileEntry, update: &MetadataUpdate) -> bool {
+    let mut changed = false;
+    if update.size != MetadataValue::Unknown && entry.size != update.size {
+        entry.size = update.size.clone();
+        changed = true;
+    }
+    if update.modified_unix_seconds != MetadataValue::Unknown
+        && entry.modified_unix_seconds != update.modified_unix_seconds
+    {
+        entry.modified_unix_seconds = update.modified_unix_seconds.clone();
+        changed = true;
+    }
+    changed
 }
 
 fn merge_entries(
@@ -881,6 +1058,18 @@ fn merge_entries(
     }
 
     (merged, insertions)
+}
+
+/// Sorts a complete staged snapshot once, off the main thread. Unstable:
+/// display-name and location tie-breakers in `compare_entries` order
+/// distinct entries deterministically, so repeated loads present
+/// deterministic rows. Callers move the vector in and out with no copies.
+pub(crate) fn sort_entries(
+    mut entries: Vec<FileEntry>,
+    preferences: ViewPreferences,
+) -> Vec<FileEntry> {
+    entries.sort_unstable_by(|left, right| compare_entries(left, right, preferences));
+    entries
 }
 
 fn remove_monitored_entry(
