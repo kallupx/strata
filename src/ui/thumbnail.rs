@@ -524,7 +524,7 @@ fn park_thumbnail(
             first_park: None,
             hooked: false,
         });
-        // A dead viewport's address may be recycled: reset the group instead of joining its stale hooks and pendings.
+        // A dead viewport's address may be recycled: reset the group instead of joining its stale hooks and pending requests.
         if group != 0 && settle.viewport.upgrade().is_none() {
             if let Some(timer) = settle.timer.take() {
                 timer.remove();

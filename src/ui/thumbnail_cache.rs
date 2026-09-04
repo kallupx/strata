@@ -22,7 +22,7 @@ use std::{
 };
 
 pub const CANONICAL_MAX_EDGE: i32 = 256;
-/// Canonical PNGs are tens of kilobytes; anything past this is hostile or corrupt and is a miss without being read.
+/// Canonical PNG files are tens of kilobytes; anything past this is hostile or corrupt and is a miss without being read.
 const MAX_DISK_THUMBNAIL_BYTES: u64 = 2 * 1024 * 1024;
 /// Foreign spec-following `large` entries peak at 256 px too; anything wider is rejected before allocation.
 const MAX_CACHED_DIMENSION: u32 = 512;
