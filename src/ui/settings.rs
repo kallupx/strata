@@ -167,7 +167,12 @@ pub(super) fn maybe_run_due_update_check(manager: &Rc<ThemeManager>, notice: &Up
     let weak_manager = Rc::downgrade(manager);
     let notice = notice.clone();
     resolve_update_method_async(move |method| {
-        let receiver = services::check_for_updates(channel, crate::build_info::installed_version());
+        let receiver = services::check_for_updates(
+            channel,
+            crate::build_info::installed_version(),
+            method,
+            false,
+        );
         glib::timeout_add_local(Duration::from_millis(100), move || {
             match receiver.try_recv() {
                 Err(TryRecvError::Empty) => glib::ControlFlow::Continue,

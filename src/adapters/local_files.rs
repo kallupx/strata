@@ -2,11 +2,14 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
-    io::ErrorKind,
+    collections::{HashMap, HashSet},
+    ffi::OsString,
+    fs,
+    io::{ErrorKind, Read},
+    os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
     rc::Rc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use gtk::{gio, glib, prelude::*};
@@ -15,12 +18,25 @@ use crate::{
     model::{EntryKind, FileEntry, Location, MetadataValue},
     services::{
         DirectoryChange, DirectoryEvent, DirectoryRequest, FileSource, LoadHandle,
-        LocationValidationError, RequestId, backend_unavailable_message, sanitize_uri_credentials,
+        LocationValidationError, MetadataOutcome, MetadataRequest, MetadataUpdate, RequestId,
+        backend_unavailable_message, sanitize_uri_credentials,
     },
 };
 
-const ATTRIBUTES: &str = "standard::display-name,standard::name,standard::type,standard::is-hidden,standard::is-symlink,standard::size,time::modified";
+/// Attributes for streaming enumeration: identity and kind only, no size or
+/// modification time, so large directories list without statting every entry.
+/// Size and modification time arrive later through `fill_metadata` for the
+/// rows the views actually bind.
+const LIST_ATTRIBUTES: &str =
+    "standard::display-name,standard::name,standard::type,standard::is-hidden,standard::is-symlink";
+/// Full attributes for single-entry reads (monitor upserts), where one stat
+/// is the whole cost.
+const FULL_ATTRIBUTES: &str = "standard::display-name,standard::name,standard::type,standard::is-hidden,standard::is-symlink,standard::size,time::modified";
+/// Per-entry metadata fill: size and modification time only. Type rides along
+/// free from the dirent, so directory rows can keep their unknown size.
+const METADATA_ATTRIBUTES: &str = "standard::type,standard::size,time::modified";
 const MAX_PENDING_MONITOR_CHANGES: usize = 256;
+const MAX_HIDDEN_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Default)]
 pub struct LocalFileSource;
@@ -31,6 +47,15 @@ enum PendingMonitorChange {
     Remove(PathBuf),
     Move { from: PathBuf, to: PathBuf },
     Rescan,
+}
+
+enum NativeEnumeration {
+    Complete {
+        entries: Vec<FileEntry>,
+        truncated: bool,
+    },
+    Failed(String),
+    Cancelled,
 }
 
 fn map_validation_error(error: std::io::Error) -> LocationValidationError {
@@ -103,27 +128,271 @@ fn entry_from_info(location: Location, info: gio::FileInfo) -> FileEntry {
         (gio::FileType::SymbolicLink, _) => EntryKind::SymbolicLink,
         _ => EntryKind::Other,
     };
+    // Size and modification time are only present when the query asked for
+    // them: streaming enumeration skips both so it never stats, while the
+    // window fill and single-entry monitor reads bring them afterwards.
+    let size = if matches!(
+        kind,
+        EntryKind::Directory | EntryKind::DirectorySymbolicLink
+    ) {
+        MetadataValue::Unknown
+    } else if info.has_attribute(gio::FILE_ATTRIBUTE_STANDARD_SIZE) {
+        u64::try_from(info.size())
+            .map(MetadataValue::Known)
+            .unwrap_or(MetadataValue::Unavailable)
+    } else {
+        MetadataValue::Unknown
+    };
+    let modified_unix_seconds = if info.has_attribute(gio::FILE_ATTRIBUTE_TIME_MODIFIED) {
+        info.modification_date_time()
+            .map(|modified| MetadataValue::Known(modified.to_unix()))
+            .unwrap_or(MetadataValue::Unavailable)
+    } else {
+        MetadataValue::Unknown
+    };
     FileEntry {
         location,
         native_name,
         display_name: info.display_name().to_string(),
         kind,
-        size: if matches!(
-            kind,
-            EntryKind::Directory | EntryKind::DirectorySymbolicLink
-        ) {
-            MetadataValue::Unknown
-        } else {
-            u64::try_from(info.size())
-                .map(MetadataValue::Known)
-                .unwrap_or(MetadataValue::Unavailable)
-        },
-        modified_unix_seconds: info
-            .modification_date_time()
-            .map(|modified| MetadataValue::Known(modified.to_unix()))
-            .unwrap_or(MetadataValue::Unavailable),
+        size,
+        modified_unix_seconds,
         is_hidden: info_is_hidden(&info),
     }
+}
+
+fn native_kind(file_type: fs::FileType, path: &Path) -> EntryKind {
+    if file_type.is_dir() {
+        return EntryKind::Directory;
+    }
+    if file_type.is_file() {
+        return EntryKind::File;
+    }
+    if !file_type.is_symlink() {
+        return EntryKind::Other;
+    }
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => EntryKind::DirectorySymbolicLink,
+        Ok(metadata) if metadata.is_file() => EntryKind::FileSymbolicLink,
+        Ok(_) => EntryKind::Other,
+        Err(_) => EntryKind::SymbolicLink,
+    }
+}
+
+fn unix_seconds(time: SystemTime) -> Option<i64> {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_secs()).ok(),
+        Err(error) => {
+            let duration = error.duration();
+            let seconds = i64::try_from(duration.as_secs()).ok()?;
+            seconds
+                .checked_neg()?
+                .checked_sub(i64::from(duration.subsec_nanos() != 0))
+        }
+    }
+}
+
+fn fill_native_entry_metadata(entry: &mut FileEntry) {
+    let Some(path) = entry.location.native_path() else {
+        return;
+    };
+    let Ok(metadata) = fs::metadata(path) else {
+        entry.size = MetadataValue::Unknown;
+        entry.modified_unix_seconds = MetadataValue::Unknown;
+        return;
+    };
+    entry.size = if metadata.is_dir() {
+        MetadataValue::Unknown
+    } else {
+        MetadataValue::Known(metadata.len())
+    };
+    entry.modified_unix_seconds = metadata
+        .modified()
+        .ok()
+        .and_then(unix_seconds)
+        .map(MetadataValue::Known)
+        .unwrap_or(MetadataValue::Unavailable);
+}
+
+fn native_hidden_names(path: &Path) -> HashSet<OsString> {
+    let Ok(file) = fs::File::open(path.join(".hidden")) else {
+        return HashSet::new();
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take(MAX_HIDDEN_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > MAX_HIDDEN_FILE_BYTES
+    {
+        return HashSet::new();
+    }
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|name| !name.is_empty())
+        .map(|name| OsString::from_vec(name.strip_suffix(b"\r").unwrap_or(name).to_vec()))
+        .collect()
+}
+
+fn scan_native_directory(
+    path: &Path,
+    request: &DirectoryRequest,
+    cancellable: &gio::Cancellable,
+    deadline: Instant,
+) -> NativeEnumeration {
+    let children = match fs::read_dir(path) {
+        Ok(children) => children,
+        Err(error) => return NativeEnumeration::Failed(error.to_string()),
+    };
+    let hidden_names = native_hidden_names(path);
+    let mut entries = Vec::new();
+    for child in children {
+        if cancellable.is_cancelled() {
+            return NativeEnumeration::Cancelled;
+        }
+        if Instant::now() >= deadline {
+            return NativeEnumeration::Complete {
+                entries,
+                truncated: true,
+            };
+        }
+        let child = match child {
+            Ok(child) => child,
+            Err(error) => return NativeEnumeration::Failed(error.to_string()),
+        };
+        let native_name = child.file_name();
+        let is_hidden = native_name.as_encoded_bytes().first().copied() == Some(b'.')
+            || hidden_names.contains(&native_name);
+        if entries.len() == request.max_entries {
+            return NativeEnumeration::Complete {
+                entries,
+                truncated: true,
+            };
+        }
+        let file_type = match child.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return NativeEnumeration::Failed(error.to_string()),
+        };
+        let path = child.path();
+        let kind = native_kind(file_type, &path);
+        entries.push(FileEntry {
+            location: Location::local(path),
+            display_name: native_name.to_string_lossy().into_owned(),
+            native_name,
+            kind,
+            size: MetadataValue::Unknown,
+            modified_unix_seconds: MetadataValue::Unknown,
+            is_hidden,
+        });
+    }
+
+    if request.include_metadata && !entries.is_empty() {
+        let width = sort_fill_width().min(entries.len());
+        let chunk = entries.len().div_ceil(width);
+        std::thread::scope(|scope| {
+            for piece in entries.chunks_mut(chunk) {
+                let cancellable = cancellable.clone();
+                scope.spawn(move || {
+                    for entry in piece {
+                        if cancellable.is_cancelled() || Instant::now() >= deadline {
+                            break;
+                        }
+                        fill_native_entry_metadata(entry);
+                    }
+                });
+            }
+        });
+        if cancellable.is_cancelled() {
+            return NativeEnumeration::Cancelled;
+        }
+        if Instant::now() >= deadline {
+            return NativeEnumeration::Complete {
+                entries,
+                truncated: true,
+            };
+        }
+    }
+
+    NativeEnumeration::Complete {
+        entries,
+        truncated: false,
+    }
+}
+
+fn enumerate_native(
+    request: DirectoryRequest,
+    emit: Rc<dyn Fn(DirectoryEvent)>,
+    started: Instant,
+    path: PathBuf,
+) -> LoadHandle {
+    let request_id = request.id;
+    let cancellable = gio::Cancellable::new();
+    let cancel = cancellable.clone();
+    let task = glib::MainContext::default().spawn_local(async move {
+        let deadline = started + request.time_budget;
+        let outcome = gio::spawn_blocking(move || {
+            scan_native_directory(&path, &request, &cancellable, deadline)
+        })
+        .await;
+        let Ok(outcome) = outcome else {
+            emit(DirectoryEvent::Failed {
+                request_id,
+                message: "Native directory worker failed".to_owned(),
+            });
+            return;
+        };
+        match outcome {
+            NativeEnumeration::Complete { entries, truncated } => {
+                let total_entries = entries.len();
+                if !entries.is_empty() {
+                    tracing::info!(
+                        request_id = request_id.0,
+                        entries = total_entries,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "first directory batch ready"
+                    );
+                    emit(DirectoryEvent::Batch {
+                        request_id,
+                        entries,
+                    });
+                }
+                if truncated {
+                    tracing::warn!(
+                        request_id = request_id.0,
+                        entries = total_entries,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        reason = "budget",
+                        "directory load truncated"
+                    );
+                } else {
+                    tracing::info!(
+                        request_id = request_id.0,
+                        entries = total_entries,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "directory load finished"
+                    );
+                }
+                emit(DirectoryEvent::Finished {
+                    request_id,
+                    truncated,
+                });
+            }
+            NativeEnumeration::Failed(message) => {
+                tracing::warn!(request_id = request_id.0, "directory load failed");
+                emit(DirectoryEvent::Failed {
+                    request_id,
+                    message,
+                });
+            }
+            NativeEnumeration::Cancelled => {}
+        }
+    });
+    LoadHandle::new(move || {
+        tracing::debug!(request_id = request_id.0, "directory load cancelled");
+        cancel.cancel();
+        task.abort();
+    })
 }
 
 impl FileSource for LocalFileSource {
@@ -182,6 +451,10 @@ impl FileSource for LocalFileSource {
         let started = Instant::now();
         log_directory_load_started(request_id, &location);
 
+        if let Some(path) = location.native_path() {
+            return enumerate_native(request, emit, started, path.to_path_buf());
+        }
+
         let task = glib::MainContext::default().spawn_local(async move {
             let deadline = started + request.time_budget;
             let finish_truncated = |entries: usize, reason: &'static str| {
@@ -206,10 +479,17 @@ impl FileSource for LocalFileSource {
                 finish_truncated(0, "time budget");
                 return;
             }
+            // Size/date sorts arrive with metadata inline: statting once per
+            // file up front beats listing placeholders and re-sorting after.
+            let attributes = if request.include_metadata {
+                FULL_ATTRIBUTES
+            } else {
+                LIST_ATTRIBUTES
+            };
             let enumerator = match glib::future_with_timeout(
                 remaining,
                 directory.enumerate_children_future(
-                    ATTRIBUTES,
+                    attributes,
                     gio::FileQueryInfoFlags::NONE,
                     glib::Priority::DEFAULT,
                 ),
@@ -321,6 +601,94 @@ impl FileSource for LocalFileSource {
         })
     }
 
+    fn supports_metadata_fill(&self, _location: &Location) -> bool {
+        // Native paths and remote URIs alike go through cancellable async
+        // GIO queries; unstatable entries degrade to placeholders per the
+        // fill protocol instead of being rejected up front.
+        true
+    }
+
+    fn fill_metadata(
+        &self,
+        request: MetadataRequest,
+        emit: Rc<dyn Fn(DirectoryEvent)>,
+    ) -> LoadHandle {
+        // Defensive cap: the UI only ever asks for its visible window, but a
+        // bug upstream must not turn one fill into a full-directory stat.
+        // Sorts set `full` to stat the whole column behind their spinner.
+        const MAX_FILL_ENTRIES: usize = 1024;
+        let request_id = request.id;
+        let mut locations = request.entries;
+        if !request.full {
+            locations.truncate(MAX_FILL_ENTRIES);
+        }
+        // Viewport fills stay on one sequential async pass over the visible
+        // window; only full native sorts fan out, and remote entries never
+        // do (bounded cancellable GIO, no server-request fan-out).
+        let all_native = locations
+            .iter()
+            .all(|location| location.native_path().is_some());
+        if request.full && all_native && !locations.is_empty() {
+            return fill_parallel(request_id, locations, request.time_budget, emit);
+        }
+        let task = glib::MainContext::default().spawn_local(async move {
+            let deadline = Instant::now() + request.time_budget;
+            let mut updates = Vec::with_capacity(locations.len());
+            let mut truncated = false;
+            let mut attempted = 0usize;
+            let mut failed = 0usize;
+            for location in &locations {
+                if Instant::now() >= deadline {
+                    truncated = true;
+                    break;
+                }
+                // Remote and GVfs entries stat through the same cancellable
+                // async GIO query; only locations with no usable form at all
+                // are skipped.
+                let Some(file) = location
+                    .native_path()
+                    .map(gio::File::for_path)
+                    .or_else(|| location.uri_value().map(gio::File::for_uri))
+                else {
+                    continue;
+                };
+                attempted += 1;
+                // A row that vanished between listing and fill keeps its
+                // placeholder: Unknown re-arms the next bind's request.
+                let (update, ok) = match file
+                    .query_info_future(
+                        METADATA_ATTRIBUTES,
+                        gio::FileQueryInfoFlags::NONE,
+                        glib::Priority::DEFAULT,
+                    )
+                    .await
+                {
+                    Ok(info) => update_from_info(&info, location),
+                    Err(_) => (
+                        MetadataUpdate {
+                            location: location.clone(),
+                            size: MetadataValue::Unknown,
+                            modified_unix_seconds: MetadataValue::Unknown,
+                        },
+                        false,
+                    ),
+                };
+                failed += usize::from(!ok);
+                updates.push(update);
+            }
+            emit_fill_outcome(
+                &emit,
+                request_id,
+                updates,
+                truncated,
+                attempted,
+                failed,
+                locations.len(),
+            );
+        });
+        LoadHandle::new(move || task.abort())
+    }
+
     fn watch(
         &self,
         location: Location,
@@ -421,6 +789,200 @@ impl FileSource for LocalFileSource {
         }))
     }
 }
+/// Worker width for full native sort fills: the machine's parallelism
+/// capped at the measured optimum. Sweep on this machine's 8-core host over
+/// 3,000 warm-cache files: 1→11.6 ms, 2→5.4 ms, 4→3.4 ms, 8→2.7 ms. Eight
+/// is the fastest without sustained pressure (sorts run rarely, behind a
+/// spinner, in millisecond bursts); fewer cores scale the width down.
+fn sort_fill_width() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().min(8))
+        .unwrap_or(4)
+        .max(1)
+}
+/// Stats a full native column with bounded scoped workers over synchronous
+/// GIO queries. Cancellation and the deadline are checked between entries;
+/// a cancelled fill reports `Cancelled` with no chunks, never a partial
+/// pass masquerading as complete.
+fn fill_parallel(
+    request_id: RequestId,
+    locations: Vec<Location>,
+    time_budget: Duration,
+    emit: Rc<dyn Fn(DirectoryEvent)>,
+) -> LoadHandle {
+    fill_parallel_with(sort_fill_width(), request_id, locations, time_budget, emit)
+}
+
+/// Width-parameterized core, so the worker sweep measures the real path.
+fn fill_parallel_with(
+    width: usize,
+    request_id: RequestId,
+    locations: Vec<Location>,
+    time_budget: Duration,
+    emit: Rc<dyn Fn(DirectoryEvent)>,
+) -> LoadHandle {
+    let cancellable = gio::Cancellable::new();
+    let cancel = cancellable.clone();
+    let cancelled = cancellable.clone();
+    let task = glib::MainContext::default().spawn_local(async move {
+        let deadline = Instant::now() + time_budget;
+        let outcome = gio::spawn_blocking(move || {
+            let width = width.max(1);
+            let chunk = locations.len().div_ceil(width);
+            let mut updates = Vec::with_capacity(locations.len());
+            let mut attempted = 0usize;
+            let mut failed = 0usize;
+            let mut truncated = false;
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for piece in locations.chunks(chunk.max(1)) {
+                    let cancellable = cancellable.clone();
+                    handles.push(scope.spawn(move || {
+                        let mut updates = Vec::with_capacity(piece.len());
+                        let mut attempted = 0usize;
+                        let mut failed = 0usize;
+                        let mut truncated = false;
+                        for location in piece {
+                            if cancellable.is_cancelled() || Instant::now() >= deadline {
+                                truncated = true;
+                                break;
+                            }
+                            let Some(path) = location.native_path() else {
+                                continue;
+                            };
+                            attempted += 1;
+                            let (update, ok) = match gio::File::for_path(path).query_info(
+                                METADATA_ATTRIBUTES,
+                                gio::FileQueryInfoFlags::NONE,
+                                Some(&cancellable),
+                            ) {
+                                Ok(info) => update_from_info(&info, location),
+                                Err(_) => (
+                                    MetadataUpdate {
+                                        location: location.clone(),
+                                        size: MetadataValue::Unknown,
+                                        modified_unix_seconds: MetadataValue::Unknown,
+                                    },
+                                    false,
+                                ),
+                            };
+                            failed += usize::from(!ok);
+                            updates.push(update);
+                        }
+                        (updates, attempted, failed, truncated)
+                    }));
+                }
+                for handle in handles {
+                    let Ok((piece, attempted_piece, failed_piece, truncated_piece)) = handle.join()
+                    else {
+                        truncated = true;
+                        continue;
+                    };
+                    updates.extend(piece);
+                    attempted += attempted_piece;
+                    failed += failed_piece;
+                    truncated = truncated || truncated_piece;
+                }
+            });
+            (updates, attempted, failed, truncated, locations.len())
+        })
+        .await;
+        let Ok((updates, attempted, failed, truncated, total)) = outcome else {
+            return;
+        };
+        if cancelled.is_cancelled() {
+            emit(DirectoryEvent::MetadataFinished {
+                request_id,
+                outcome: MetadataOutcome::Cancelled,
+            });
+            return;
+        }
+        if !updates.is_empty() {
+            emit(DirectoryEvent::MetadataFilled {
+                request_id,
+                updates,
+            });
+        }
+        let outcome = if truncated {
+            MetadataOutcome::Truncated
+        } else if attempted == 0 && total > 0 {
+            MetadataOutcome::Unsupported
+        } else if attempted > 0 && failed == attempted {
+            MetadataOutcome::Failed
+        } else {
+            MetadataOutcome::Complete
+        };
+        emit(DirectoryEvent::MetadataFinished {
+            request_id,
+            outcome,
+        });
+    });
+    LoadHandle::new(move || {
+        cancel.cancel();
+        task.abort();
+    })
+}
+
+/// Maps one stat result to its update. Symlink semantics are explicit:
+/// queries follow links (the same flags as enumeration), so a symlink
+/// reports its target's size and mtime, while a link to a directory keeps
+/// the explicitly unavailable directory size. Returns whether the stat
+/// succeeded as more than a placeholder.
+fn update_from_info(info: &gio::FileInfo, location: &Location) -> (MetadataUpdate, bool) {
+    let size = if info.file_type() == gio::FileType::Directory {
+        MetadataValue::Unknown
+    } else {
+        u64::try_from(info.size())
+            .map(MetadataValue::Known)
+            .unwrap_or(MetadataValue::Unavailable)
+    };
+    let modified_unix_seconds = info
+        .modification_date_time()
+        .map(|modified| MetadataValue::Known(modified.to_unix()))
+        .unwrap_or(MetadataValue::Unavailable);
+    let ok = size != MetadataValue::Unknown || modified_unix_seconds != MetadataValue::Unknown;
+    (
+        MetadataUpdate {
+            location: location.clone(),
+            size,
+            modified_unix_seconds,
+        },
+        ok,
+    )
+}
+
+/// Emits one chunk plus the total-protocol terminal for a fill. A pass that
+/// statted nothing successfully is a failure, not a complete pass over
+/// placeholders; a pass with no usable entries at all is unsupported.
+fn emit_fill_outcome(
+    emit: &Rc<dyn Fn(DirectoryEvent)>,
+    request_id: RequestId,
+    updates: Vec<MetadataUpdate>,
+    truncated: bool,
+    attempted: usize,
+    failed: usize,
+    total: usize,
+) {
+    if !updates.is_empty() {
+        emit(DirectoryEvent::MetadataFilled {
+            request_id,
+            updates,
+        });
+    }
+    let outcome = if truncated {
+        MetadataOutcome::Truncated
+    } else if attempted == 0 && total > 0 {
+        MetadataOutcome::Unsupported
+    } else if attempted > 0 && failed == attempted {
+        MetadataOutcome::Failed
+    } else {
+        MetadataOutcome::Complete
+    };
+    emit(DirectoryEvent::MetadataFinished {
+        request_id,
+        outcome,
+    });
+}
 
 fn log_directory_load_started(request_id: RequestId, location: &Location) {
     tracing::info!(
@@ -517,7 +1079,7 @@ fn query_monitored_entry(
         let file = gio::File::for_path(&path);
         let result = file
             .query_info_future(
-                ATTRIBUTES,
+                FULL_ATTRIBUTES,
                 gio::FileQueryInfoFlags::NONE,
                 glib::Priority::DEFAULT,
             )

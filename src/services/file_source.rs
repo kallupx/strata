@@ -5,7 +5,7 @@ mod tests;
 
 use std::{fmt, rc::Rc, time::Duration};
 
-use crate::model::{FileEntry, Location, uri_contains_credentials};
+use crate::model::{FileEntry, Location, MetadataValue, uri_contains_credentials};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RequestId(pub u64);
@@ -15,6 +15,12 @@ pub struct DirectoryRequest {
     pub id: RequestId,
     pub location: Location,
     pub batch_size: usize,
+    /// When true, every entry arrives with size and modification time (one
+    /// stat per file). Loads sorted by size or date set it, since sorting
+    /// placeholders and re-sorting afterwards costs more than statting
+    /// inline; name and type sorts stream identity only and fill the
+    /// visible window afterwards.
+    pub include_metadata: bool,
     /// Caps how many entries a single load will retain/render, bounding worst-case time and
     /// memory on an adversarially large or unbounded directory.
     pub max_entries: usize,
@@ -187,6 +193,68 @@ pub enum DirectoryEvent {
         request_id: RequestId,
         message: String,
     },
+    /// Size/mtime arrivals for already-listed entries. Positions are resolved
+    /// by the receiver against stable locations, so fills never reorder.
+    /// Zero or more chunks arrive, followed by exactly one `MetadataFinished`
+    /// terminal outcome (unless the fill's `LoadHandle` is dropped first, in
+    /// which case the owner treats the fill as cancelled).
+    MetadataFilled {
+        request_id: RequestId,
+        updates: Vec<MetadataUpdate>,
+    },
+    /// Terminal outcome for a metadata fill. Every fill ends with exactly
+    /// one of these, including empty fills (no chunks, then `Complete`) and
+    /// fills that statted nothing successfully. Sorts wait for this event,
+    /// never for a chunk, so a partial pass can never be mistaken for a
+    /// complete one.
+    MetadataFinished {
+        request_id: RequestId,
+        outcome: MetadataOutcome,
+    },
+}
+
+/// Terminal outcome for a metadata fill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetadataOutcome {
+    /// Every requested entry was attempted within budget.
+    Complete,
+    /// The time budget expired partway; emitted chunks still apply and the
+    /// remaining rows keep their placeholders for a later retry.
+    Truncated,
+    /// The provider cannot stat these entries (for example a source without
+    /// per-entry metadata); rows keep their placeholders.
+    Unsupported,
+    /// The fill failed before producing a trustworthy pass; rows keep their
+    /// placeholders and any waiting sort is abandoned without reordering.
+    Failed,
+    /// The fill was dropped before finishing. Providers never emit this
+    /// (a dropped task cannot emit); owners synthesize it when they discard
+    /// a fill's `LoadHandle` while a sort still waits on it.
+    Cancelled,
+}
+
+/// Fresh size/mtime for one listed entry. Either field may stay
+/// `Unknown`/`Unavailable` when the entry vanished or the stat failed; the
+/// row keeps its placeholder and can be re-requested on its next bind.
+#[derive(Clone, Debug)]
+pub struct MetadataUpdate {
+    pub location: Location,
+    pub size: MetadataValue<u64>,
+    pub modified_unix_seconds: MetadataValue<i64>,
+}
+
+/// A bounded request for [`MetadataUpdate`]s over already-listed entries.
+#[derive(Clone, Debug)]
+pub struct MetadataRequest {
+    /// The directory load these entries belong to; fills for a superseded
+    /// load are dropped rather than applied to a reloaded column.
+    pub id: RequestId,
+    pub entries: Vec<Location>,
+    /// When true, the whole entry list is statted (a sort's full pass);
+    /// otherwise the provider caps the fill to a viewport-sized window.
+    pub full: bool,
+    /// Caps how long a single fill may run; partial results still apply.
+    pub time_budget: Duration,
 }
 
 /// A cancellable directory load. Dropping it cancels any unfinished provider work.
@@ -225,6 +293,35 @@ pub trait FileSource {
     }
 
     fn enumerate(&self, request: DirectoryRequest, emit: Rc<dyn Fn(DirectoryEvent)>) -> LoadHandle;
+    /// Whether `fill_metadata` can stat `location`. The owner asks the
+    /// provider instead of guessing from the location shape, so remote and
+    /// GVfs fills stay on cancellable provider I/O rather than being
+    /// rejected owner-side. The default implementation supports nothing and
+    /// answers `Unsupported`, so listings keep their placeholders.
+    fn supports_metadata_fill(&self, _location: &Location) -> bool {
+        false
+    }
+
+    /// Fills size/mtime for already-listed entries (the visible window).
+    /// The default implementation reports `Unsupported`, so sources without
+    /// a cheap per-entry stat keep working; listings then keep their
+    /// `Unknown` placeholders and waiting sorts are abandoned in order.
+    ///
+    /// Overrides must emit zero or more `MetadataFilled` chunks followed by
+    /// exactly one `MetadataFinished` terminal outcome, including for empty
+    /// fills. Dropping the returned `LoadHandle` aborts the fill without
+    /// any terminal event; the owner then treats it as cancelled.
+    fn fill_metadata(
+        &self,
+        request: MetadataRequest,
+        emit: Rc<dyn Fn(DirectoryEvent)>,
+    ) -> LoadHandle {
+        emit(DirectoryEvent::MetadataFinished {
+            request_id: request.id,
+            outcome: MetadataOutcome::Unsupported,
+        });
+        LoadHandle::new(|| {})
+    }
 
     fn watch(
         &self,
