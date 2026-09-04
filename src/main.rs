@@ -22,6 +22,8 @@ use gtk::{gio, prelude::*};
 const APPLICATION_ID: &str = "io.github.lgse.Strata";
 const GVFS_PROBE_ARGUMENT: &str = "--gvfs-probe";
 const GVFS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const GIO_FALLBACK_BACKENDS: [(&str, &str); 2] =
+    [("GIO_USE_VFS", "local"), ("GIO_USE_VOLUME_MONITOR", "unix")];
 
 fn main() -> gtk::glib::ExitCode {
     let arguments: Vec<_> = std::env::args().collect();
@@ -112,12 +114,14 @@ fn restart_with_local_vfs_if_gvfs_is_unresponsive() {
         return;
     }
 
-    eprintln!("GVFS is unresponsive; using local filesystem support for this session.");
+    eprintln!(
+        "GVFS is unresponsive; using local filesystem and volume support for this session."
+    );
     let error = std::process::Command::new(executable)
         .args(std::env::args_os().skip(1))
-        .env("GIO_USE_VFS", "local")
+        .envs(GIO_FALLBACK_BACKENDS)
         .exec();
-    eprintln!("Unable to restart Strata with local filesystem support: {error}");
+    eprintln!("Unable to restart Strata with local filesystem and volume support: {error}");
 }
 
 fn gvfs_probe_marker_path() -> Option<std::path::PathBuf> {

@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 
-use super::{encode_daemon_pids, gvfs_daemon_pids, gvfs_probe_marker_path_in};
+use super::{GIO_FALLBACK_BACKENDS, encode_daemon_pids, gvfs_daemon_pids, gvfs_probe_marker_path_in};
 
 fn fake_proc(label: &str, processes: &[(&str, &str)]) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
@@ -62,5 +62,16 @@ fn marker_path_needs_a_runtime_dir() {
         Some(std::path::PathBuf::from(
             "/run/user/1000/strata-gvfs-probe-ok"
         ))
+    );
+}
+
+#[test]
+fn gvfs_fallback_covers_files_and_volumes() {
+    assert_eq!(
+        GIO_FALLBACK_BACKENDS,
+        [
+            ("GIO_USE_VFS", "local"),
+            ("GIO_USE_VOLUME_MONITOR", "unix"),
+        ]
     );
 }
