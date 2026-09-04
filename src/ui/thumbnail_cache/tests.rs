@@ -17,10 +17,6 @@ use crate::test_support::TestMutex;
 
 static CACHE_TEST_LOCK: TestMutex = TestMutex::new();
 
-/// Serializes cache tests around a unique bucket override: the override cell
-/// is process-global, and mutating the umask is too, so concurrent tests
-/// must never interleave. Production resolution always goes through the
-/// environment; tests never touch it (mutating it is unsafe in edition 2024).
 struct BucketGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     previous_umask: Option<u32>,
@@ -78,8 +74,6 @@ fn unique_source(label: &str) -> PathBuf {
     dir
 }
 
-/// A solid-color PNG of the requested size, standing in for a sandbox
-/// render without needing media fixtures.
 fn solid_png(width: i32, height: i32) -> Vec<u8> {
     let pixbuf =
         gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, false, 8, width, height)
@@ -103,9 +97,6 @@ fn glib_md5(input: &str) -> String {
 
 #[test]
 fn md5_matches_reference_vectors() {
-    // Verified against the system's md5sum, not copied from anywhere. The
-    // digest is only the cache file name; it comes from GLib so keys match
-    // every other spec-following application.
     let vectors = [
         ("", "d41d8cd98f00b204e9800998ecf8427e"),
         ("a", "0cc175b9c0f1b6a831c399e269772661"),
@@ -129,15 +120,12 @@ fn md5_matches_reference_vectors() {
 fn tag_reader_rejects_non_png_and_truncation() {
     assert_eq!(read_thumb_tags(b"definitely not a png"), None);
     assert_eq!(read_thumb_tags(b"\x89PNG\r\n\x1a\n"), None);
-    // Signature plus a truncated chunk header: ends the walk, never panics.
     assert_eq!(read_thumb_tags(b"\x89PNG\r\n\x1a\n\x00\x00"), None);
 }
 
 #[test]
 fn tag_reader_reads_a_minimal_tagged_png() {
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-    // IHDR with a zero length and no CRC: the reader skips structure, it
-    // does not validate it.
     png.extend_from_slice(&[0, 0, 0, 0]);
     png.extend_from_slice(b"IHDR");
     png.extend_from_slice(&[0, 0, 0, 0]);
@@ -168,12 +156,9 @@ fn stored_entries_are_canonical_large() {
     let path = source.join("photo.jpg");
     std::fs::write(&path, b"source").expect("the fixture should be written");
 
-    // A 300 px render scales down to the canonical maximum edge.
     store(&path, 111, &solid_png(300, 200));
     assert_eq!(stored_dimensions(&bucket, &path), Some((256, 171)));
 
-    // A tiny view's render scales up instead of poisoning the bucket: a
-    // later large view reads a valid large entry, not a 17 px one.
     store(&path, 111, &solid_png(20, 10));
     assert_eq!(stored_dimensions(&bucket, &path), Some((256, 128)));
     assert!(lookup(&path, 111).is_some());
@@ -187,10 +172,8 @@ fn stale_entries_are_misses() {
     std::fs::write(&path, b"source").expect("the fixture should be written");
     store(&path, 111, &solid_png(64, 64));
     assert!(lookup(&path, 111).is_some());
-    // Wrong mtime: the file changed since the entry was stored.
     assert_eq!(lookup(&path, 222), None);
 
-    // Foreign bytes under another file's key: URI tags mismatch.
     let other = source.join("other.jpg");
     std::fs::write(&other, b"source").expect("the fixture should be written");
     let (_, name) = cache_key(&other).expect("the other path should key");
@@ -210,7 +193,6 @@ fn oversized_and_sparse_entries_are_misses_without_huge_reads() {
     std::fs::create_dir_all(&bucket).expect("the bucket should exist");
     let source = unique_source("oversized");
 
-    // A multi-megabyte blob under a valid key name is a miss.
     let path = source.join("huge.jpg");
     std::fs::write(&path, b"source").expect("the fixture should be written");
     let (_, name) = cache_key(&path).expect("the path should key");
@@ -218,8 +200,6 @@ fn oversized_and_sparse_entries_are_misses_without_huge_reads() {
         .expect("the oversized entry should be written");
     assert_eq!(lookup(&path, 111), None);
 
-    // A sparse 100 MB file reports a huge length but holds no blocks: the
-    // size bound rejects it before any allocation.
     let sparse = source.join("sparse.jpg");
     std::fs::write(&sparse, b"source").expect("the fixture should be written");
     let (_, sparse_name) = cache_key(&sparse).expect("the sparse path should key");
@@ -237,7 +217,6 @@ fn fifo_symlink_and_malformed_entries_are_safe_misses() {
     std::fs::create_dir_all(&bucket).expect("the bucket should exist");
     let source = unique_source("hostile");
 
-    // FIFO under a key name: not a regular file, never opened for parsing.
     let fifo_path = source.join("fifo.jpg");
     std::fs::write(&fifo_path, b"source").expect("the fixture should be written");
     let (_, fifo_name) = cache_key(&fifo_path).expect("the fifo path should key");
@@ -249,8 +228,6 @@ fn fifo_symlink_and_malformed_entries_are_safe_misses() {
     .expect("the fifo should be created");
     assert_eq!(lookup(&fifo_path, 111), None);
 
-    // Symlink under a key name: never followed, and the link target that a
-    // successful write would have clobbered stays intact.
     let canary = source.join("canary.txt");
     std::fs::write(&canary, b"canary").expect("the canary should be written");
     let link_path = source.join("linked.jpg");
@@ -262,15 +239,12 @@ fn fifo_symlink_and_malformed_entries_are_safe_misses() {
         std::fs::read(&canary).expect("the canary should survive"),
         b"canary"
     );
-    // A symlink at the destination also blocks stores: the atomic write
-    // refuses non-regular destinations instead of following the link.
     store(&link_path, 111, &solid_png(64, 64));
     assert_eq!(
         std::fs::read(&canary).expect("the canary should survive the store"),
         b"canary"
     );
 
-    // Random bytes, truncated PNGs, and absurd dimensions: misses, no panic.
     let bad_path = source.join("bad.jpg");
     std::fs::write(&bad_path, b"source").expect("the fixture should be written");
     let (_, bad_name) = cache_key(&bad_path).expect("the bad path should key");
@@ -288,8 +262,6 @@ fn fifo_symlink_and_malformed_entries_are_safe_misses() {
     extreme.extend_from_slice(&[8, 2, 0, 0, 0]);
     extreme.extend_from_slice(&[0, 0, 0, 0]);
     std::fs::write(bucket.join(&bad_name), &extreme).expect("the extreme entry is written");
-    // 100000 px dwarfs the cache bound, so the pre-decode dimension check
-    // rejects it without allocating a pixel buffer.
     assert_eq!(lookup(&bad_path, 111), None);
 }
 
@@ -321,8 +293,6 @@ fn bucket_and_entries_keep_strict_modes_under_a_permissive_umask() {
 fn uri_keys_cover_tricky_names() {
     let (_guard, _bucket) = BucketGuard::unique("urikeys");
     let source = unique_source("urikeys");
-    // Spaces, fragments, queries, at-signs, and Unicode round-trip through
-    // GLib URI forms with matching keys.
     let tricky = [
         "sp ace.jpg",
         "hash#tag.jpg",
@@ -343,8 +313,6 @@ fn uri_keys_cover_tricky_names() {
         assert_eq!(lookup(&path, 222), None);
     }
 
-    // Non-UTF-8 native names must never panic: they round-trip where GLib
-    // can represent them, and miss otherwise.
     let raw_path = source.join(OsString::from_vec(b"raw-\xff.jpg".to_vec()));
     std::fs::write(&raw_path, b"source").expect("the raw fixture should be written");
     store(&raw_path, 111, &solid_png(64, 64));

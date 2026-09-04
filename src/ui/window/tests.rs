@@ -467,8 +467,6 @@ fn sidebar_sync_runs_only_for_location_changes() {
             position: Some(2),
         }
     ));
-    // Batch, metadata, sort-progress, and operation traffic never moves the
-    // active location.
     assert!(!SidebarState::event_changes_active_place(
         &BrowserEvent::EntriesInserted {
             depth: 0,

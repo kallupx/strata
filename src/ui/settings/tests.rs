@@ -384,13 +384,9 @@ fn due_check_respects_its_ttl() {
     use std::time::{Duration, Instant};
 
     let now = Instant::now();
-    // Never checked: due.
     assert!(update_check_due(None, now));
-    // Just checked: not due.
     assert!(!update_check_due(Some(now), now));
-    // Exactly at the TTL boundary: due.
     assert!(update_check_due(Some(now - UPDATE_DUE_INTERVAL), now));
-    // One second of TTL left: not due.
     assert!(!update_check_due(
         Some(now - UPDATE_DUE_INTERVAL + Duration::from_secs(1)),
         now
@@ -408,8 +404,6 @@ fn update_method_resolves_and_caches() {
         Rc::new(std::cell::RefCell::new(None));
     let second: Rc<std::cell::RefCell<Option<UpdateMethod>>> =
         Rc::new(std::cell::RefCell::new(None));
-    // Detection shells out to the package manager; even so, both resolves
-    // must complete rather than hang on a placeholder.
     let capture = first.clone();
     resolve_update_method_async(move |method| {
         *capture.borrow_mut() = Some(method);
@@ -419,7 +413,6 @@ fn update_method_resolves_and_caches() {
         gtk::glib::MainContext::default().iteration(true);
     }
     let resolved = first.borrow().expect("the update method should resolve");
-    // The second resolve answers from the process-wide cache.
     let capture = second.clone();
     resolve_update_method_async(move |method| {
         *capture.borrow_mut() = Some(method);

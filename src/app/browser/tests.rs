@@ -1636,8 +1636,6 @@ fn batch_entry(name: &str) -> FileEntry {
 
 #[test]
 fn repeated_identical_batches_emit_selection_only_once() {
-    // Remote loads stay progressive, so this covers the coalescing path;
-    // native loads stage instead (see the staging tests below).
     let _serial = crate::test_support::ASYNC_MAIN_CONTEXT_DEFAULT
         .lock()
         .expect("the async test lock should not be poisoned");
@@ -1662,8 +1660,6 @@ fn repeated_identical_batches_emit_selection_only_once() {
     browser.select(0, 0);
     emit(batch(&["mike"]));
     emit(batch(&["zulu"]));
-    // Later batches coalesce instead of applying; flush them the way load
-    // finish does before asserting.
     browser.flush_coalesced_capped(None);
 
     let selections: Vec<_> = events
@@ -1682,12 +1678,9 @@ fn repeated_identical_batches_emit_selection_only_once() {
         .iter()
         .filter(|event| matches!(event, BrowserEvent::EntriesInserted { .. }))
         .count();
-    // First paint plus one coalesced group for the two later batches.
     assert_eq!(inserted, 2);
 }
 
-/// A source whose listing carries no metadata and whose fill answers it
-/// synchronously, so the sort gate runs without waiting on I/O.
 struct SortFillSource;
 
 impl FileSource for SortFillSource {
@@ -1765,9 +1758,6 @@ fn size_sort_waits_for_its_metadata_pass() {
     });
 
     browser.navigate(Location::local("/fixture"));
-    // Name order out of the listing: alpha before beta. The public sort path
-    // debounces 16 ms on the main context; the fake fill answers
-    // synchronously once the debounce fires.
     browser.set_sort(0, SortKey::Size, SortDirection::Ascending);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     gtk::glib::MainContext::default().block_on(std::future::poll_fn(|cx| {
@@ -1788,7 +1778,6 @@ fn size_sort_waits_for_its_metadata_pass() {
         .iter()
         .map(|entry| entry.display_name.clone())
         .collect();
-    // Size order: beta (1 byte) before alpha (100 bytes).
     assert_eq!(names, vec!["beta".to_owned(), "alpha".to_owned()]);
     assert!(
         events
@@ -1796,7 +1785,6 @@ fn size_sort_waits_for_its_metadata_pass() {
             .iter()
             .any(|event| { matches!(event, BrowserEvent::MetadataFilled { .. }) })
     );
-    // Total protocol: the sort's indicator opens once and closes once.
     assert_eq!(
         events
             .borrow()
@@ -1817,8 +1805,6 @@ fn size_sort_waits_for_its_metadata_pass() {
 
 #[test]
 fn load_finish_applies_rows_queued_behind_the_count_threshold() {
-    // Remote loads stay progressive, so this covers the coalesced straggler
-    // flush; native loads stage instead (see the staging tests below).
     let _serial = crate::test_support::ASYNC_MAIN_CONTEXT_DEFAULT
         .lock()
         .expect("the async test lock should not be poisoned");
@@ -1835,7 +1821,6 @@ fn load_finish_applies_rows_queued_behind_the_count_threshold() {
         .borrow()
         .clone()
         .expect("navigate should start a directory load");
-    // First paint applies at once; the rest coalesces below the threshold.
     emit(DirectoryEvent::Batch {
         request_id,
         entries: vec![batch_entry("alpha")],
@@ -1844,8 +1829,6 @@ fn load_finish_applies_rows_queued_behind_the_count_threshold() {
         request_id,
         entries: vec![batch_entry("beta")],
     });
-    // Used to panic: the straggler flush ran under the live scrutinee
-    // borrow instead of a bound depth.
     emit(DirectoryEvent::Finished {
         request_id,
         truncated: false,
@@ -1865,17 +1848,121 @@ fn load_finish_applies_rows_queued_behind_the_count_threshold() {
     );
 }
 
-/// Scripted answers for one `fill_metadata` call, in call order.
+#[test]
+fn remote_load_finishes_only_after_every_queued_row_is_applied() {
+    let _serial = crate::test_support::ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .expect("the async test lock should not be poisoned");
+    let captured: CapturedLoad = Rc::new(RefCell::new(None));
+    let browser = Browser::new(Rc::new(BatchReplaySource {
+        captured: captured.clone(),
+    }));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = events.clone();
+    browser.observe(move |event| observed.borrow_mut().push(event.clone()));
+
+    browser.navigate(Location::uri("sftp://host/fixture"));
+    let (request_id, emit) = captured
+        .borrow()
+        .clone()
+        .expect("navigate should start a directory load");
+    emit(DirectoryEvent::Batch {
+        request_id,
+        entries: vec![batch_entry("first")],
+    });
+    emit(DirectoryEvent::Batch {
+        request_id,
+        entries: (0..1025)
+            .map(|index| batch_entry(&format!("queued-{index:04}")))
+            .collect(),
+    });
+    emit(DirectoryEvent::Finished {
+        request_id,
+        truncated: false,
+    });
+
+    assert!(
+        !events
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, BrowserEvent::LoadFinished { .. }))
+    );
+    assert_eq!(browser.state.borrow().columns[0].entries.len(), 513);
+
+    browser.flush_coalesced_capped(Some(0));
+    assert!(
+        !events
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, BrowserEvent::LoadFinished { .. }))
+    );
+    browser.flush_coalesced_capped(Some(0));
+
+    let events = events.borrow();
+    let finish = events
+        .iter()
+        .position(|event| matches!(event, BrowserEvent::LoadFinished { .. }))
+        .expect("the drained load should finish");
+    let last_insert = events
+        .iter()
+        .rposition(|event| matches!(event, BrowserEvent::EntriesInserted { .. }))
+        .expect("the final queued rows should be inserted");
+    assert!(finish > last_insert);
+    assert_eq!(browser.state.borrow().columns[0].entries.len(), 1026);
+}
+
+#[test]
+fn remote_load_failure_waits_for_queued_rows() {
+    let _serial = crate::test_support::ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .expect("the async test lock should not be poisoned");
+    let captured: CapturedLoad = Rc::new(RefCell::new(None));
+    let browser = Browser::new(Rc::new(BatchReplaySource {
+        captured: captured.clone(),
+    }));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = events.clone();
+    browser.observe(move |event| observed.borrow_mut().push(event.clone()));
+
+    browser.navigate(Location::uri("sftp://host/fixture"));
+    let (request_id, emit) = captured
+        .borrow()
+        .clone()
+        .expect("navigate should start a directory load");
+    emit(DirectoryEvent::Batch {
+        request_id,
+        entries: vec![batch_entry("first")],
+    });
+    emit(DirectoryEvent::Batch {
+        request_id,
+        entries: (0..513)
+            .map(|index| batch_entry(&format!("queued-{index:04}")))
+            .collect(),
+    });
+    emit(DirectoryEvent::Failed {
+        request_id,
+        message: "remote failure".to_owned(),
+    });
+
+    assert!(
+        !events
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, BrowserEvent::LoadFailed { .. }))
+    );
+    browser.flush_coalesced_capped(Some(0));
+    assert!(events.borrow().iter().any(|event| matches!(
+        event,
+        BrowserEvent::LoadFailed { message, .. } if message == "remote failure"
+    )));
+    assert_eq!(browser.state.borrow().columns[0].entries.len(), 514);
+}
+
 enum FillAnswer {
-    /// One chunk carrying `name -> size` pairs, then `Complete`.
     Complete(Vec<(&'static str, u64)>),
-    /// Several chunks, then the given terminal outcome.
     Chunks(Vec<Vec<(&'static str, u64)>>, MetadataOutcome),
-    /// No chunks, then `Complete`.
     EmptyComplete,
-    /// No chunks, then the given terminal outcome.
     TerminalOnly(MetadataOutcome),
-    /// Capture the emit for the test to fire later.
     Never,
 }
 
@@ -1888,8 +1975,6 @@ struct FillCall {
 
 type DirectoryEmit = Rc<dyn Fn(DirectoryEvent)>;
 
-/// Listings carry no metadata; every fill answers from a script so the
-/// terminal protocol is fully deterministic without I/O or timers.
 struct ScriptedSource {
     files: Vec<&'static str>,
     dirs: Vec<&'static str>,
@@ -2083,9 +2168,7 @@ fn scripted_browser(
     (browser, events, source)
 }
 
-/// Pumps the main context until `condition` holds or the deadline passes.
-/// Callers assert on the resulting state; the deadline only turns a hang
-/// into a deterministic failure.
+/// The deadline only turns a hang into a deterministic failure.
 fn pump_until(condition: impl Fn() -> bool) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !condition() && std::time::Instant::now() < deadline {
@@ -2137,12 +2220,10 @@ fn multi_chunk_fill_sorts_once_on_its_terminal() {
             MetadataOutcome::Complete,
         )],
     ));
-    // Script answers pop from the back; with one answer the order is fixed.
     browser.navigate(Location::local("/fixture"));
     browser.set_sort(0, SortKey::Size, SortDirection::Ascending);
     pump_until(|| finish_count(&events) == 1);
 
-    // Sorted once, on the complete pass: never on the first partial chunk.
     assert_eq!(replaced_count(&events), 2);
     assert_eq!(start_count(&events), 1);
     assert_eq!(
@@ -2212,7 +2293,6 @@ fn failed_fill_abandons_the_sort_in_order() {
     browser.set_sort(0, SortKey::Size, SortDirection::Ascending);
     pump_until(|| finish_count(&events) == 1);
 
-    // Chunks still apply to rows, but the failed pass never reorders.
     assert_eq!(replaced_count(&events), 1);
     assert_eq!(start_count(&events), 1);
     assert_eq!(
@@ -2234,7 +2314,6 @@ fn empty_fill_still_closes_the_sort() {
     browser.set_sort(0, SortKey::Size, SortDirection::Ascending);
     pump_until(|| finish_count(&events) == 1);
 
-    // A zero-row result is a complete pass, not a hang.
     assert_eq!(start_count(&events), 1);
     assert_eq!(replaced_count(&events), 2);
 }
@@ -2249,7 +2328,6 @@ fn navigation_cancels_an_awaiting_sort_without_stale_commit() {
         vec![FillAnswer::Never],
     ));
     browser.navigate(Location::local("/fixture"));
-    // The initial load publishes synchronously through staging.
     let published = replaced_count(&events);
     assert_eq!(published, 1);
     browser.set_sort(0, SortKey::Size, SortDirection::Ascending);
@@ -2261,8 +2339,6 @@ fn navigation_cancels_an_awaiting_sort_without_stale_commit() {
     assert!(browser.sort_awaiting_fill.borrow().is_none());
     assert!(browser.pending_sort.get().is_none());
 
-    // The abandoned fill's late terminal lands on a superseded load and
-    // must not commit anything.
     let old = source.fill_calls.borrow();
     let old_emit = old[0].emit.clone();
     let old_id = old[0].id;
@@ -2279,8 +2355,6 @@ fn navigation_cancels_an_awaiting_sort_without_stale_commit() {
         request_id: old_id,
         outcome: MetadataOutcome::Complete,
     });
-    // The elsewhere load publishes once through staging; the stale fill
-    // and terminal add nothing further.
     assert_eq!(replaced_count(&events), published + 1);
     assert_eq!(finish_count(&events), 1);
     assert_eq!(
@@ -2327,13 +2401,9 @@ fn viewport_flush_never_disturbs_an_active_sort() {
         .expect("the async test lock should not be poisoned");
     let (browser, events, source) = scripted_browser(ScriptedSource::scripted(
         vec!["alpha", "beta"],
-        vec![
-            FillAnswer::Complete(vec![("alpha", 30), ("beta", 10)]),
-            FillAnswer::Never,
-        ],
+        vec![FillAnswer::Never, FillAnswer::Never],
     ));
     browser.navigate(Location::local("/fixture"));
-    // A viewport fill queued directly (no settle timer) starts first.
     browser.metadata_pending.borrow_mut().insert(
         0,
         vec![
@@ -2351,26 +2421,17 @@ fn viewport_flush_never_disturbs_an_active_sort() {
     assert_eq!(source.fill_calls.borrow().len(), 1);
     assert!(!source.fill_calls.borrow()[0].full);
 
-    // The full sort starts while the viewport fill is still in flight; each
-    // keeps its own handle. The scripted sort answers synchronously.
     browser.set_sort(0, SortKey::Size, SortDirection::Ascending);
-    pump_until(|| finish_count(&events) == 1);
-    assert!(source.fill_calls.borrow()[1].full);
+    pump_until(|| source.fill_calls.borrow().len() == 2);
+    let calls = source.fill_calls.borrow();
+    let viewport_id = calls[0].id;
+    let viewport_emit = calls[0].emit.clone();
+    let sort_id = calls[1].id;
+    let sort_emit = calls[1].emit.clone();
+    assert!(calls[1].full);
+    assert_ne!(viewport_id, sort_id);
+    drop(calls);
 
-    // The sort completed on its own terminal while the viewport fill was
-    // still in flight: one reorder, balanced indicator.
-    assert_eq!(replaced_count(&events), 2);
-    assert_eq!(
-        column_names(&browser, 0),
-        vec!["beta".to_owned(), "alpha".to_owned()]
-    );
-    assert!(browser.metadata_loads.borrow().contains_key(&0));
-
-    // The late viewport chunk still applies to its row without re-sorting.
-    let viewport = source.fill_calls.borrow();
-    let viewport_emit = viewport[0].emit.clone();
-    let viewport_id = viewport[0].id;
-    drop(viewport);
     viewport_emit(DirectoryEvent::MetadataFilled {
         request_id: viewport_id,
         updates: vec![MetadataUpdate {
@@ -2379,8 +2440,39 @@ fn viewport_flush_never_disturbs_an_active_sort() {
             modified_unix_seconds: MetadataValue::Known(7),
         }],
     });
+    viewport_emit(DirectoryEvent::MetadataFinished {
+        request_id: viewport_id,
+        outcome: MetadataOutcome::Complete,
+    });
+    assert_eq!(replaced_count(&events), 1);
+    assert_eq!(finish_count(&events), 0);
+    assert!(browser.sort_awaiting_fill.borrow().is_some());
+
+    sort_emit(DirectoryEvent::MetadataFilled {
+        request_id: sort_id,
+        updates: vec![
+            MetadataUpdate {
+                location: Location::local("/fixture/alpha"),
+                size: MetadataValue::Known(30),
+                modified_unix_seconds: MetadataValue::Known(7),
+            },
+            MetadataUpdate {
+                location: Location::local("/fixture/beta"),
+                size: MetadataValue::Known(10),
+                modified_unix_seconds: MetadataValue::Known(7),
+            },
+        ],
+    });
+    sort_emit(DirectoryEvent::MetadataFinished {
+        request_id: sort_id,
+        outcome: MetadataOutcome::Complete,
+    });
     assert_eq!(replaced_count(&events), 2);
     assert_eq!(finish_count(&events), 1);
+    assert_eq!(
+        column_names(&browser, 0),
+        vec!["beta".to_owned(), "alpha".to_owned()]
+    );
 }
 
 #[test]
@@ -2394,7 +2486,6 @@ fn refresh_drops_staging_and_its_sort() {
     ));
     browser.navigate(Location::local("/fixture"));
     let (request_id, emit) = source.enumerate_calls.borrow()[0].clone();
-    // Batches stage with no merge and no UI events until enumeration ends.
     emit(DirectoryEvent::Batch {
         request_id,
         entries: vec![batch_entry("alpha")],
@@ -2413,12 +2504,10 @@ fn refresh_drops_staging_and_its_sort() {
     );
     assert_eq!(replaced_count(&events), 0);
 
-    // A reload discards the staged snapshot before it ever publishes.
     browser.refresh_column(0);
     assert!(!browser.staging.borrow().contains_key(&0));
     assert_eq!(replaced_count(&events), 0);
 
-    // The reloaded column stages and publishes on its own finish.
     let (request_id, emit) = source.enumerate_calls.borrow()[1].clone();
     emit(DirectoryEvent::Batch {
         request_id,
@@ -2434,7 +2523,6 @@ fn refresh_drops_staging_and_its_sort() {
         vec!["alpha".to_owned(), "beta".to_owned()]
     );
 
-    // A sort fill in flight is still cancelled by a later reload.
     browser.set_sort(0, SortKey::Size, SortDirection::Ascending);
     pump_until(|| !source.fill_calls.borrow().is_empty());
     assert!(browser.sort_awaiting_fill.borrow().is_some());
@@ -2479,12 +2567,10 @@ fn close_column_clears_the_truncated_depth() {
     let published = replaced_count(&events);
     assert_eq!(published, 2);
 
-    // A sort fill in flight at the child depth.
     browser.set_sort(1, SortKey::Size, SortDirection::Ascending);
     pump_until(|| !source.fill_calls.borrow().is_empty());
     assert!(browser.sort_awaiting_fill.borrow().is_some());
 
-    // A grandchild load still staging its first batches.
     browser.descend(1, Location::local("/fixture/sub/deep"));
     let (deep_id, deep_emit) = source.enumerate_calls.borrow()[2].clone();
     deep_emit(DirectoryEvent::Batch {
@@ -2515,24 +2601,18 @@ fn settle_timer_restarts_while_rows_keep_arriving() {
     ));
     browser.navigate(Location::local("/fixture"));
     browser.request_metadata_fill(0, 0, Location::local("/fixture/alpha"));
-    // Non-blocking iterations plus wall-clock sleeps: blocking iterations
-    // would overshoot the wall-clock checkpoints below.
     let pump_until_elapsed = |millis: u64, start: std::time::Instant| {
         while start.elapsed() < std::time::Duration::from_millis(millis) {
             gtk::glib::MainContext::default().iteration(false);
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     };
-    // Wait past half the debounce, then bind another row: the settle timer
-    // restarts instead of firing for the first row alone.
     let start = std::time::Instant::now();
     pump_until_elapsed(80, start);
     browser.request_metadata_fill(0, 1, Location::local("/fixture/beta"));
     pump_until_elapsed(140, start);
-    // Past the first row's deadline: nothing flushed yet.
     assert!(source.fill_calls.borrow().is_empty());
     pump_until_elapsed(400, start);
-    // One flush carrying both settled rows.
     assert_eq!(source.fill_calls.borrow().len(), 1);
     assert!(!source.fill_calls.borrow()[0].full);
 }
@@ -2547,7 +2627,6 @@ fn shifted_viewport_rows_go_stale_without_repaint() {
         vec![FillAnswer::Never],
     ));
     browser.navigate(Location::local("/fixture"));
-    // Token captured at bind time: beta sits at source position 1.
     browser.metadata_pending.borrow_mut().insert(
         0,
         vec![ViewportTarget {
@@ -2558,8 +2637,6 @@ fn shifted_viewport_rows_go_stale_without_repaint() {
     browser.flush_metadata_fills();
     assert_eq!(source.fill_calls.borrow().len(), 1);
 
-    // The head row leaves before the fill lands: beta shifts to position 0,
-    // so the token no longer validates.
     browser.state.borrow_mut().columns[0].entries.remove(0);
     let fill = source.fill_calls.borrow();
     let emit = fill[0].emit.clone();
@@ -2573,8 +2650,6 @@ fn shifted_viewport_rows_go_stale_without_repaint() {
             modified_unix_seconds: MetadataValue::Known(7),
         }],
     });
-    // Stale: no repaint, and the placeholder survives for the next bind's
-    // retry instead of painting the wrong row.
     assert_eq!(replaced_count(&events), 1);
     assert!(
         !events
@@ -2603,8 +2678,6 @@ fn remote_name_listing_fills_visible_metadata() {
     src.uri_base = Some("sftp://host/share");
     let (browser, events, source) = scripted_browser(src);
     browser.navigate(Location::uri("sftp://host/share"));
-    // Remote Name listings used to keep blank metadata forever: the owner
-    // no longer rejects them, so the visible rows fill.
     browser.metadata_pending.borrow_mut().insert(
         0,
         vec![
@@ -2648,7 +2721,6 @@ fn modified_sort_fills_directory_mtimes() {
     browser.navigate(Location::local("/fixture"));
     browser.set_sort(0, SortKey::Modified, SortDirection::Ascending);
     pump_until(|| !source.fill_calls.borrow().is_empty());
-    // The sort fill covers the directory's mtime, not just file fields.
     let fill = source.fill_calls.borrow();
     assert!(fill[0].full);
     assert!(fill[0].entries.contains(&Location::local("/fixture/sub")));
@@ -2681,8 +2753,6 @@ fn modified_sort_fills_directory_mtimes() {
         .iter()
         .find(|entry| entry.location == Location::local("/fixture/sub"))
         .expect("the directory row should still be listed");
-    // Directory mtime filled for Modified sorting, while directory size
-    // stays explicitly unavailable.
     assert_eq!(sub.modified_unix_seconds, MetadataValue::Known(200));
     assert_eq!(sub.size, MetadataValue::Unknown);
 }
@@ -2698,8 +2768,6 @@ fn fan_out_shares_one_event_with_every_observer() {
     }
 
     browser.navigate(Location::local("/fixture"));
-    // One owned event per emission, borrowed N ways: every observer sees
-    // the same staged publication payloads with no per-observer clone.
     for collected in [first.clone(), second.clone(), third.clone()] {
         let published: Vec<_> = collected
             .borrow()
@@ -2725,8 +2793,6 @@ fn observers_added_or_cleared_mid_dispatch_do_not_corrupt_it() {
     let browser_for_observer = browser.clone();
     browser.observe(move |event| {
         observed.borrow_mut().push(event.clone());
-        // Mutating the observer list mid-dispatch acts on the next emission:
-        // dispatch iterates the list cloned up front.
         let value = late_events.clone();
         browser_for_observer.observe(move |event| {
             value.borrow_mut().push(event.clone());
@@ -2739,8 +2805,6 @@ fn observers_added_or_cleared_mid_dispatch_do_not_corrupt_it() {
     assert!(first_wave > 0);
     assert!(late.borrow().is_empty());
 
-    // The mid-dispatch clear took effect: the next navigation notifies the
-    // observer added mid-dispatch... which was also cleared, so nobody runs.
     browser.navigate(Location::local("/elsewhere"));
     assert_eq!(events.borrow().len(), first_wave);
 }
@@ -2756,8 +2820,6 @@ fn nested_emission_during_dispatch_is_safe() {
             matches!(event, BrowserEvent::EntriesReplaced { .. }) && observed.borrow().len() < 4;
         observed.borrow_mut().push(event.clone());
         if select_now {
-            // Reentrant emission while the outer dispatch holds no borrows:
-            // the observer list was cloned up front.
             browser_for_observer.select(0, 0);
         }
     });
@@ -2794,8 +2856,6 @@ fn native_initial_load_publishes_sorted_once() {
     let (browser, events, source) = scripted_browser(ScriptedSource::manual(vec![], vec![]));
     browser.navigate(Location::local("/fixture"));
     let (request_id, emit) = source.enumerate_calls.borrow()[0].clone();
-    // Wire batches arrive out of order and stage with no merge walk and no
-    // UI events: nothing is exposed until the complete scan can sort.
     emit(DirectoryEvent::Batch {
         request_id,
         entries: vec![batch_entry("gamma"), batch_entry("alpha")],
@@ -2820,8 +2880,6 @@ fn native_initial_load_publishes_sorted_once() {
         request_id,
         truncated: false,
     });
-    // Small snapshots sort inline and publish synchronously: one exact
-    // replacement plus the load terminal, nothing else.
     assert_eq!(replaced_count(&events), 1);
     assert_eq!(
         column_names(&browser, 0),
@@ -2859,6 +2917,46 @@ fn empty_native_initial_load_finishes_without_a_batch() {
 }
 
 #[test]
+fn incomplete_native_metadata_uses_name_order_until_a_full_retry_finishes() {
+    let source = Rc::new(ScriptedSource::manual(vec![], vec![FillAnswer::Never]));
+    let browser = Browser::with_preferences(
+        source.clone(),
+        ViewPreferences {
+            sort_key: SortKey::Size,
+            ..ViewPreferences::default()
+        },
+    );
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = events.clone();
+    browser.observe(move |event| observed.borrow_mut().push(event.clone()));
+    browser.navigate(Location::local("/fixture"));
+    let (request_id, emit) = source.enumerate_calls.borrow()[0].clone();
+    emit(DirectoryEvent::Batch {
+        request_id,
+        entries: vec![
+            staged_entry("beta", EntryKind::File, MetadataValue::Known(1), 1),
+            staged_entry("alpha", EntryKind::File, MetadataValue::Unknown, 1),
+        ],
+    });
+    emit(DirectoryEvent::MetadataIncomplete { request_id });
+    emit(DirectoryEvent::Finished {
+        request_id,
+        truncated: false,
+    });
+
+    assert_eq!(
+        column_names(&browser, 0),
+        vec!["alpha".to_owned(), "beta".to_owned()]
+    );
+    assert_eq!(start_count(&events), 1);
+    assert!(browser.sort_awaiting_fill.borrow().is_some());
+    let fills = source.fill_calls.borrow();
+    assert_eq!(fills.len(), 1);
+    assert!(fills[0].full);
+    assert_ne!(fills[0].id, request_id);
+}
+
+#[test]
 fn staged_load_reconciles_monitor_deltas_without_resurrection() {
     let (browser, events, source) = scripted_browser(ScriptedSource::manual(vec![], vec![]));
     browser.navigate(Location::local("/fixture"));
@@ -2867,7 +2965,6 @@ fn staged_load_reconciles_monitor_deltas_without_resurrection() {
         request_id,
         entries: vec![batch_entry("alpha"), batch_entry("beta")],
     });
-    // Monitor traffic mid-stage queues instead of racing the snapshot.
     browser.handle_directory_change(
         0,
         &Location::local("/fixture"),
@@ -2893,8 +2990,6 @@ fn staged_load_reconciles_monitor_deltas_without_resurrection() {
         request_id,
         truncated: false,
     });
-    // The removed row never resurrects from the staged batch; the upserted
-    // row appears exactly once.
     assert_eq!(
         column_names(&browser, 0),
         vec!["alpha".to_owned(), "gamma".to_owned()]
@@ -3053,8 +3148,6 @@ fn large_load_streams_prefix_then_tails_with_terminal_last() {
     let (browser, events, source) = scripted_browser(ScriptedSource::manual(vec![], vec![]));
     browser.navigate(Location::local("/fixture"));
     let (request_id, emit) = source.enumerate_calls.borrow()[0].clone();
-    // 700 rows in reverse: the staged sort restores order, and publication
-    // slices past the inline limit.
     let first: Vec<FileEntry> = (0..400)
         .rev()
         .map(|index| batch_entry(&format!("file-{index:03}")))
@@ -3075,8 +3168,6 @@ fn large_load_streams_prefix_then_tails_with_terminal_last() {
         request_id,
         truncated: false,
     });
-    // Small snapshots sort inline without touching the main context, but
-    // publication tails ride idle callbacks: pump them to completion.
     pump_until(|| {
         events
             .borrow()
@@ -3100,8 +3191,6 @@ fn large_load_streams_prefix_then_tails_with_terminal_last() {
             _ => None,
         })
         .collect();
-    // Prefix first, tails next, terminal last. No callback in this chain
-    // may exceed a frame; the terminal proves the stream converged.
     assert!(!kinds.is_empty());
     assert_eq!(kinds[0], (0, 128));
     assert_eq!(
@@ -3125,14 +3214,11 @@ fn remote_rows_flush_within_the_latency_bound() {
     let (browser, events, source) = scripted_browser(ScriptedSource::manual(vec![], vec![]));
     browser.navigate(Location::uri("sftp://host/share"));
     let (request_id, emit) = source.enumerate_calls.borrow()[0].clone();
-    // First paint applies at once.
     emit(DirectoryEvent::Batch {
         request_id,
         entries: vec![batch_entry("alpha")],
     });
     assert_eq!(column_names(&browser, 0), vec!["alpha".to_owned()]);
-    // Later batches never wait solely for the count threshold: the latency
-    // timer flushes them.
     emit(DirectoryEvent::Batch {
         request_id,
         entries: vec![batch_entry("beta")],
@@ -3168,9 +3254,6 @@ fn remote_rows_flush_within_the_latency_bound() {
 
 #[test]
 fn resort_after_mid_load_preference_change_republishes() {
-    // The staged sort ran under stale preferences while the user resorted:
-    // the completion hands off to a re-sort with the current preferences
-    // instead of publishing a stale order.
     let (browser, events, _) =
         scripted_browser(ScriptedSource::scripted(vec!["b.txt", "a.txt"], vec![]));
     browser.navigate(Location::local("/fixture"));
@@ -3183,8 +3266,6 @@ fn resort_after_mid_load_preference_change_republishes() {
         .borrow()
         .request_id_for_depth(0)
         .expect("the load should still own its request");
-    // Simulate a sort task finishing after a mid-load preference change:
-    // entries arrive sorted by size while the column now wants names.
     browser.sorting.borrow_mut().insert(
         0,
         SortingLoad {
@@ -3202,9 +3283,8 @@ fn resort_after_mid_load_preference_change_republishes() {
             ..ViewPreferences::default()
         },
         false,
+        false,
     );
-    // Handed off, not published stale: the re-sort restores name order and
-    // the load terminal still fires exactly once per emission chain.
     assert_eq!(
         column_names(&browser, 0),
         vec!["a.txt".to_owned(), "b.txt".to_owned()]

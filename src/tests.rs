@@ -2,7 +2,10 @@
 
 use std::ffi::OsString;
 
-use super::{GIO_FALLBACK_BACKENDS, encode_daemon_pids, gvfs_daemon_pids, gvfs_probe_marker_path_in};
+use super::{
+    GIO_FALLBACK_BACKENDS, encode_daemon_pids, gvfs_daemon_pids, gvfs_probe_marker_is_fresh_at,
+    gvfs_probe_marker_path_in,
+};
 
 fn fake_proc(label: &str, processes: &[(&str, &str)]) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
@@ -66,12 +69,22 @@ fn marker_path_needs_a_runtime_dir() {
 }
 
 #[test]
+fn only_a_readable_matching_marker_is_fresh() {
+    let proc_root = fake_proc("marker", &[("31", "bash\n")]);
+    let marker = proc_root.join("marker");
+    assert!(!gvfs_probe_marker_is_fresh_at(&marker, &proc_root));
+
+    std::fs::write(&marker, "").expect("the empty identity marker should be written");
+    assert!(gvfs_probe_marker_is_fresh_at(&marker, &proc_root));
+
+    std::fs::write(&marker, [0xff]).expect("the unreadable marker should be written");
+    assert!(!gvfs_probe_marker_is_fresh_at(&marker, &proc_root));
+}
+
+#[test]
 fn gvfs_fallback_covers_files_and_volumes() {
     assert_eq!(
         GIO_FALLBACK_BACKENDS,
-        [
-            ("GIO_USE_VFS", "local"),
-            ("GIO_USE_VOLUME_MONITOR", "unix"),
-        ]
+        [("GIO_USE_VFS", "local"), ("GIO_USE_VOLUME_MONITOR", "unix"),]
     );
 }

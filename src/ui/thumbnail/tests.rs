@@ -119,13 +119,7 @@ fn saturated_queue_defers_the_live_request() {
             image: glib::WeakRef::new(),
         },
     );
-    // Bypass the settle delay: the fire defers the live request against the
-    // saturated render queue.
     fire_settled_thumbnails();
-    // The fire takes the fallback group's timer, so nothing is left armed:
-    // nothing pumps it in this test, and a later test sharing this thread
-    // must not inherit the fire. The drain is asserted through the per-view
-    // settle map the park resolved (no viewport ancestor: group zero).
     SETTLE_VIEWS.with(|views| {
         let settle = &views.borrow()[&0];
         assert!(settle.timer.is_none());
@@ -280,14 +274,11 @@ fn rejects_files_without_a_thumbnail_provider() {
 #[test]
 fn viewport_eligibility_covers_visible_plus_overscan() {
     use super::rect_eligible;
-    // Fully inside a 1000x760 viewport.
     assert!(rect_eligible(10.0, 10.0, 100.0, 40.0, 1000.0, 760.0));
-    // Partial boundary rows count: hanging off every edge.
     assert!(rect_eligible(-20.0, 100.0, 100.0, 40.0, 1000.0, 760.0));
     assert!(rect_eligible(950.0, 100.0, 100.0, 40.0, 1000.0, 760.0));
     assert!(rect_eligible(100.0, -20.0, 100.0, 40.0, 1000.0, 760.0));
     assert!(rect_eligible(100.0, 750.0, 100.0, 40.0, 1000.0, 760.0));
-    // Within the 25% prefetch band but off-screen.
     assert!(rect_eligible(100.0, -190.0, 100.0, 40.0, 1000.0, 760.0));
     assert!(rect_eligible(
         100.0,
@@ -297,7 +288,6 @@ fn viewport_eligibility_covers_visible_plus_overscan() {
         1000.0,
         760.0
     ));
-    // Past the band: a flung row earns nothing until it settles on screen.
     assert!(!rect_eligible(100.0, -300.0, 100.0, 40.0, 1000.0, 760.0));
     assert!(!rect_eligible(
         100.0,
@@ -309,8 +299,6 @@ fn viewport_eligibility_covers_visible_plus_overscan() {
     ));
     assert!(!rect_eligible(2000.0, 100.0, 100.0, 40.0, 1000.0, 760.0));
     assert!(!rect_eligible(-500.0, 100.0, 100.0, 40.0, 1000.0, 760.0));
-    // GTK pre-binds offscreen rows with a zero-sized allocation. Neither
-    // those rows nor a degenerate viewport may start thumbnail work.
     assert!(!rect_eligible(0.0, 4.0, 0.0, 0.0, 1000.0, 760.0));
     assert!(!rect_eligible(0.0, 4.0, -1.0, 40.0, 1000.0, 760.0));
     assert!(!rect_eligible(0.0, 0.0, 100.0, 40.0, 0.0, 0.0));
@@ -368,8 +356,6 @@ fn persist_queue_bounds_and_drains_oldest_first() {
             png: vec![1],
         });
     }
-    // Bounded: the five oldest renders dropped instead of growing the queue
-    // behind a slow disk.
     assert_eq!(queue.len(), MAX_PERSIST_QUEUE);
     assert_eq!(
         queue.pop_front().expect("queue should drain").path,

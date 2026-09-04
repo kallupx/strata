@@ -34,8 +34,7 @@ pub fn mark_window_presented() {
     }
 }
 
-/// First themed frame / after-paint signal. Emitted once per process; the
-/// field harness parses this line for the cold/warm first-frame metric.
+/// The field harness parses this line for the cold/warm first-frame metric.
 pub fn mark_first_themed_frame() {
     if FIRST_THEMED_FRAME.swap(true, Ordering::Relaxed) {
         return;
@@ -48,8 +47,7 @@ pub fn mark_first_themed_frame() {
     }
 }
 
-/// First correct visible row installed into a GTK model. Emitted once per
-/// process so paired runs can compare identical-work first-content latency.
+/// Emitted once per process so paired runs can compare identical-work latency.
 pub fn mark_first_visible_row(entries: usize) {
     if FIRST_VISIBLE_ROW.swap(true, Ordering::Relaxed) {
         return;
@@ -63,17 +61,12 @@ pub fn mark_first_visible_row(entries: usize) {
     }
 }
 
-/// Stage timing for enumeration, stat, sort, state-install, and UI
-/// publication slices. Narrowly scoped: callers time their own slice and
-/// report it here so the harness can attribute wall time without extra
-/// global state.
+/// Callers time their own slice and report it here so the harness can
+/// attribute wall time without extra global state.
 pub fn record_stage(stage: &str, elapsed_ms: u64) {
     tracing::debug!(stage, elapsed_ms, "directory stage completed");
 }
 
-/// Input-event to presented-frame latency probe. Callers capture the event
-/// instant and report it when the resulting frame is presented. Frame-clock
-/// plumbing lands with Task 11 (scroll/filter/select-all input paths).
 #[expect(dead_code, reason = "frame-clock plumbing lands with Task 11")]
 pub fn record_input_latency(elapsed_ms: u64) {
     tracing::debug!(elapsed_ms, "input event to presented frame");
@@ -96,8 +89,7 @@ pub fn mark_batch_rendered(entries: usize, render_started: Instant) {
     }
 }
 
-/// Thumbnail pipeline counters. Each transition logs at debug and bumps a
-/// process-wide counter the harness can scrape at settle time.
+/// Each transition bumps a process-wide counter the harness scrapes at settle time.
 pub fn mark_thumbnail_eligible(count: u64) {
     THUMB_ELIGIBLE.fetch_add(count, Ordering::Relaxed);
     tracing::debug!(
@@ -161,7 +153,6 @@ pub fn mark_thumbnail_stale(uri: &str) {
     );
 }
 
-/// Snapshot of every pipeline counter for settle-time reporting.
 pub fn thumbnail_counts() -> ThumbnailCounts {
     ThumbnailCounts {
         eligible: THUMB_ELIGIBLE.load(Ordering::Relaxed),

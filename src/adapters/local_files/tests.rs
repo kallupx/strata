@@ -448,6 +448,40 @@ fn enumerate_reports_truncated_once_the_entry_budget_is_exceeded() {
 }
 
 #[test]
+fn entry_limited_metadata_load_fills_every_retained_entry() {
+    let root = unique_fixture_root("entry-budget-metadata");
+    fs::create_dir_all(&root).expect("the fixture directory should be created");
+    for index in 0..5 {
+        fs::write(root.join(format!("file-{index}.txt")), b"content")
+            .expect("the fixture file should be written");
+    }
+
+    let events = run_enumerate(DirectoryRequest {
+        id: RequestId(1),
+        location: Location::local(&root),
+        batch_size: 2,
+        include_metadata: true,
+        max_entries: 3,
+        time_budget: Duration::from_secs(10),
+    });
+    fs::remove_dir_all(&root).expect("the fixture directory should be removed");
+
+    assert_eq!(finished_truncated(&events), Some(true));
+    let entries = batched_entries(&events);
+    assert_eq!(entries.len(), 3);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| matches!(entry.size, MetadataValue::Known(7)))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, DirectoryEvent::MetadataIncomplete { .. }))
+    );
+}
+
+#[test]
 fn enumerate_completes_untruncated_at_the_exact_entry_budget() {
     let root = unique_fixture_root("exact-entry-budget");
     fs::create_dir_all(&root).expect("the fixture directory should be created");
@@ -660,9 +694,6 @@ fn enumerate_with_metadata_fills_sizes_up_front() -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-/// `fill_metadata()` spawns on the shared default context like `enumerate()`
-/// does, so it needs the same serialized `block_on` bridge. The terminal is
-/// `MetadataFinished` instead of `Finished`.
 fn run_fill(request: MetadataRequest) -> Vec<DirectoryEvent> {
     let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
         .lock()
@@ -725,6 +756,41 @@ fn fill_empty_entries_completes_without_chunks() {
 }
 
 #[test]
+fn sequential_fill_with_no_time_remaining_is_truncated() {
+    let events = run_fill(MetadataRequest {
+        id: RequestId(1),
+        entries: vec![Location::local("/fixture/file.txt")],
+        full: false,
+        time_budget: Duration::ZERO,
+    });
+    assert_eq!(fill_outcome(&events), Some(MetadataOutcome::Truncated));
+    assert_eq!(fill_chunk_count(&events), 0);
+}
+
+#[test]
+fn hostile_hidden_files_are_ignored_without_blocking_or_following() {
+    use std::os::unix::fs::symlink;
+
+    let root = unique_fixture_root("hidden-hostile");
+    fs::create_dir_all(&root).expect("the fixture directory should be created");
+    let hidden = root.join(".hidden");
+    rustix::fs::mkfifoat(
+        rustix::fs::CWD,
+        &hidden,
+        rustix::fs::Mode::from_bits_truncate(0o600),
+    )
+    .expect("the fifo should be created");
+    assert!(native_hidden_names(&root).is_empty());
+
+    fs::remove_file(&hidden).expect("the fifo should be removed");
+    let target = root.join("target");
+    fs::write(&target, b"secret\n").expect("the target should be written");
+    symlink(&target, &hidden).expect("the symlink should be created");
+    assert!(native_hidden_names(&root).is_empty());
+    fs::remove_dir_all(&root).expect("the fixture should be removed");
+}
+
+#[test]
 fn fill_all_vanished_entries_reports_failed() {
     let root = unique_fixture_root("fill-vanished");
     let events = run_fill(MetadataRequest {
@@ -736,7 +802,6 @@ fn fill_all_vanished_entries_reports_failed() {
         full: true,
         time_budget: Duration::from_secs(10),
     });
-    // Every stat failed: a failure, not a complete pass over placeholders.
     assert_eq!(fill_outcome(&events), Some(MetadataOutcome::Failed));
 }
 
@@ -748,9 +813,6 @@ fn fill_unreachable_remote_reports_failed() {
         full: false,
         time_budget: Duration::from_secs(10),
     });
-    // The remote form is statable in principle, so the provider attempts it
-    // through GIO and reports the failure instead of claiming no support.
-    // The failed row still rides along as a placeholder chunk.
     assert_eq!(fill_outcome(&events), Some(MetadataOutcome::Failed));
     assert_eq!(fill_chunk_count(&events), 1);
 }
@@ -769,8 +831,6 @@ fn fill_file_uri_stats_through_the_uri_form() -> Result<(), Box<dyn Error>> {
         full: false,
         time_budget: Duration::from_secs(10),
     });
-    // URI-form entries stat through `gio::File::for_uri`, the same path
-    // remote and GVfs fills take.
     assert_eq!(fill_outcome(&events), Some(MetadataOutcome::Complete));
     assert_eq!(fill_chunk_count(&events), 1);
     Ok(())
@@ -835,8 +895,6 @@ fn parallel_fill_follows_symlinks_like_enumeration() -> Result<(), Box<dyn Error
             _ => None,
         })
     };
-    // A file symlink reports its target's size and mtime (follows, like the
-    // enumeration queries do), never the link's own bytes.
     let link_update = by_location(&Location::local(&link)).expect("the link should fill");
     let target_update = by_location(&Location::local(&target)).expect("the target should fill");
     assert_eq!(link_update.size, MetadataValue::Known(10));
@@ -845,7 +903,6 @@ fn parallel_fill_follows_symlinks_like_enumeration() -> Result<(), Box<dyn Error
         link_update.modified_unix_seconds,
         target_update.modified_unix_seconds
     );
-    // A directory symlink keeps the explicitly unavailable directory size.
     let dir_update = by_location(&Location::local(&dir_link)).expect("the dir link should fill");
     assert_eq!(dir_update.size, MetadataValue::Unknown);
     assert!(matches!(
@@ -862,9 +919,6 @@ fn parallel_fill_cancellation_reports_cancelled_without_chunks() {
         .expect("the async test lock should not be poisoned");
     let root = unique_fixture_root("fill-cancel");
     let count = 20_000;
-    // Entries need not exist: cancellation must win before any stat runs.
-    // (Nonexistent paths would fail fast, so create a handful to keep
-    // workers busy and the rest virtual.)
     fs::create_dir_all(&root).expect("the fixture directory should be created");
     for index in 0..100 {
         fs::write(root.join(format!("file-{index:04}.txt")), b"content")
@@ -881,11 +935,6 @@ fn parallel_fill_cancellation_reports_cancelled_without_chunks() {
     glib::MainContext::default().block_on(async {
         let handle =
             super::fill_parallel_with(8, RequestId(1), entries, Duration::from_secs(60), emit);
-        // Yield once so the driver task starts its workers, then cancel
-        // mid-flight: the abort silences the driver while the shared
-        // cancellable stops the workers, so neither chunks nor Complete
-        // ever arrive. No `iteration()` inside `block_on` (reentering the
-        // executor panics); a one-shot timeout wakes the grace poll.
         let mut yielded = false;
         std::future::poll_fn(|cx| {
             if yielded {
@@ -900,8 +949,6 @@ fn parallel_fill_cancellation_reports_cancelled_without_chunks() {
         drop(handle);
         let waker: Rc<RefCell<Option<std::task::Waker>>> = Rc::new(RefCell::new(None));
         let wake = waker.clone();
-        // Recurring wake-ups: a one-shot wake parks forever once spent,
-        // since the aborted driver emits nothing more.
         let ticker = glib::timeout_add_local(Duration::from_millis(20), move || {
             if let Some(waker) = wake.borrow_mut().take() {
                 waker.wake();

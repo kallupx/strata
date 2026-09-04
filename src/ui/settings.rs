@@ -81,25 +81,16 @@ pub(super) fn install_guard() -> InstallGuard {
 }
 
 thread_local! {
-    /// When the last automatic update check completed. Consulted by the
-    /// due scheduler so every window shares one TTL instead of each
-    /// window firing its own check.
+    /// Shared by the due scheduler so every window uses one TTL.
     static LAST_COMPLETED_CHECK: Cell<Option<Instant>> = const { Cell::new(None) };
     static CHECK_IN_FLIGHT: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The detected package-manager method, computed once per process. The
-/// detection spawns a package-manager child, so it never runs during
-/// startup: it resolves asynchronously the first time the Updates page or
-/// a due background check needs it.
+/// Detection spawns a package-manager child, so it resolves asynchronously
+/// on first need, never during startup.
 static UPDATE_METHOD_CACHE: OnceLock<UpdateMethod> = OnceLock::new();
 
-/// Resolves the update method, invoking `callback` on the GTK thread. A
-/// cached value answers synchronously; otherwise detection runs on a worker
-/// thread so neither page opens nor background checks stall the main loop.
-/// The callback stays on the main thread (UI closures are `Rc`-bound, not
-/// `Send`): the worker reports through a channel that a main-thread poll
-/// drains, mirroring the existing update-check receivers.
+/// Invokes `callback` on the GTK thread, detecting on a worker thread on a cache miss.
 pub(super) fn resolve_update_method_async(callback: impl FnOnce(UpdateMethod) + 'static) {
     if let Some(method) = UPDATE_METHOD_CACHE.get().copied() {
         callback(method);
@@ -113,8 +104,6 @@ pub(super) fn resolve_update_method_async(callback: impl FnOnce(UpdateMethod) + 
             let _sent = sender.send(method);
         });
     if spawned.is_err() {
-        // Thread spawn practically never fails; fall back to a synchronous
-        // detect so the caller never waits on a placeholder forever.
         let method = *UPDATE_METHOD_CACHE.get_or_init(services::update_method);
         callback(method);
         return;
@@ -126,8 +115,6 @@ pub(super) fn resolve_update_method_async(callback: impl FnOnce(UpdateMethod) + 
             resolved => {
                 let method = match resolved {
                     Ok(method) => method,
-                    // The worker died mid-detect; detect synchronously
-                    // rather than leaving the caller on a placeholder.
                     Err(TryRecvError::Disconnected) => {
                         *UPDATE_METHOD_CACHE.get_or_init(services::update_method)
                     }
@@ -141,20 +128,12 @@ pub(super) fn resolve_update_method_async(callback: impl FnOnce(UpdateMethod) + 
         }
     });
 }
-/// Minimum age of the last completed check before another automatic one is
-/// due. Manual checks and channel toggles always run immediately.
 const UPDATE_DUE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 
-/// Whether an automatic check is due given the last completion time.
-/// Pure so the scheduler policy is unit-testable without clocks or network.
 fn update_check_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|completed| now.duration_since(completed) >= UPDATE_DUE_INTERVAL)
 }
 
-/// Runs the headless due update check when one is actually due: automatic
-/// checks enabled, none in flight, and the TTL expired. Shows the sidebar
-/// notice on new releases; failures stay silent and uncached so the next
-/// launch retries. Every `SortingStarted`... (no sorting here).
 pub(super) fn maybe_run_due_update_check(manager: &Rc<ThemeManager>, notice: &UpdateNoticeHandler) {
     if !manager.checks_for_updates() || CHECK_IN_FLIGHT.get() {
         return;
@@ -194,9 +173,7 @@ pub(super) fn maybe_run_due_update_check(manager: &Rc<ThemeManager>, notice: &Up
                     glib::ControlFlow::Break
                 }
                 Ok(_) => {
-                    // UpToDate caches like a result; Failed stays uncached
-                    // so the next launch retries instead of waiting out the
-                    // TTL on a transient network error.
+                    // Failed stays uncached so the next launch retries on transient errors.
                     CHECK_IN_FLIGHT.set(false);
                     LAST_COMPLETED_CHECK.set(Some(Instant::now()));
                     glib::ControlFlow::Break
@@ -359,16 +336,12 @@ impl ResponsiveBin {
         bin
     }
 
-    /// Registers one navigation entry after construction, for pages that
-    /// build on first selection rather than with the layer.
     fn add_navigation(&self, label: gtk::Label, content: gtk::Box) {
         let imp = self.imp();
         imp.navigation_labels.borrow_mut().push(label);
         imp.navigation_contents.borrow_mut().push(content);
     }
 
-    /// Registers one theme flow after construction, for the lazily built
-    /// theme page.
     fn add_flow(&self, flow: gtk::FlowBox, columns: u32) {
         self.imp()
             .responsive_flows
@@ -376,8 +349,6 @@ impl ResponsiveBin {
             .push((flow, columns));
     }
 
-    /// Registers one update row after construction, for the lazily built
-    /// Updates page.
     fn add_action(&self, row: gtk::Box, button: gtk::Button) {
         self.imp()
             .responsive_actions
@@ -538,8 +509,6 @@ pub fn build_layer(
                         }
                     }
                     "updates" => {
-                        // Release notes fetch only when the Updates page is
-                        // opened; detection itself stays off the main thread.
                         let container = updates_container.clone();
                         let panel = responsive_panel.clone();
                         let themes = themes.clone();
@@ -886,11 +855,7 @@ fn updates_page(
             update_notice(None);
         }
     });
-    // No automatic check here: the due scheduler (see
-    // `maybe_run_due_update_check`) owns background checks process-wide,
-    // starting after the first viewport is ready and the app is idle.
-    // Manual checks, channel toggles, and re-enabling auto-check run
-    // immediately through `run_check`.
+    // No automatic check here: the due scheduler owns background checks process-wide.
 
     let page = scrollable_page(&preferences, None);
     let broadcast_check = run_check.clone();

@@ -423,6 +423,25 @@ fn keyboard_selection_skips_hidden_entries_when_hidden_files_are_not_shown() {
 }
 
 #[test]
+fn staged_keyboard_descent_selects_the_first_visible_entry() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/home"), RequestId(1));
+    state.select_first_on_load(0);
+    state.install_snapshot(
+        RequestId(1),
+        vec![
+            hidden_entry("/home/.hidden", ".hidden"),
+            named_entry("/home/visible", "visible"),
+        ],
+    );
+
+    assert_eq!(
+        state.focused_entry().map(|(_, position, _)| position),
+        Some(1)
+    );
+}
+
+#[test]
 fn keyboard_selection_extension_skips_hidden_entries() {
     let mut state = NavigationState::default();
     state.navigate(location("/home"), RequestId(1));
@@ -736,7 +755,6 @@ fn depth_for_request_tracks_live_loads_only() {
     assert!(state.descend(0, location("/fixture/sub"), RequestId(2)));
     assert_eq!(state.depth_for_request(RequestId(2)), Some(1));
 
-    // Reloading a depth retires its old request identity.
     state.reload_column(0, RequestId(3));
     assert_eq!(state.depth_for_request(RequestId(1)), None);
     assert_eq!(state.depth_for_request(RequestId(3)), Some(0));
@@ -755,7 +773,6 @@ fn positioned_fill_applies_in_place_and_flags_moved_rows() {
         ],
     );
 
-    // Tokens captured at bind time: everything lines up.
     let applied = state.apply_positioned_metadata(
         RequestId(1),
         vec![
@@ -768,8 +785,6 @@ fn positioned_fill_applies_in_place_and_flags_moved_rows() {
     );
     assert_eq!(state.columns[0].entries[0].size, MetadataValue::Known(30));
 
-    // The head row leaves: remaining rows shift, so old tokens go stale
-    // instead of painting the wrong rows.
     state.columns[0].entries.remove(0);
     let applied = state.apply_positioned_metadata(
         RequestId(1),
@@ -781,7 +796,6 @@ fn positioned_fill_applies_in_place_and_flags_moved_rows() {
     assert!(
         matches!(applied, Some((0, ref positions, ref stale)) if positions.is_empty() && stale.len() == 2)
     );
-    // Stale rows keep their placeholders for the next bind's retry.
     assert_eq!(state.columns[0].entries[0].size, MetadataValue::Unknown);
 }
 
@@ -793,7 +807,6 @@ fn fill_updates_never_clobber_known_fields() {
     half_known.size = MetadataValue::Known(50);
     state.apply_batch(RequestId(1), vec![half_known]);
 
-    // The fill only learned the mtime: the known size survives.
     let applied = state.apply_metadata(
         RequestId(1),
         vec![MetadataUpdate {
@@ -809,7 +822,6 @@ fn fill_updates_never_clobber_known_fields() {
         MetadataValue::Known(300)
     );
 
-    // A fill carrying nothing new reports nothing.
     let applied = state.apply_metadata(
         RequestId(1),
         vec![MetadataUpdate {
@@ -835,8 +847,6 @@ fn gap_targets_cover_directory_mtimes_but_never_directory_sizes() {
         vec![named_entry("/fixture/sub", "sub"), complete_file, half_file],
     );
 
-    // The directory qualifies for its mtime and the half-known file for its
-    // mtime; the complete file needs nothing.
     assert_eq!(
         state.column_unknown_metadata(0).map(|targets| {
             targets

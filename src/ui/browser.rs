@@ -65,9 +65,6 @@ struct ColumnView {
     presentation: LoadPresentation,
     model: EntryListModel,
     filtered_model: gtk::FilterListModel,
-    /// Cached visible<->source index translation. Shares the ViewState
-    /// model-generation clock, so every splice invalidates every column at
-    /// once; binds and selection syncs are O(1) afterwards.
     map: ViewMap,
     model_generation: Rc<Cell<u64>>,
     header_actions: gtk::Box,
@@ -80,8 +77,6 @@ struct ColumnView {
     bound_rows: Rc<RefCell<Vec<BoundRow>>>,
     entry_count: Rc<Cell<usize>>,
     spinner: gtk::Spinner,
-    /// Delayed initial-spinner timer: fast loads settle before it ever
-    /// fires, so no spinner flashes for work that finishes in ~120 ms.
     spinner_delay: Rc<RefCell<Option<glib::SourceId>>>,
     truncated_hint: gtk::Image,
     empty_trash_button: Option<gtk::Button>,
@@ -304,9 +299,6 @@ pub(super) struct ViewState {
     hovered_column: Cell<Option<usize>>,
     cut_locations: RefCell<Vec<Location>>,
     horizontal_scroll_generation: Rc<Cell<u64>>,
-    /// Bumped on every shared source-model mutation. Every column and mode
-    /// pane holds a clone and keys its cached position map on it, so one
-    /// counter invalidates every map at once with no per-view bookkeeping.
     source_generation: Rc<Cell<u64>>,
     peek: RefCell<Option<PeekView>>,
     pending_peek: RefCell<Option<glib::SourceId>>,
@@ -3755,9 +3747,6 @@ impl ViewState {
     }
 
     fn handle(self: &Rc<Self>, event: &BrowserEvent) {
-        // The Columns view owns every depth's source model and applies its
-        // own mutations first; mode views then borrow the settled models to
-        // wrap (never copy) for the active Grid/Explorer pane.
         match event {
             BrowserEvent::Reset => {
                 self.pending_location_credentials.take();
@@ -3784,8 +3773,7 @@ impl ViewState {
                         column.presentation.show_content();
                     }
                     for insertion in insertions {
-                        // Invalidate filtered position maps before the model
-                        // emits its synchronous items-changed notification.
+                        // Touch before splice: the model notifies synchronously.
                         touch_source_model(&column);
                         column.model.splice(
                             insertion.position as u32,
@@ -3797,8 +3785,6 @@ impl ViewState {
                     column.entry_count.set(count);
                     set_filter_placeholder(&column, count);
                     update_empty_trash_sensitivity(&column, count);
-                    // Correct rows arrived: assistive technology leaves the
-                    // busy state even while later batches still stream.
                     set_column_busy(&column, false);
                     crate::metrics::mark_batch_rendered(entry_count, render_started);
                     crate::metrics::record_stage(
@@ -3845,19 +3831,12 @@ impl ViewState {
                 }
             }
             BrowserEvent::MetadataFilled { depth, updates } => {
-                // Metadata waiters promote before any mode check: a row may
-                // wait in a hidden view while another mode is active.
                 for (_, entry) in updates.iter() {
                     super::thumbnail::note_metadata_entry(entry);
                 }
                 if self.mode_views.borrow().mode() == BrowserMode::Columns
                     && let Some(column) = self.columns.borrow().get(*depth).cloned()
                 {
-                    // In-place refresh of realized rows only: no model mutation,
-                    // so no rebind, thumbnail restart, or filter re-evaluation.
-                    // Realized rows resolve their current source position through
-                    // the filter mapping, so resort/insert shifts need no extra
-                    // bookkeeping and dead rows prune themselves here.
                     let filled: HashMap<usize, &FileEntry> = updates
                         .iter()
                         .map(|(position, entry)| (*position, entry))
@@ -4282,8 +4261,6 @@ impl ViewState {
                 }
             }
         }
-        // Active-path styling depends on row positions and the active child:
-        // recompute only for events that can move rows or the active child,
         if Self::event_refreshes_active_path(event) {
             self.refresh_active_path_rows();
         }
@@ -4351,9 +4328,6 @@ impl ViewState {
         column.list.grab_focus();
     }
 
-    /// Whether a browser event can move rows or the active child, requiring an
-    /// active-path styling pass. Pure so the fan-out gate stays unit-testable
-    /// without widgets.
     fn event_refreshes_active_path(event: &BrowserEvent) -> bool {
         matches!(
             event,
@@ -4573,10 +4547,6 @@ impl ViewState {
                 &query_for_filter,
                 settled,
             );
-            // The filter reshuffles visible positions, so the GTK bitset goes
-            // stale: re-assert it from the NavigationState truth (selected
-            // locations survive filtering by design) through the rebuilt map
-            // instead of leaving the highlight on the wrong rows.
             let Some(state) = weak_state_for_filter.upgrade() else {
                 return;
             };
@@ -4900,8 +4870,7 @@ impl ViewState {
                 }),
             );
             if let Some(entry) = entry.as_ref() {
-                // Like the grid and explorer binds: hidden views bind, but
-                // only the visible mode earns decodes and fills.
+                // Hidden views bind, but only the visible mode earns decodes and fills.
                 let mode_active = state
                     .as_ref()
                     .is_some_and(|state| state.mode_views.borrow().mode() == BrowserMode::Columns);
@@ -4918,9 +4887,6 @@ impl ViewState {
                 }
                 icon.set_opacity(if entry.is_directory() { 1.0 } else { 0.72 });
                 chevron.set_visible(entry.is_directory());
-                // Bound rows are the visible window: backfill the size/mtime
-                // the streaming enumeration skipped. Debounced per depth, so
-                // a fling binds hundreds of rows but stats one settled set.
                 if mode_active
                     && let Some(state) = state.as_ref()
                     && let Some(position) = source_position
@@ -5190,8 +5156,6 @@ impl ViewState {
             filter: filter_for_column,
         });
 
-        // Accessible loading state immediately; the prominent spinner only
-        // after the delay, so fast loads never flash it.
         if let Some(column) = self.columns.borrow().last() {
             set_column_busy(column, true);
             arm_column_spinner(column);
@@ -5541,16 +5505,11 @@ pub(super) fn format_file_size(bytes: u64) -> String {
     format!("{} {}", formatted.trim_end_matches(".0"), UNITS[unit])
 }
 
-/// Whether a bound row still needs a viewport metadata fill: files missing
-/// size or mtime, or directories missing mtime. Directory size stays unknown
-/// by design and never qualifies.
 pub(super) fn metadata_needs_fill(entry: &FileEntry) -> bool {
     entry.modified_unix_seconds == crate::model::MetadataValue::Unknown
         || (!entry.is_directory() && entry.size == crate::model::MetadataValue::Unknown)
 }
 
-/// Size label text for a columns row, shared by the bind and the in-place
-/// metadata refresh so both render identical strings.
 fn column_size_text(entry: Option<&FileEntry>) -> String {
     entry
         .filter(|entry| !entry.is_directory())
@@ -5561,11 +5520,8 @@ fn column_size_text(entry: Option<&FileEntry>) -> String {
         .unwrap_or_default()
 }
 
-/// Delay before a new column's header spinner becomes prominent. Fast loads
-/// settle first, so no spinner flashes for work that finishes in ~120 ms.
 const COLUMN_SPINNER_DELAY: std::time::Duration = std::time::Duration::from_millis(120);
 
-/// Arms the delayed initial spinner for a freshly appended column.
 fn arm_column_spinner(column: &ColumnView) {
     cancel_column_spinner(column);
     let spinner = column.spinner.clone();
@@ -5581,21 +5537,18 @@ fn arm_column_spinner(column: &ColumnView) {
         },
     ));
 }
-/// Cancels a pending delayed spinner without touching a running one.
 fn cancel_column_spinner(column: &ColumnView) {
     if let Some(source) = column.spinner_delay.borrow_mut().take() {
         source.remove();
     }
 }
 
-/// Stops a column's spinner outright, including a still-pending delay.
 fn stop_column_spinner(column: &ColumnView) {
     cancel_column_spinner(column);
     column.spinner.stop();
     column.spinner.set_visible(false);
 }
 
-/// Marks a column's list busy (or settled) for assistive technology.
 fn set_column_busy(column: &ColumnView, busy: bool) {
     column
         .list
@@ -5609,15 +5562,8 @@ fn set_filter_placeholder(column: &ColumnView, count: usize) {
         .set_placeholder_text(Some(&format!("Filter {count} {noun}…")));
 }
 
-/// Debounce applied to every filter entry: rapid keystrokes collapse into a
-/// single settled evaluation instead of one full re-filter per character.
-/// Re-filtering 100k rows costs far more than a frame, so per-keystroke
-/// evaluation is the typing jank; one evaluation per pause is not.
 pub(crate) const FILTER_DEBOUNCE_DELAY: Duration = Duration::from_millis(60);
 
-/// Routes a filter entry through the shared debounce: each edit cancels the
-/// pending evaluation and arms a fresh one, so only the latest query after
-/// a typing pause reaches `on_settled` with its settled text.
 pub(crate) fn debounce_filter_entry(entry: &gtk::Entry, on_settled: impl Fn(String) + 'static) {
     let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     let on_settled = Rc::new(on_settled);
@@ -5635,10 +5581,6 @@ pub(crate) fn debounce_filter_entry(entry: &gtk::Entry, on_settled: impl Fn(Stri
         ));
     });
 }
-/// Picks the cheapest `FilterChange` for a settled query edit. Typing
-/// narrows the previous query, so matches can only shrink and the model
-/// skips already-hidden rows; deleting widens it and must reconsider them.
-/// Anything else re-evaluates everything.
 pub(crate) fn filter_change_for(previous: &str, settled: &str) -> gtk::FilterChange {
     if settled.starts_with(previous) && settled.len() > previous.len() {
         gtk::FilterChange::MoreStrict
@@ -5667,18 +5609,11 @@ pub(crate) fn apply_filter_query(
     }
 }
 
-/// Cached source<->visible index map for one (query, model generation). A
-/// full re-filter or model splice rebuilds it once in O(n); every bind,
-/// activation, and selection sync after that is O(1). With no query active
-/// the filter passes everything in order, so callers take the identity fast
-/// path and never build (or even touch) the map.
 #[derive(Default)]
 pub(crate) struct PositionMap {
     query: String,
     generation: u64,
-    /// Visible position -> source position, in visible order.
     forward: Vec<usize>,
-    /// Source position -> visible position (`NO_FILTERED_POSITION` = hidden).
     reverse: Vec<u32>,
 }
 
@@ -5710,11 +5645,6 @@ fn rebuild_position_map(
     }
 }
 
-/// Everything a view needs to translate between its visible positions and
-/// source positions: the shared model-generation clock, the folded query,
-/// the map cache, and the two models. Columns views carry no placeholder
-/// (`placeholder: None`); Grid/Explorer flatten a placeholder row above the
-/// filter output, so their visible positions shift by its live row count.
 #[derive(Clone)]
 pub(crate) struct ViewMap {
     cache: Rc<RefCell<PositionMap>>,
@@ -5752,9 +5682,6 @@ impl ViewMap {
             .map_or(0, |placeholder| placeholder.n_items())
     }
 
-    /// Visible (flatten) position -> source position. O(1): identity-checked
-    /// without a query, cache hit otherwise, one O(n) rebuild per
-    /// (query, generation) at most.
     pub(crate) fn source_position(&self, visible_position: u32) -> Option<usize> {
         let filter_position = visible_position.checked_sub(self.placeholder_count())?;
         let query = self.query.borrow();
@@ -5772,8 +5699,6 @@ impl ViewMap {
         cache.forward.get(filter_position as usize).copied()
     }
 
-    /// Source position -> visible (flatten) position. Same cost profile as
-    /// [`ViewMap::source_position`].
     pub(crate) fn view_position(&self, source_position: usize) -> Option<u32> {
         let query = self.query.borrow();
         if query.is_empty() && self.show_hidden.get() {
@@ -5792,8 +5717,6 @@ impl ViewMap {
         (position != NO_FILTERED_POSITION).then_some(position + self.placeholder_count())
     }
 
-    /// Batch variant for selection sync: one cache ensure, then O(1) per
-    /// position. Preserves the (visible, source) pair order of the input.
     pub(crate) fn source_positions(&self, visible_positions: &[u32]) -> Vec<(u32, usize)> {
         visible_positions
             .iter()
@@ -5805,9 +5728,6 @@ impl ViewMap {
     }
 }
 
-/// How a position list reaches the GTK selection: whole-model and single
-/// contiguous runs use native bulk ops (one call, no per-row round trips);
-/// only genuinely scattered sets fall back to per-item selection.
 pub(crate) enum SelectionPlan<'a> {
     All,
     Range { position: u32, count: u32 },
@@ -5829,8 +5749,6 @@ pub(crate) fn plan_selection(n_items: u32, positions: &[u32]) -> SelectionPlan<'
     }
 }
 
-/// Applies `positions` (visible indexes into a model of `n_items` rows)
-/// with the cheapest native op. Callers hold their syncing guard.
 pub(crate) fn apply_selection_plan(
     selection: &gtk::MultiSelection,
     n_items: u32,
@@ -5851,9 +5769,6 @@ pub(crate) fn apply_selection_plan(
         }
     }
 }
-/// Advances the shared source-model generation after a splice. Every column
-/// and mode pane keys its cached position map on this clock, so one bump
-/// invalidates every map at once with no per-view bookkeeping.
 fn touch_source_model(column: &ColumnView) {
     column
         .model_generation
@@ -5871,8 +5786,6 @@ fn set_column_selection(column: &ColumnView, position: u32) {
 
 fn set_column_selections(column: &ColumnView, positions: &[u32]) {
     column.syncing_selection.set(true);
-    // Select All over 100k rows used to issue 100k `select_item` calls;
-    // full coverage and single contiguous runs now use one native bulk op.
     apply_selection_plan(
         &column.selection,
         column.filtered_model.n_items(),
@@ -7920,9 +7833,6 @@ pub(super) fn entry_icon(entry: &FileEntry) -> &'static str {
     icon_for_name(&entry.display_name)
 }
 
-/// Full-directory filter predicate shared by every view mode. Source models
-/// carry `kind\tname` values; matching runs against the display name so a
-/// shared model filters identically in Columns, Grid, and Explorer.
 /// `query` must already be folded to lowercase by the caller.
 pub(super) fn pane_filter_matches(value: &str, query: &str) -> bool {
     query.is_empty() || model_display_name(value).to_lowercase().contains(query)

@@ -692,6 +692,10 @@ impl ModeViews {
             }
             BrowserEvent::EntriesReplaced { depth, count } => {
                 for pane in self.panes_at(*depth) {
+                    if *count > 0 {
+                        pane.spinner.stop();
+                        pane.spinner.set_visible(false);
+                    }
                     replace_entries(pane, &self.browser, *count);
                 }
             }

@@ -18,22 +18,14 @@ use crate::{
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 const MAX_CACHE_ENTRIES: usize = 256;
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
-/// Four concurrent sandbox decodes shorten the visible thumbnail drain;
-/// viewport bounding keeps the amount of admitted work fixed.
+/// Viewport bounding keeps the admitted work fixed.
 const MAX_THUMBNAIL_WORKERS: usize = 4;
 const MAX_QUEUED_THUMBNAILS: usize = 64;
 const FAILED_THUMBNAIL_TTL: Duration = Duration::from_secs(30);
-/// Settles scrolling before decoding: binds during a fling only park their
-/// rows, and one timer fire starts jobs for the rows still on screen. Cache
-/// hits bypass the gate entirely, so revisits never wait on it.
+/// Settles scrolling before decoding; cache hits bypass the gate.
 const THUMBNAIL_SETTLE_DELAY: Duration = Duration::from_millis(120);
-/// Bounds starvation: continuous binds re-arm the settle timer, but the
-/// first park starts the clock and anything parked longer fires anyway. The
-/// fire still intersects the viewport, so a mid-fling fire only spends work
-/// on rows that are actually visible.
+/// Bounds starvation: overlong parks fire anyway, still viewport-intersected.
 const MAX_SETTLE_WAIT: Duration = Duration::from_millis(400);
-/// Viewport overscan fraction per side: visible rows plus roughly 25%
-/// prefetch start work; anything further out waits for a later settle.
 const VIEWPORT_OVERSCAN: f32 = 0.25;
 
 thread_local! {
@@ -43,15 +35,9 @@ thread_local! {
         RefCell::new(HashMap::new());
     static THUMBNAIL_QUEUE: RefCell<ThumbnailQueue> = RefCell::new(ThumbnailQueue::default());
     static THUMBNAIL_CACHE: RefCell<ThumbnailCache> = RefCell::new(ThumbnailCache::default());
-    /// Fallback settle group (key zero) for targets with no viewport
-    /// ancestor (popups, tests): fires on the same per-group machinery.
-    /// One settle group per visible scrolled window, keyed by widget
-    /// address. A fling in one view re-arms only its own timer, so windows
-    /// can never postpone each other's thumbnails.
+    /// Per-viewport settle groups (key zero is the fallback); one view's fling never postpones another's.
     static SETTLE_VIEWS: RefCell<HashMap<usize, ViewSettle>> = RefCell::new(HashMap::new());
-    /// Rows parked while their file metadata is still unknown. The next
-    /// metadata fill promotes them through `note_metadata` instead of
-    /// rendering once without an mtime and again after it arrives.
+    /// Parked while metadata is unknown to avoid rendering twice.
     static METADATA_WAITERS: RefCell<HashMap<PathBuf, Vec<MetadataWaiter>>> =
         RefCell::new(HashMap::new());
 }
@@ -73,8 +59,6 @@ struct PendingTarget {
     request: u64,
     image: glib::WeakRef<gtk::Image>,
 }
-/// One parked row: the render key, its provider, the target widget, and
-/// whether the row must wait for file metadata before it may start work.
 struct SettledPark {
     key: ThumbnailKey,
     kind: ThumbnailKind,
@@ -82,7 +66,6 @@ struct SettledPark {
     wait_for_metadata: bool,
 }
 
-/// Settle state for one visible scrolled window.
 struct ViewSettle {
     viewport: glib::WeakRef<gtk::ScrolledWindow>,
     pending: Vec<SettledPark>,
@@ -91,8 +74,6 @@ struct ViewSettle {
     hooked: bool,
 }
 
-/// A row parked while its file metadata is unknown. Promoted by
-/// `note_metadata` into its original viewport group once the fill arrives.
 struct MetadataWaiter {
     group: usize,
     kind: ThumbnailKind,
@@ -100,17 +81,13 @@ struct MetadataWaiter {
     file_size: Option<u64>,
     thumbnail_size: i32,
 }
-/// One validated render awaiting disk persistence.
 struct PersistJob {
     path: PathBuf,
     mtime: i64,
     png: Vec<u8>,
 }
 
-/// Bounded persistence queue. Slow or failing disk must never delay display
-/// or hold a render-worker slot, so validated renders land here and a single
-/// background pump stores them. Over capacity the oldest entry drops: its
-/// file simply re-renders on the next cold start.
+/// Bounded: slow disk never delays display; over capacity the oldest entry drops.
 const MAX_PERSIST_QUEUE: usize = 32;
 
 struct PersistQueue {
@@ -146,8 +123,6 @@ impl PersistQueue {
 static PERSIST_QUEUE: std::sync::Mutex<PersistQueue> = std::sync::Mutex::new(PersistQueue::new());
 static PERSIST_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Enqueues a validated render for background persistence and ensures the
-/// pump runs. Display already applied; this never blocks the caller.
 fn enqueue_persist(path: PathBuf, mtime: i64, png: Vec<u8>) {
     PERSIST_QUEUE
         .lock()
@@ -170,8 +145,7 @@ fn pump_persist_queue() {
             let Some(job) = job else {
                 break;
             };
-            // Best effort, on no render slot: every store failure is
-            // silently dropped and the in-memory result already applied.
+            // Best effort: store failures are dropped; the in-memory result already applied.
             super::thumbnail_cache::store(&job.path, job.mtime, &job.png);
         }
         PERSIST_RUNNING.store(false, Ordering::SeqCst);
@@ -369,9 +343,7 @@ pub(super) fn set_thumbnail_or_icon_for_path(
     });
 }
 
-/// One thumbnail scheduling request. Bundled so the scheduler entry point
-/// stays under the argument-count lint as viewport and metadata flags join
-/// the key material.
+/// Bundled to stay under the argument-count lint.
 struct ThumbnailRequest<'a> {
     image: &'a gtk::Image,
     path: &'a Path,
@@ -397,10 +369,7 @@ fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
         file_size: request.file_size,
         thumbnail_size,
     };
-    // Memory hits apply instantly with no I/O: revisits never wait on the
-    // settle queue. Disk validation moves to fire time, where only rows in
-    // the settled viewport spend the lookup; offscreen rows never touch the
-    // disk merely because GTK retained them.
+    // Disk validation moves to fire time so offscreen rows never touch the disk.
     match THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().get(&key)) {
         Some(CacheHit::Ready(bytes)) => {
             apply_thumbnail(request.image, &bytes, thumbnail_size);
@@ -426,10 +395,7 @@ fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
         request: request_id,
         image: weak_image,
     };
-    // Factory binds run while GTK is mutating the list's widget tree. Wait
-    // until that mutation finishes before walking the image's ancestors and
-    // hooking its viewport; doing either from the bind callback can corrupt
-    // GTK's in-progress layout.
+    // Binds run while GTK mutates the widget tree; walking ancestors or hooking the viewport here can corrupt layout. Defer to idle.
     glib::idle_add_local_once(move || {
         if target_live_image(&target).is_some() {
             park_thumbnail(key, kind, target, request.wait_for_metadata);
@@ -437,11 +403,6 @@ fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
     });
 }
 
-/// Viewport ancestor of a bound row image, if the row lives inside a
-/// scrolled window. Resolved at park time, when the row is parented, so bind
-/// call sites pass nothing new: every column, grid, explorer, and search row
-/// finds its own viewport automatically. No scrolled ancestor (popups,
-/// tests) lands in the fallback group with the historic behavior.
 fn viewport_of(image: &gtk::Image) -> Option<gtk::ScrolledWindow> {
     let mut ancestor = image.parent();
     while let Some(widget) = ancestor {
@@ -453,10 +414,6 @@ fn viewport_of(image: &gtk::Image) -> Option<gtk::ScrolledWindow> {
     None
 }
 
-/// Eligibility of an item rect expressed in viewport coordinates against the
-/// viewport size. Visible rows plus `VIEWPORT_OVERSCAN` prefetch on every
-/// side start work; anything further out waits for a later settle. Pure over
-/// floats so the geometry is unit-testable without a display.
 fn rect_eligible(
     x: f32,
     y: f32,
@@ -476,9 +433,6 @@ fn rect_eligible(
         && y + height > -viewport_height * overscan
 }
 
-/// The live item rect of a bound row image in viewport coordinates, or
-/// `None` when the row is unmapped or detached. A miss degrades to
-/// ineligible, never to a wrong row.
 fn image_viewport_rect(
     image: &gtk::Image,
     viewport: &gtk::ScrolledWindow,
@@ -498,9 +452,7 @@ fn list_item_owner(widget: &gtk::Widget) -> Option<gtk::Widget> {
     None
 }
 
-/// GTK keeps the last allocation of rows visited during a fling, so bounds
-/// alone can make every intermediate page look current. Hit-testing the
-/// visible part identifies the row actually displayed at that position.
+/// GTK keeps stale allocations from fling-visited rows; hit-test the visible part to find the row actually displayed.
 fn image_is_currently_picked(
     image: &gtk::Image,
     viewport: &gtk::ScrolledWindow,
@@ -546,9 +498,6 @@ fn image_eligible(image: &gtk::Image, viewport: &gtk::ScrolledWindow) -> bool {
     ) && image_is_currently_picked(image, viewport, x, y, width, height)
 }
 
-/// Settle group address for a viewport: its widget address, or zero for the
-/// fallback group. The map holds only weak viewport refs, so dead windows
-/// drop out at the next fire instead of leaking.
 fn group_address(viewport: Option<&gtk::ScrolledWindow>) -> usize {
     viewport.map_or(0, |viewport| viewport.as_ptr() as usize)
 }
@@ -560,8 +509,6 @@ fn park_thumbnail(
     wait_for_metadata: bool,
 ) {
     crate::metrics::mark_thumbnail_requested(&key.path.display().to_string());
-    // Parked until scrolling settles: a fling binds hundreds of rows, and
-    // only the rows still visible at fire time earn a decode.
     let viewport = target.image.upgrade().and_then(|image| viewport_of(&image));
     let group = group_address(viewport.as_ref());
     let viewport_ref = glib::WeakRef::new();
@@ -577,10 +524,7 @@ fn park_thumbnail(
             first_park: None,
             hooked: false,
         });
-        // A dead viewport's address may be recycled by a new window: never
-        // join its stale hooks and pendings, reset the group instead. The
-        // orphaned timer fires into the fresh group at worst, which only
-        // settles early.
+        // A dead viewport's address may be recycled: reset the group instead of joining its stale hooks and pendings.
         if group != 0 && settle.viewport.upgrade().is_none() {
             if let Some(timer) = settle.timer.take() {
                 timer.remove();
@@ -609,8 +553,6 @@ fn park_thumbnail(
     request_group_fire(group);
 }
 
-/// Parks into the legacy fallback group. Tests land here with the historic
-/// global behavior.
 #[cfg(test)]
 fn schedule_or_defer(key: ThumbnailKey, kind: ThumbnailKind, target: PendingTarget) {
     park_thumbnail(key, kind, target, false);
@@ -627,23 +569,14 @@ fn mark_deferred(key: ThumbnailKey, kind: ThumbnailKind, image_id: usize, reques
     });
 }
 
-/// Arms a group's settle timer. Fires happen exclusively on the main loop
-/// through timer callbacks: `request_group_fire` runs inside binds and
-/// adjustment callbacks, and a synchronous fire there would nest thumbnail
-/// application inside GTK layout (reentrant relayout, torn item bounds,
-/// fatal `bounds.y` assertion). An overdue group (continuous binds past
-/// `MAX_SETTLE_WAIT`) arms a zero-delay timer instead of extending the
-/// wait, so the bound holds without ever firing nested.
+/// Fires happen only on the main loop: firing inside binds or adjustment callbacks would nest thumbnail application inside GTK layout (reentrant relayout, fatal `bounds.y` assertion). Overdue groups arm a zero-delay timer so the bound holds without ever firing nested.
 fn request_group_fire(group: usize) {
     SETTLE_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
         let Some(settle) = views.get_mut(&group) else {
             return;
         };
-        // No pending rows, no timer: adjustment callbacks fire constantly
-        // during layout, and re-arming into an empty queue would turn every
-        // thumbnail application (which relayouts) into another fire, a
-        // self-sustaining apply storm that tears item bounds apart.
+        // No pending rows, no timer: re-arming into an empty queue turns every thumbnail application (which relayouts) into another fire.
         if settle.pending.is_empty() {
             return;
         }
@@ -663,10 +596,6 @@ fn request_group_fire(group: usize) {
         }));
     });
 }
-/// Hooks a viewport's adjustments so scrolling or resizing without fresh
-/// binds still reconciles the parked set. Connected once per viewport; the
-/// closures hold only the group address, so no reference cycle keeps a dead
-/// window alive.
 fn hook_viewport(group: usize, viewport: &gtk::ScrolledWindow) {
     let hooked = SETTLE_VIEWS.with(|views| {
         views
@@ -684,9 +613,6 @@ fn hook_viewport(group: usize, viewport: &gtk::ScrolledWindow) {
     }
 }
 
-/// Fires one viewport group: drops dead windows, intersects the parked rows
-/// with the live viewport, serves memory and disk caches for visible rows,
-/// parks metadata waiters, and queues renders for the visible remainder.
 fn fire_view_group(group: usize) {
     let (viewport, drained) = SETTLE_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
@@ -708,10 +634,8 @@ fn fire_view_group(group: usize) {
     fire_parks(drained, viewport.as_ref());
 }
 
-/// Fires the fallback group. Tests drive this directly.
 #[cfg(test)]
 fn fire_settled_thumbnails() {
-    // fire_view_group takes the group's timer, so no disarm is needed here.
     fire_view_group(0);
 }
 
@@ -730,9 +654,7 @@ fn target_live_image(target: &PendingTarget) -> Option<gtk::Image> {
 
 fn fire_parks(mut drained: Vec<SettledPark>, viewport: Option<&gtk::ScrolledWindow>) {
     if let Some(viewport) = viewport {
-        // Factory bind order is not a display-order contract. Queue the
-        // settled viewport from top to bottom (and left to right for grids)
-        // so the first visible item cannot be overtaken by a later row.
+        // Bind order is not display order; queue top-to-bottom so the first visible item is not overtaken.
         drained.sort_by(|left, right| {
             let position = |park: &SettledPark| {
                 park.target
@@ -754,10 +676,6 @@ fn fire_parks(mut drained: Vec<SettledPark>, viewport: Option<&gtk::ScrolledWind
     for park in drained {
         let image_id = park.target.image_id;
         let request = park.target.request;
-        // Rows that scrolled away (or were unbound) while settling earn
-        // nothing: their request was superseded or cancelled. Rows outside
-        // the settled viewport wait for a later settle instead of decoding
-        // off-screen: scrolling back re-parks them on rebind.
         let live = ACTIVE_REQUESTS.with(|requests| {
             requests
                 .borrow()
@@ -767,17 +685,11 @@ fn fire_parks(mut drained: Vec<SettledPark>, viewport: Option<&gtk::ScrolledWind
         if !live {
             continue;
         }
-        // The widget may be gone while its request is still current (tests
-        // park imageless targets): viewport, memory, and disk steps need the
-        // live image, but the render queue decision does not. Completion
-        // still drops imageless results as stale.
         let image = park.target.image.upgrade();
         if let (Some(image), Some(viewport)) = (image.as_ref(), viewport)
             && !image_eligible(image, viewport)
         {
-            // GTK pre-binds rows outside its allocated window. Keep those
-            // requests parked: adjustment changes recheck the same live
-            // widgets, so scrolling into them starts work without a rebind.
+            // Keep pre-bound offscreen requests parked; scrolling into them starts work without a rebind.
             offscreen.push(park);
             continue;
         }
@@ -819,7 +731,6 @@ fn fire_parks(mut drained: Vec<SettledPark>, viewport: Option<&gtk::ScrolledWind
     }
 }
 
-/// Settle group for a fire-time viewport reference.
 fn group_of_viewport(viewport: Option<&gtk::ScrolledWindow>) -> usize {
     group_address(viewport)
 }
@@ -828,8 +739,7 @@ fn push_metadata_waiter(group: usize, park: SettledPark) {
     METADATA_WAITERS.with(|waiters| {
         let mut waiters = waiters.borrow_mut();
         let queue = waiters.entry(park.key.path.clone()).or_default();
-        // One waiter per bound view of the file is plenty; extras re-park
-        // on their next bind.
+        // Capped per file; extras re-park on their next bind.
         if queue.len() < 8 {
             queue.push(MetadataWaiter {
                 group,
@@ -842,18 +752,11 @@ fn push_metadata_waiter(group: usize, park: SettledPark) {
     });
 }
 
-/// Promotes rows parked while their file metadata was unknown. Called from
-/// every metadata-fill path with the filled values; unknown mtimes no-op so
-/// call sites stay one-liners. Each promoted waiter re-parks into its
-/// original viewport group with a validated key, so the file renders once
-/// instead of once without an mtime and again after it arrives.
 pub(super) fn note_metadata(path: &Path, modified: Option<i64>, file_size: Option<u64>) {
     let Some(mtime) = modified else {
         return;
     };
-    // Metadata may arrive after a bind parks the row but before the settle
-    // timer moves it into METADATA_WAITERS. Update both sides of that gate so
-    // the ordering cannot strand a live thumbnail indefinitely.
+    // Metadata may arrive on either side of the settle gate; update both so no thumbnail strands.
     SETTLE_VIEWS.with(|views| {
         for settle in views.borrow_mut().values_mut() {
             for park in &mut settle.pending {
@@ -893,9 +796,6 @@ pub(super) fn note_metadata(path: &Path, modified: Option<i64>, file_size: Optio
         park_into_group(waiter.group, key, waiter.kind, waiter.target, false);
     }
 }
-/// Fill-arm entry point: promotes metadata waiters for one filled entry.
-/// Non-native locations and unknown mtimes no-op, so every fill arm calls
-/// this unconditionally per update before touching its own rows.
 pub(super) fn note_metadata_entry(entry: &FileEntry) {
     let (Some(path), Some(mtime)) = (
         entry.location.native_path(),
@@ -906,8 +806,6 @@ pub(super) fn note_metadata_entry(entry: &FileEntry) {
     note_metadata(path, Some(mtime), known_metadata(&entry.size));
 }
 
-/// Parks into a known group (waiter promotion). A vanished group falls back
-/// to the shared queue instead of dropping the row.
 fn park_into_group(
     group: usize,
     key: ThumbnailKey,
@@ -991,12 +889,7 @@ async fn run_thumbnail_job(job: ThumbnailJob) {
         {
             return Ok((png, false));
         }
-        // Always render the canonical `large` size class: the shared cache
-        // keys one entry per file, so a small view's render must never
-        // poison the bucket. Presentation downscales via `apply_thumbnail`.
-        // Persistence deliberately stays out of this worker: storing beside
-        // rendering holds a render slot behind disk I/O. Validated bytes
-        // apply first and persist through the bounded background queue.
+        // Render the canonical size class: one entry per file, so a small view must never poison the bucket.
         render_thumbnail(
             &job.key.path,
             job.kind,
@@ -1017,9 +910,7 @@ async fn run_thumbnail_job(job: ThumbnailJob) {
                 let bytes = glib::Bytes::from_owned(png.clone());
                 THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().insert(key.clone(), bytes.clone()));
                 finish_thumbnail_targets(targets, Some(&bytes), thumbnail_size, &uri);
-                // Validated bytes apply first; persistence follows on no
-                // render slot. Unverifiable keys (unknown mtime) skip the
-                // shared cache: nothing validates them later.
+                // Unverifiable keys (unknown mtime) skip persistence: nothing validates them later.
                 if rendered && let Some(mtime) = key.modified {
                     enqueue_persist(key.path.clone(), mtime, png);
                 }
@@ -1197,15 +1088,11 @@ fn cancel_thumbnail(image_id: usize) {
     ACTIVE_REQUESTS.with(|requests| {
         requests.borrow_mut().remove(&image_id);
     });
-    // Departed rows cancel everywhere they can wait: every viewport group
-    // and the metadata-waiter map, so no queued work survives its row.
     SETTLE_VIEWS.with(|views| {
         views.borrow_mut().retain(|_, settle| {
             settle
                 .pending
                 .retain(|park| park.target.image_id != image_id);
-            // Hooked viewports keep their group (and connections) across
-            // empty moments; unhooked groups vanish once drained.
             !settle.pending.is_empty() || settle.hooked
         });
     });

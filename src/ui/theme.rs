@@ -23,9 +23,7 @@ thread_local! {
     static SOURCE_STYLE_PATH_INSTALLED: Cell<bool> = const { Cell::new(false) };
     static SOURCE_BUFFERS: RefCell<Vec<glib::WeakRef<sourceview5::Buffer>>> = const { RefCell::new(Vec::new()) };
     static CHANNEL_LISTENERS: RefCell<Vec<ChannelListener>> = const { RefCell::new(Vec::new()) };
-    /// Latest theme tokens awaiting installation. File generation and the
-    /// style-manager rescan wait for the first source preview buffer, so
-    /// ordinary startup performs no SourceView I/O at all.
+    /// Installed on the first source preview buffer, so startup performs no SourceView I/O.
     static PENDING_STYLE_TOKENS: RefCell<Option<ThemeTokens>> = const { RefCell::new(None) };
     static STYLE_SCHEME_DIRTY: Cell<bool> = const { Cell::new(true) };
 }
@@ -1000,9 +998,6 @@ pub(super) fn register_source_buffer(buffer: &sourceview5::Buffer) {
     });
 }
 
-/// Stages theme tokens for the source preview style without touching disk:
-/// an explicit theme switch while previews are live reinstalls immediately,
-/// otherwise installation waits for the first source buffer.
 fn stage_source_style_scheme(tokens: &ThemeTokens) {
     PENDING_STYLE_TOKENS.with(|pending| pending.replace(Some(tokens.clone())));
     STYLE_SCHEME_DIRTY.with(|dirty| dirty.set(true));
@@ -1017,9 +1012,7 @@ fn stage_source_style_scheme(tokens: &ThemeTokens) {
     }
 }
 
-/// Writes the staged style scheme and rescans the style manager, once per
-/// staged token set. Called on the first source preview buffer (and on
-/// theme switches while buffers are live), never during ordinary startup.
+/// Writes the staged scheme and rescans the style manager, once per staged token set.
 fn ensure_source_style_scheme_installed() {
     if !STYLE_SCHEME_DIRTY.with(|dirty| dirty.get()) {
         return;

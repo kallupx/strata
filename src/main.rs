@@ -87,13 +87,9 @@ fn restart_with_local_vfs_if_gvfs_is_unresponsive() {
     if std::env::var_os("GIO_USE_VFS").is_some() {
         return;
     }
-    // A healthy probe costs a full subprocess spawn (~60 ms warm) on every
-    // launch. Remember the probed daemon generation instead: a wedged GVfs
-    // daemon persists for the boot, so the first launch still catches it,
-    // while the rest skip straight to startup. A daemon restart changes its
-    // kernel pid, which re-arms the probe; a daemon wedging in place under
-    // the same pid is not detected (documented residual: the probe timeout
-    // bounded the original detection, and no cheap identity survives that).
+    // Skip the subprocess probe when the marker matches the current `gvfsd`
+    // generation; a daemon restart (new pid) re-arms it. A daemon wedging
+    // under the same pid is not detected.
     if gvfs_probe_marker_is_fresh() {
         return;
     }
@@ -114,9 +110,7 @@ fn restart_with_local_vfs_if_gvfs_is_unresponsive() {
         return;
     }
 
-    eprintln!(
-        "GVFS is unresponsive; using local filesystem and volume support for this session."
-    );
+    eprintln!("GVFS is unresponsive; using local filesystem and volume support for this session.");
     let error = std::process::Command::new(executable)
         .args(std::env::args_os().skip(1))
         .envs(GIO_FALLBACK_BACKENDS)
@@ -136,10 +130,8 @@ fn gvfs_probe_marker_path_in(runtime: Option<std::ffi::OsString>) -> Option<std:
     Some(std::path::Path::new(&runtime).join("strata-gvfs-probe-ok"))
 }
 
-/// Kernel pids currently owned by a `gvfsd` process, sorted. Read straight
-/// from `/proc` so a healthy launch pays directory reads instead of a
-/// subprocess spawn. Matches the `gvfsd*` family (daemon, fuse, trash):
-/// any of them restarting re-arms the probe.
+/// Kernel pids of `gvfsd*` processes, read from `/proc` to avoid a subprocess
+/// spawn; any restart re-arms the probe.
 fn gvfs_daemon_pids(proc_root: &std::path::Path) -> Vec<u32> {
     let mut pids = Vec::new();
     let Ok(entries) = std::fs::read_dir(proc_root) else {
@@ -172,8 +164,14 @@ fn gvfs_probe_marker_is_fresh() -> bool {
     let Some(path) = gvfs_probe_marker_path() else {
         return false;
     };
-    let stored = std::fs::read_to_string(&path).unwrap_or_default();
-    stored == encode_daemon_pids(&gvfs_daemon_pids(std::path::Path::new("/proc")))
+    gvfs_probe_marker_is_fresh_at(&path, std::path::Path::new("/proc"))
+}
+
+fn gvfs_probe_marker_is_fresh_at(path: &std::path::Path, proc_root: &std::path::Path) -> bool {
+    let Ok(stored) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    stored == encode_daemon_pids(&gvfs_daemon_pids(proc_root))
 }
 
 fn write_gvfs_probe_marker() {

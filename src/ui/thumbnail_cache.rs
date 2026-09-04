@@ -1,24 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Freedesktop shared thumbnail cache: reads and writes
-//! `$XDG_CACHE_HOME/thumbnails/large` so thumbnails survive restarts and are
-//! shared with every other spec-following application.
+//! Freedesktop shared thumbnail cache (`$XDG_CACHE_HOME/thumbnails/large`).
 //!
-//! Keys follow the thumbnail managing standard: the MD5 of the file's URI as
-//! the file name. Every hit re-validates the PNG's own `Thumb::URI` and
-//! `Thumb::MTime` text chunks against the requested file, so a stale or
-//! foreign entry can never serve the wrong image; anything unreadable is a
-//! miss. Only entries with a known modification time touch the disk at all,
-//! since there is nothing to validate the cached copy against otherwise.
+//! Keys are the MD5 of the file's URI; every hit re-validates the PNG's
+//! `Thumb::URI`/`Thumb::MTime` tags, so stale or foreign entries miss. Only
+//! known mtimes touch the disk, since there is nothing to validate against
+//! otherwise.
 //!
-//! Cache bytes are untrusted: entries are opened without following symlinks,
-//! size- and dimension-bounded before allocation, structurally validated
-//! before their tags are read, and never decoded outside the platform's
-//! glycin-backed loader path. Raster decoding of source media happens only
-//! inside the sandbox; this module merely persists and re-serves PNG bytes.
-//! Stored entries are always normalized to the canonical `large` size class
-//! (maximum edge of 256 px), so a small view can never poison the shared
-//! bucket for larger views.
+//! Cache bytes are untrusted: opened without following symlinks,
+//! size- and dimension-bounded before allocation, and never decoded outside
+//! the sandbox loader path. Entries are normalized to the canonical `large`
+//! size class so small views cannot poison the shared bucket.
 
 #[cfg(test)]
 mod tests;
@@ -29,26 +21,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Canonical `large` size class: every stored entry has a maximum edge of
-/// exactly this many pixels, regardless of which view rendered it.
 pub const CANONICAL_MAX_EDGE: i32 = 256;
-/// Upper bound for one cache entry on disk. Canonical PNGs are tens of
-/// kilobytes; anything past this is hostile or corrupt and is a miss without
-/// being read.
+/// Canonical PNGs are tens of kilobytes; anything past this is hostile or corrupt and is a miss without being read.
 const MAX_DISK_THUMBNAIL_BYTES: u64 = 2 * 1024 * 1024;
-/// Upper bound for decoded cache dimensions. Canonical entries peak at 256
-/// px; foreign spec-following `large` entries peak there too. Anything wider
-/// is rejected before allocation.
+/// Foreign spec-following `large` entries peak at 256 px too; anything wider is rejected before allocation.
 const MAX_CACHED_DIMENSION: u32 = 512;
-/// Upper bound for decoded cache pixels, bounding `width * height` before
-/// any pixel buffer exists.
 const MAX_CACHED_PIXELS: u64 = 512 * 512;
-/// Upper bound for renders handed to `store`. Sandbox outputs are small; this
-/// only guards the normalization decode against absurd inputs.
+/// Only guards the normalization decode against absurd inputs.
 const MAX_RENDER_BYTES: usize = 32 * 1024 * 1024;
 
-/// Reads a cached thumbnail for `path` validated at `mtime`, or `None` on any
-/// miss, mismatch, or I/O failure. Callers fall back to rendering.
 pub fn lookup(path: &Path, mtime: i64) -> Option<Vec<u8>> {
     let (uri, name) = cache_key(path)?;
     let bytes = read_bounded(&shared_cache_dir()?.join(name))?;
@@ -59,8 +40,6 @@ pub fn lookup(path: &Path, mtime: i64) -> Option<Vec<u8>> {
     if u64::from(width) * u64::from(height) > MAX_CACHED_PIXELS {
         return None;
     }
-    // Tags validate only after the structure passed the bounded checks:
-    // corrupt ancillary data is a miss, never a crash.
     let (stored_uri, stored_mtime) = read_thumb_tags(&bytes)?;
     if stored_uri != uri || stored_mtime != mtime.to_string() {
         return None;
@@ -68,11 +47,7 @@ pub fn lookup(path: &Path, mtime: i64) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Stores freshly rendered PNG bytes under the file's cache key, tagged with
-/// its URI and mtime and normalized to the canonical size class. Best
-/// effort: every failure is silently dropped and the in-memory result still
-/// applies. Cancellation, vanished sources, and renderer failures never reach
-/// here with bytes to persist, so nothing writes negative-cache files.
+/// Best effort: failures are silently dropped. Only rendered bytes reach here, so nothing writes negative-cache files.
 pub fn store(path: &Path, mtime: i64, png: &[u8]) {
     if png.is_empty() || png.len() > MAX_RENDER_BYTES {
         return;
@@ -92,10 +67,7 @@ pub fn store(path: &Path, mtime: i64, png: &[u8]) {
     let _ignored = crate::storage::atomic_write(&dir.join(name), &tagged);
 }
 
-/// `(uri, "<md5>.png")` for `path`, or `None` when the path has no URI form.
-/// The digest is only a file name, where MD5's collision weakness is
-/// irrelevant; it comes from GLib's checksum support rather than a bespoke
-/// implementation so keys match every other spec-following application.
+/// The digest is only a file name, where MD5's weakness is irrelevant; GLib keeps keys matching other spec-following applications.
 fn cache_key(path: &Path) -> Option<(String, String)> {
     let uri = gtk_glib_filename_to_uri(path)?;
     Some((
@@ -119,10 +91,7 @@ fn gtk_glib_filename_to_uri(path: &Path) -> Option<String> {
 #[cfg(test)]
 static CACHE_DIR_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// Test-only bucket override. Production always resolves through the
-/// environment; mutating process-global environment in tests is both unsafe
-/// (edition 2024) and racy, so tests serialize on a lock and swap this cell
-/// instead.
+/// Test-only bucket override: mutating process-global environment in tests is unsafe and racy, so tests swap this cell instead.
 #[cfg(test)]
 fn set_cache_dir_override(dir: Option<PathBuf>) {
     match CACHE_DIR_OVERRIDE.lock() {
@@ -161,24 +130,16 @@ fn shared_cache_dir() -> Option<PathBuf> {
     Some(base.join("thumbnails").join("large"))
 }
 
-/// Creates the cache directory with 0700 permissions even under a permissive
-/// umask or XDG parent, and repairs the mode when the directory already
-/// exists. Same-user applications are unaffected by the mode; other users
-/// lose the ability to plant symlinks or FIFOs in the bucket.
+/// 0700 so other users cannot plant symlinks or FIFOs in the bucket; repairs the mode when the directory already exists.
 fn ensure_cache_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
-/// Opens `path` without following symlinks, verifies it is a regular file,
-/// and reads at most the entry bound. Symlinks, FIFOs, oversized entries,
-/// and sparse files with huge claimed lengths are misses that never allocate
-/// past the bound.
+/// Symlinks, FIFOs, oversized, and sparse entries are misses that never allocate past the bound.
 fn read_bounded(path: &Path) -> Option<Vec<u8>> {
-    // `NONBLOCK`: opening a FIFO without it would wait for a writer
-    // forever. The type check below rejects everything but regular files
-    // before any byte is read.
+    // `NONBLOCK`: opening a FIFO without it would wait for a writer forever.
     let fd = rustix::fs::open(
         path,
         rustix::fs::OFlags::RDONLY
@@ -203,11 +164,7 @@ fn read_bounded(path: &Path) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Decodes rendered PNG bytes and re-saves them at the canonical size class,
-/// tagged with the file's URI and mtime, so later lookups can validate the
-/// entry. The output always has a maximum edge of 256 px: larger renders
-/// scale down and smaller renders scale up, so a tiny view can never poison
-/// the shared bucket with an upscaled-after-the-fact entry.
+/// The output always has a maximum edge of 256 px, so a tiny view can never poison the shared bucket.
 fn normalize_to_canonical(png: &[u8], uri: &str, mtime: i64) -> Result<Vec<u8>, String> {
     use gtk::gdk_pixbuf::prelude::PixbufLoaderExt;
     let loader = gtk::gdk_pixbuf::PixbufLoader::new();
@@ -247,8 +204,6 @@ fn normalize_to_canonical(png: &[u8], uri: &str, mtime: i64) -> Result<Vec<u8>, 
         .map(|bytes| bytes.to_vec())
 }
 
-/// Reads `(width, height)` out of a PNG's IHDR without decoding anything.
-/// Returns `None` for anything that is not a PNG with a well-formed IHDR.
 fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
     const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
     if png.get(..SIGNATURE.len())? != SIGNATURE {
@@ -273,9 +228,7 @@ fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
-/// Reads the `Thumb::URI` / `Thumb::MTime` text tags out of PNG bytes.
-/// Returns `None` for anything that is not a PNG or carries no tags, without
-/// ever panicking on hostile input: the shared cache is world-writable data.
+/// Never panics on hostile input: the shared cache is world-writable data.
 fn read_thumb_tags(png: &[u8]) -> Option<(String, String)> {
     const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
     if png.get(..SIGNATURE.len())? != SIGNATURE {
@@ -288,7 +241,6 @@ fn read_thumb_tags(png: &[u8]) -> Option<(String, String)> {
         let length = u32::from_be_bytes(png.get(position..position + 4)?.try_into().ok()?) as usize;
         let kind = png.get(position + 4..position + 8)?;
         let data_end = position.checked_add(8)?.checked_add(length)?;
-        // Trailing CRC included: a truncated chunk ends the walk, never the process.
         if data_end.checked_add(4)? > png.len() {
             return None;
         }

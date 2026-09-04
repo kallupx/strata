@@ -27,10 +27,8 @@ use crate::{
 const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 const DIRECTORY_LOAD_TIME_BUDGET: Duration = Duration::from_secs(10);
 
-/// GIO batch size for local directories. Fewer, larger batches cut the
-/// per-batch merge, selection scan, and GTK splice count ~4x on large
-/// listings. Remote (GVfs) locations keep small batches so first paint
-/// doesn't wait out high per-file latency on slow links.
+/// Larger GIO batches cut per-batch merge, selection scan, and GTK splice
+/// cost on large listings; remote locations keep small batches for fast first paint.
 const NATIVE_DIRECTORY_BATCH_SIZE: usize = 512;
 const REMOTE_DIRECTORY_BATCH_SIZE: usize = 128;
 
@@ -69,9 +67,8 @@ pub enum BrowserEvent {
         depth: usize,
         count: usize,
     },
-    /// A contiguous range already installed in authoritative state. Views
-    /// borrow that range during synchronous dispatch instead of receiving a
-    /// deep clone of every entry.
+    /// A range already installed in authoritative state; views borrow it during
+    /// synchronous dispatch instead of receiving a deep clone.
     EntriesPublished {
         depth: usize,
         position: usize,
@@ -88,9 +85,7 @@ pub enum BrowserEvent {
         splices: Vec<EntrySplice>,
         selected: Option<usize>,
     },
-    /// Size/mtime arrivals for already-rendered rows: positions with their
-    /// refreshed entries, for an in-place same-count model refresh. The order
-    /// never changes here; sorting by size or date runs its own full pass.
+    /// Refreshed entries for already-rendered rows; the order never changes here.
     MetadataFilled {
         depth: usize,
         updates: Vec<(usize, FileEntry)>,
@@ -205,13 +200,9 @@ pub enum BrowserEvent {
     TransferCompleted,
 }
 
-/// Observers receive the event by reference during synchronous dispatch:
-/// listing payloads (`Vec<FileEntry>`) move exactly once from the provider
-/// into authoritative state and the single emitted event, and fan-out to
-/// every observer borrows instead of deep-cloning per observer. Consumers
-/// that retain data clone only the small field they store. The observer
-/// list itself is cloned before dispatch so add/remove/reentrant emission
-/// stays safe.
+/// Events dispatch by reference: payloads move once into authoritative state,
+/// observers borrow, and the observer list is cloned up front so reentrant
+/// emission stays safe.
 type Observer = Rc<dyn Fn(&BrowserEvent)>;
 type PreferencesObserver = Rc<dyn Fn(ViewPreferences)>;
 
@@ -286,54 +277,61 @@ const METADATA_FILL_TIME_BUDGET: Duration = Duration::from_secs(5);
 /// Defensive cap per depth: the UI only ever asks for its visible window.
 const MAX_PENDING_FILL_LOCATIONS: usize = 1024;
 
-/// Accumulates this many entries before flushing early: first paint applies
-/// at once, later batches merge, scan, and splice in groups of four.
-/// Remote loads only; native loads stage instead (see `StagingLoad`).
+/// Remote loads only (native loads stage instead): entries accumulate this far
+/// before an early flush bounds first-result latency.
 const COALESCE_ENTRIES: usize = 2048;
 /// Bounds one remote progressive flush: a slow link must not turn one timer
 /// fire into a multi-frame GTK mutation.
 const REMOTE_FLUSH_CAP: usize = 512;
-/// Maximum latency for remote progressive rows: later batches flush on the
-/// next idle/frame instead of waiting solely for the count threshold.
+/// Latency bound so later remote batches flush on the next idle/frame.
 const REMOTE_FLUSH_DELAY: Duration = Duration::from_millis(50);
 /// Rows published synchronously with a staged load or sort; the rest stream
 /// from idle callbacks inside an 8 ms work budget.
 const FIRST_PUBLISH_COUNT: usize = 128;
-/// Loads at or below this size publish in one synchronous replace.
 const STAGE_INLINE_LIMIT: usize = 512;
-/// Snapshots at or below this size sort synchronously on the calling
-/// thread: sub-millisecond work that needs no off-thread hop and no main
-/// context. Larger snapshots sort in a blocking worker.
+/// Snapshots at or below this size sort synchronously; larger ones sort in a
+/// blocking worker.
 const SORT_INLINE_LIMIT: usize = 2048;
-/// Rows per publication tail callback.
 const PUBLISH_TAIL_CHUNK: usize = 2048;
-/// Main-thread work budget per publication tail callback.
 const PUBLISH_SLICE_BUDGET: Duration = Duration::from_millis(8);
 
-/// Last selection event emitted per depth on the batch path, keyed by request
-/// so a new load re-emits even when it selects the same rows. Lets background
-/// batches skip the redundant per-pane selection refresh (and its scroll)
-/// when nothing moved.
+/// Last selection emitted per depth on the batch path, keyed by request so a
+/// new load re-emits; lets background batches skip redundant refreshes.
 type BatchSelectionState = HashMap<usize, (RequestId, Vec<usize>, usize)>;
 
-/// One bound row's viewport fill request: the stable location plus the source
-/// position it occupied when bound, so fills apply in O(requested rows)
-/// after validating the row has not moved.
+/// One bound row's fill request: stable location plus its source position, so
+/// fills apply after validating the row has not moved.
 struct ViewportTarget {
     position: usize,
     location: Location,
 }
 
-/// A native initial load in flight. Identity batches accumulate here with no
-/// merge walk and no UI events; monitor deltas arriving mid-stage queue for
-/// one reconcile instead of racing the snapshot. Removed locations filter
-/// later batches, so a removed entry is never resurrected by a stale batch
-/// while an upserted one still lands.
+/// Routing for one metadata request: own ids, validated against the owning
+/// directory request.
+struct ViewportFill {
+    depth: usize,
+    directory_request: RequestId,
+    tokens: Vec<(usize, Location)>,
+}
+
+#[derive(Clone, Copy)]
+struct SortFill {
+    generation: u64,
+    depth: usize,
+    fill_request: RequestId,
+    directory_request: RequestId,
+    preferences: ViewPreferences,
+}
+
+/// A native initial load in flight: batches accumulate with no merge walk and
+/// no UI events; monitor deltas queue for one reconcile, and removed locations
+/// filter later batches so stale batches never resurrect deleted entries.
 struct StagingLoad {
     request_id: RequestId,
     entries: Vec<FileEntry>,
     removed: HashSet<Location>,
     deltas: Vec<(Location, DirectoryChange)>,
+    metadata_incomplete: bool,
 }
 
 /// A native load sorting off-thread after enumeration finished. Deltas
@@ -343,18 +341,35 @@ struct SortingLoad {
     deltas: Vec<(Location, DirectoryChange)>,
 }
 
-/// Terminal event owed after a staged publication's final tail.
+#[derive(Clone, Copy)]
+struct SortPlan {
+    ordering_preferences: ViewPreferences,
+    staged_preferences: ViewPreferences,
+    retry_metadata: bool,
+}
+
 enum PublishTerminal {
-    LoadFinished { truncated: bool },
+    LoadFinished {
+        truncated: bool,
+        retry_metadata: bool,
+    },
     SortingFinished,
 }
 
-/// A staged publication streaming to the UI: the prefix is already in the
-/// model, and idle callbacks append contiguous tails inside a work budget.
-/// Chunks clone from authoritative state at fire time, so no full-vector
-/// copy ever crosses the publish path. Selection and the terminal event
-/// wait for the final tail, so no out-of-range selection and no premature
-/// completion is ever published.
+enum RemoteTerminal {
+    Finished {
+        request_id: RequestId,
+        truncated: bool,
+    },
+    Failed {
+        request_id: RequestId,
+        message: String,
+    },
+}
+
+/// A staged publication streaming to the UI: the prefix is already in the model,
+/// tails append from idle callbacks in a work budget, and selection plus the
+/// terminal event wait for the final tail.
 struct StagedPublish {
     request_id: RequestId,
     published: usize,
@@ -372,20 +387,18 @@ pub struct Browser {
     metadata_pending: RefCell<HashMap<usize, Vec<ViewportTarget>>>,
     metadata_timer: RefCell<Option<gio::glib::SourceId>>,
     staging: RefCell<HashMap<usize, StagingLoad>>,
-    /// Native loads whose snapshot is sorting off-thread. Monitor deltas
-    /// arriving mid-sort queue here for the same silent reconcile.
     sorting: RefCell<HashMap<usize, SortingLoad>>,
     staged_publishes: RefCell<HashMap<usize, StagedPublish>>,
     publish_timer: RefCell<Option<gio::glib::SourceId>>,
     remote_flush_timer: RefCell<Option<gio::glib::SourceId>>,
+    remote_terminals: RefCell<HashMap<usize, RemoteTerminal>>,
     metadata_loads: RefCell<HashMap<usize, LoadHandle>>,
-    /// Stable `(position, Location)` tokens per in-flight viewport fill, so
-    fill_tokens: RefCell<HashMap<RequestId, Vec<(usize, Location)>>>,
+    fill_tokens: RefCell<HashMap<RequestId, ViewportFill>>,
     /// Full-column sort fills, kept apart from viewport fills so a viewport
     /// settle timer can never overwrite or cancel an active full sort.
     sort_loads: RefCell<HashMap<usize, LoadHandle>>,
     coalesce_pending: RefCell<HashMap<usize, (RequestId, Vec<FileEntry>)>>,
-    sort_awaiting_fill: RefCell<Option<(u64, usize, RequestId, ViewPreferences)>>,
+    sort_awaiting_fill: RefCell<Option<SortFill>>,
     last_batch_selection: RefCell<BatchSelectionState>,
     peek_load: RefCell<Option<LoadHandle>>,
     validation_load: RefCell<Option<LoadHandle>>,
@@ -424,6 +437,7 @@ impl Browser {
             staged_publishes: RefCell::new(HashMap::new()),
             publish_timer: RefCell::new(None),
             remote_flush_timer: RefCell::new(None),
+            remote_terminals: RefCell::new(HashMap::new()),
             metadata_loads: RefCell::new(HashMap::new()),
             fill_tokens: RefCell::new(HashMap::new()),
             sort_loads: RefCell::new(HashMap::new()),
@@ -706,8 +720,7 @@ impl Browser {
                 browser.handle_directory_event(event);
             }
         });
-        // Peeks stay small and show metadata immediately, so they keep the
-        // old always-stat behavior instead of the streaming split.
+        // Peeks stay small and show metadata immediately, so they skip the streaming split.
         let handle = self.source.enumerate(
             DirectoryRequest {
                 id: request_id,
@@ -857,9 +870,8 @@ impl Browser {
                 return;
             };
             update(&mut preferences);
-            // Size and date sorts need the metadata the streaming
-            // enumeration skipped. Fill the whole column first behind the
-            // sort spinner instead of sorting placeholders.
+            // Size/date sorts need the metadata streaming enumeration skipped:
+            // fill the whole column first instead of sorting placeholders.
             let targets = state.column_unknown_metadata(depth).unwrap_or_default();
             if matches!(preferences.sort_key, SortKey::Size | SortKey::Modified)
                 && !targets.is_empty()
@@ -876,8 +888,6 @@ impl Browser {
         };
         self.notify_preferences_observers();
         if let Some((request_id, total, focused, positions)) = result {
-            // Staged publication carries the new order; the sorting
-            // terminal waits for its final tail.
             if let (Some(request_id), Some(total)) = (request_id, total) {
                 self.publish_staged(
                     depth,
@@ -1768,15 +1778,11 @@ impl Browser {
             .watch(location, self.preferences.get().show_hidden, notify)
     }
 
-    /// Merges one wire batch (or one coalesced group) and emits its UI
-    /// events: the single choke point behind immediate, coalesced, and
-    /// straggler application alike.
     fn apply_owned_batch(self: &Rc<Self>, request_id: RequestId, entries: Vec<FileEntry>) {
         let install_started = std::time::Instant::now();
         let mut state = self.state.borrow_mut();
         let batch_len = entries.len();
         let Some((depth, insertions)) = state.apply_batch(request_id, entries) else {
-            // The load went away between queueing and flush.
             return;
         };
         tracing::debug!(
@@ -1792,8 +1798,7 @@ impl Browser {
             install_started.elapsed().as_millis() as u64,
         );
         self.emit(BrowserEvent::EntriesInserted { depth, insertions });
-        // The full-column scan below is the most expensive per-batch work
-        // after the merge itself; skip it entirely when nothing is selected.
+        // The full-column scan is the most expensive per-batch work after the merge.
         if let Some(focused) = selected {
             let positions = self.state.borrow().selected_positions(depth);
             let current = (request_id, positions.clone(), focused);
@@ -1811,9 +1816,6 @@ impl Browser {
         }
     }
 
-    /// Stages one native wire batch: appended to the depth's staging load
-    /// with no merge walk and no UI events. Sorting, installation, and
-    /// publication all wait for enumeration to finish.
     fn stage_batch(self: &Rc<Self>, request_id: RequestId, depth: usize, entries: Vec<FileEntry>) {
         let mut staging = self.staging.borrow_mut();
         let slot = staging.entry(depth).or_insert_with(|| StagingLoad {
@@ -1821,16 +1823,15 @@ impl Browser {
             entries: Vec::new(),
             removed: HashSet::new(),
             deltas: Vec::new(),
+            metadata_incomplete: false,
         });
         if slot.request_id != request_id {
-            // A reload replaced the load mid-stream: the old staging
-            // belongs to a discarded load, so restart it instead of mixing
-            // generations.
             *slot = StagingLoad {
                 request_id,
                 entries,
                 removed: HashSet::new(),
                 deltas: Vec::new(),
+                metadata_incomplete: false,
             };
             return;
         }
@@ -1847,16 +1848,11 @@ impl Browser {
         depth: usize,
         entries: Vec<FileEntry>,
     ) {
-        // Remote loads only: a 50 ms timer bounds first-result latency so a
-        // slow link never waits solely for the count threshold.
         let mut pending = self.coalesce_pending.borrow_mut();
         let slot = pending
             .entry(depth)
             .or_insert_with(|| (request_id, Vec::new()));
         if slot.0 != request_id {
-            // A reload replaced the load mid-stream: the old accumulation
-            // belongs to a discarded load, so drop it instead of mixing
-            // generations.
             *slot = (request_id, Vec::new());
         }
         slot.1.extend(entries);
@@ -1869,15 +1865,12 @@ impl Browser {
         }
     }
 
-    /// Flushes coalesced remote batches, capped per depth per fire so one
-    /// timer fire never becomes a multi-frame GTK mutation. Leftovers stay
-    /// queued behind a re-armed timer.
     fn flush_coalesced_capped(self: &Rc<Self>, depth: Option<usize>) {
         let depths: Vec<usize> = match depth {
             Some(depth) => vec![depth],
             None => self.coalesce_pending.borrow().keys().copied().collect(),
         };
-        for depth in depths {
+        for &depth in &depths {
             self.drain_publish(depth);
             let chunk: Option<(RequestId, Vec<FileEntry>)> = self
                 .coalesce_pending
@@ -1905,6 +1898,39 @@ impl Browser {
         } else {
             self.arm_remote_flush_timer();
         }
+        for depth in depths {
+            self.finish_remote_if_drained(depth);
+        }
+    }
+
+    fn finish_remote_if_drained(self: &Rc<Self>, depth: usize) {
+        if self.coalesce_pending.borrow().contains_key(&depth) {
+            return;
+        }
+        let Some(terminal) = self.remote_terminals.borrow_mut().remove(&depth) else {
+            return;
+        };
+        match terminal {
+            RemoteTerminal::Finished {
+                request_id,
+                truncated,
+            } => {
+                let finished = self.state.borrow_mut().finish(request_id, truncated);
+                if let Some(depth) = finished {
+                    self.emit(BrowserEvent::LoadFinished { depth, truncated });
+                    self.ensure_sorted_after_load(depth);
+                }
+            }
+            RemoteTerminal::Failed {
+                request_id,
+                message,
+            } => {
+                let failed = self.state.borrow_mut().fail(request_id, message.clone());
+                if let Some(depth) = failed {
+                    self.emit(BrowserEvent::LoadFailed { depth, message });
+                }
+            }
+        }
     }
 
     fn arm_remote_flush_timer(self: &Rc<Self>) {
@@ -1914,8 +1940,7 @@ impl Browser {
         let weak: Weak<Self> = Rc::downgrade(self);
         let source = gio::glib::timeout_add_local_once(REMOTE_FLUSH_DELAY, move || {
             if let Some(browser) = weak.upgrade() {
-                // Spent: disarm before flushing, since the flush disarms an
-                // armed timer by removing it (a fired id refuses removal).
+                // Spent: disarm before flushing; a fired id refuses removal.
                 browser.remote_flush_timer.borrow_mut().take();
                 browser.flush_coalesced_capped(None);
             }
@@ -1923,9 +1948,8 @@ impl Browser {
         *self.remote_flush_timer.borrow_mut() = Some(source);
     }
 
-    /// Sorts a staged native snapshot off the main thread, then installs,
-    /// reconciles, and publishes it. The loading state stays up throughout:
-    /// no provisional list is ever exposed for a faster first row.
+    /// Sorts a staged snapshot off-thread, then installs, reconciles, and publishes
+    /// it with the loading state up throughout: no provisional list is exposed.
     fn finish_staged_load(self: &Rc<Self>, depth: usize, request_id: RequestId, truncated: bool) {
         let staging = self.staging.borrow_mut().remove(&depth);
         let Some(staging) = staging.filter(|staged| staged.request_id == request_id) else {
@@ -1939,47 +1963,76 @@ impl Browser {
         let removed = staging.removed;
         let mut entries = staging.entries;
         entries.retain(|entry| !removed.contains(&entry.location));
+        let retry_metadata = staging.metadata_incomplete
+            && matches!(preferences.sort_key, SortKey::Size | SortKey::Modified);
+        let ordering_preferences = if retry_metadata {
+            ViewPreferences {
+                sort_key: SortKey::Name,
+                ..preferences
+            }
+        } else {
+            preferences
+        };
         let deltas = staging.deltas;
         self.sorting
             .borrow_mut()
             .insert(depth, SortingLoad { request_id, deltas });
-        self.run_sort_task(depth, request_id, entries, preferences, truncated);
+        self.run_sort_task(
+            depth,
+            request_id,
+            entries,
+            SortPlan {
+                ordering_preferences,
+                staged_preferences: preferences,
+                retry_metadata,
+            },
+            truncated,
+        );
     }
 
-    /// Sorts a snapshot inline below the threshold, or in a blocking worker
-    /// above it with completion back on the main thread. Small sorts stay
-    /// synchronous (no context, no pump); large ones never block input.
+    /// Small snapshots sort synchronously; large ones sort in a blocking worker
+    /// with completion back on the main thread.
     fn run_sort_task(
         self: &Rc<Self>,
         depth: usize,
         request_id: RequestId,
         entries: Vec<FileEntry>,
-        preferences: ViewPreferences,
+        plan: SortPlan,
         truncated: bool,
     ) {
         if entries.len() <= SORT_INLINE_LIMIT {
-            let sorted = sort_entries(entries, preferences);
-            self.finish_staged_sort(depth, request_id, sorted, preferences, truncated);
+            let sorted = sort_entries(entries, plan.ordering_preferences);
+            self.finish_staged_sort(
+                depth,
+                request_id,
+                sorted,
+                plan.staged_preferences,
+                truncated,
+                plan.retry_metadata,
+            );
             return;
         }
         let weak: Weak<Self> = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
-            let sorted = gio::spawn_blocking(move || sort_entries(entries, preferences)).await;
+            let sorted =
+                gio::spawn_blocking(move || sort_entries(entries, plan.ordering_preferences)).await;
             let Some(browser) = weak.upgrade() else {
                 return;
             };
             match sorted {
-                Ok(sorted) => {
-                    browser.finish_staged_sort(depth, request_id, sorted, preferences, truncated)
-                }
+                Ok(sorted) => browser.finish_staged_sort(
+                    depth,
+                    request_id,
+                    sorted,
+                    plan.staged_preferences,
+                    truncated,
+                    plan.retry_metadata,
+                ),
                 Err(_) => browser.fail_staged_sort(depth, request_id),
             }
         });
     }
 
-    /// Installs a sorted staged snapshot, reconciles monitor deltas queued
-    /// while it sorted, and publishes. Drops everything when the load was
-    /// superseded mid-sort.
     fn finish_staged_sort(
         self: &Rc<Self>,
         depth: usize,
@@ -1987,6 +2040,7 @@ impl Browser {
         sorted: Vec<FileEntry>,
         staged_preferences: ViewPreferences,
         truncated: bool,
+        retry_metadata: bool,
     ) {
         let sorting = self.sorting.borrow_mut().remove(&depth);
         let Some(sorting) = sorting.filter(|sorting| sorting.request_id == request_id) else {
@@ -2003,10 +2057,8 @@ impl Browser {
         {
             return;
         }
-        // Reconcile silently: the UI model is still empty, so delta events
-        // would splice invalid positions. State converges first (in sort
-        // order, since reconciled inserts stay sorted), then one staged
-        // publication carries the reconciled order.
+        // Reconcile silently: the UI model is still empty, so delta events would
+        // splice invalid positions; one staged publication carries the result.
         for (watched, change) in sorting.deltas {
             if matches!(change, DirectoryChange::Rescan) {
                 continue;
@@ -2022,10 +2074,8 @@ impl Browser {
             .column_preferences(depth)
             .unwrap_or_else(|| self.preferences.get());
         if current != staged_preferences {
-            // Resorted mid-load: route through the standard metadata-aware
-            // sort path when fields are still missing, else re-sort
-            // off-thread with the current preferences. The loading terminal
-            // fires exactly once, on whichever path finishes the load.
+            // Resorted mid-load: re-sort with the current preferences; the loading
+            // terminal fires exactly once, on whichever path finishes the load.
             if matches!(current.sort_key, SortKey::Size | SortKey::Modified)
                 && self.state.borrow().column_unknown_metadata(depth).is_some()
             {
@@ -2058,12 +2108,13 @@ impl Browser {
             total,
             focused,
             positions,
-            PublishTerminal::LoadFinished { truncated },
+            PublishTerminal::LoadFinished {
+                truncated,
+                retry_metadata,
+            },
         );
     }
 
-    /// Re-sorts an installed column off-thread after a mid-load preference
-    /// change, then publishes the new order through the staged path.
     fn resort_installed_column(
         self: &Rc<Self>,
         depth: usize,
@@ -2087,12 +2138,20 @@ impl Browser {
                 deltas: Vec::new(),
             },
         );
-        self.run_sort_task(depth, request_id, entries, preferences, truncated);
+        self.run_sort_task(
+            depth,
+            request_id,
+            entries,
+            SortPlan {
+                ordering_preferences: preferences,
+                staged_preferences: preferences,
+                retry_metadata: false,
+            },
+            truncated,
+        );
     }
 
-    /// Fails a staged load whose sort task died: the column keeps its
-    /// loading state replaced by an error, exactly like a failed
-    /// enumeration, so no spinner hangs.
+    /// Fails a staged load whose sort task died, so no spinner hangs.
     fn fail_staged_sort(self: &Rc<Self>, depth: usize, request_id: RequestId) {
         self.sorting.borrow_mut().remove(&depth);
         let mut state = self.state.borrow_mut();
@@ -2108,11 +2167,9 @@ impl Browser {
         }
     }
 
-    /// Publishes an installed column in stages: the first viewport-sized
-    /// prefix replaces the model synchronously for fast first correct rows,
-    /// then contiguous tails stream from idle callbacks inside a work
-    /// budget so no publication callback exceeds a frame. Selection and the
-    /// terminal event wait for the final tail.
+    /// Publishes an installed column in stages: a synchronous prefix for fast first
+    /// rows, tails from idle callbacks in a work budget, and deferred selection
+    /// plus terminal on the final tail.
     fn publish_staged(
         self: &Rc<Self>,
         depth: usize,
@@ -2166,19 +2223,23 @@ impl Browser {
         self.arm_publish_timer();
     }
 
-    /// Emits a staged publication's terminal event.
-    fn emit_publish_terminal(&self, depth: usize, terminal: PublishTerminal) {
+    fn emit_publish_terminal(self: &Rc<Self>, depth: usize, terminal: PublishTerminal) {
         match terminal {
-            PublishTerminal::LoadFinished { truncated } => {
-                self.emit(BrowserEvent::LoadFinished { depth, truncated })
+            PublishTerminal::LoadFinished {
+                truncated,
+                retry_metadata,
+            } => {
+                self.emit(BrowserEvent::LoadFinished { depth, truncated });
+                if retry_metadata {
+                    self.ensure_sorted_after_load(depth);
+                }
             }
             PublishTerminal::SortingFinished => self.emit(BrowserEvent::SortingFinished { depth }),
         }
     }
 
-    /// Completes a staged publication synchronously: emits the remainder,
-    /// the deferred selection, and the terminal. Called before any mutation
-    /// that assumes the model converged with authoritative state.
+    /// Completes a staged publication synchronously before any mutation assuming a
+    /// converged model.
     fn drain_publish(self: &Rc<Self>, depth: usize) {
         let staged = self.staged_publishes.borrow_mut().remove(&depth);
         let Some(staged) = staged else {
@@ -2205,8 +2266,6 @@ impl Browser {
         self.emit_publish_terminal(depth, staged.terminal);
     }
 
-    /// Drops a staged publication without emitting: the model and state are
-    /// both being reset, so nothing is owed.
     fn cancel_publish(&self, depth: usize) {
         self.staged_publishes.borrow_mut().remove(&depth);
         if self.staged_publishes.borrow().is_empty()
@@ -2221,20 +2280,17 @@ impl Browser {
             return;
         }
         let weak: Weak<Self> = Rc::downgrade(self);
-        // Idle priority: tails yield to input, paint, and higher-priority
-        // sources, streaming rows behind an interactive UI.
-        let source = gio::glib::idle_add_local_once(move || {
+        // Run after GDK redraw (priority 120), but before default idle (200):
+        // frames stay smooth without letting continuous frame work starve tails.
+        let source = gio::glib::idle_add_local_full(glib::Priority::from(130), move || {
             if let Some(browser) = weak.upgrade() {
                 browser.fire_publish_tails();
             }
+            glib::ControlFlow::Break
         });
         *self.publish_timer.borrow_mut() = Some(source);
     }
 
-    /// Appends one bounded tail chunk per staged depth, then the deferred
-    /// selection and terminal for depths that complete. Stops after the
-    /// slice budget so sustained publishing never starves the main loop.
-    /// Tails whose load was superseded drop without emitting.
     fn fire_publish_tails(self: &Rc<Self>) {
         self.publish_timer.borrow_mut().take();
         let started = std::time::Instant::now();
@@ -2250,7 +2306,6 @@ impl Browser {
                 .map(|staged| staged.request_id);
             if current.is_some_and(|id| self.state.borrow().request_id_for_depth(depth) != Some(id))
             {
-                // Superseded mid-publish: drop without emitting.
                 self.staged_publishes.borrow_mut().remove(&depth);
                 continue;
             }
@@ -2271,7 +2326,6 @@ impl Browser {
                     })
                 });
             let Some((position, chunk)) = chunk else {
-                // The column went away mid-publish: drop the tail.
                 self.staged_publishes.borrow_mut().remove(&depth);
                 continue;
             };
@@ -2307,9 +2361,8 @@ impl Browser {
         position: usize,
         location: Location,
     ) {
-        // Ask the provider what it supports instead of rejecting remote
-        // locations owner-side: remote and GVfs fills stay on cancellable
-        // GIO, and unsupported sources simply answer `Unsupported`.
+        // Defer to the provider instead of rejecting remote locations owner-side:
+        // unsupported sources answer `Unsupported`.
         if !self.source.supports_metadata_fill(&location) {
             return;
         }
@@ -2322,8 +2375,6 @@ impl Browser {
                 queued.push(ViewportTarget { position, location });
             }
         }
-        // True settle timer: every newly visible row restarts the debounce,
-        // so a continuous fling never fires mid-scroll for stale rows.
         if let Some(source) = self.metadata_timer.borrow_mut().take() {
             source.remove();
         }
@@ -2336,8 +2387,6 @@ impl Browser {
         *self.metadata_timer.borrow_mut() = Some(source);
     }
 
-    /// Stats a whole column for a size/date sort behind the sort spinner,
-    /// then sorts once the pass lands.
     fn request_sort_fill(
         self: &Rc<Self>,
         depth: usize,
@@ -2345,14 +2394,19 @@ impl Browser {
         preferences: ViewPreferences,
         targets: Vec<(usize, Location)>,
     ) {
-        let Some(request_id) = self.state.borrow().request_id_for_depth(depth) else {
+        let Some(directory_request) = self.state.borrow().request_id_for_depth(depth) else {
             self.pending_sort.set(None);
             self.emit(BrowserEvent::SortingFinished { depth });
             return;
         };
-        self.sort_awaiting_fill
-            .borrow_mut()
-            .replace((generation, depth, request_id, preferences));
+        let fill_request = self.new_request_id();
+        self.sort_awaiting_fill.borrow_mut().replace(SortFill {
+            generation,
+            depth,
+            fill_request,
+            directory_request,
+            preferences,
+        });
         let weak: Weak<Self> = Rc::downgrade(self);
         let emit = Rc::new(move |event| {
             if let Some(browser) = weak.upgrade() {
@@ -2361,14 +2415,21 @@ impl Browser {
         });
         let handle = self.source.fill_metadata(
             MetadataRequest {
-                id: request_id,
+                id: fill_request,
                 entries: targets.into_iter().map(|(_, location)| location).collect(),
                 full: true,
                 time_budget: DIRECTORY_LOAD_TIME_BUDGET,
             },
             emit,
         );
-        self.sort_loads.borrow_mut().insert(depth, handle);
+        if self
+            .sort_awaiting_fill
+            .borrow()
+            .as_ref()
+            .is_some_and(|fill| fill.fill_request == fill_request)
+        {
+            self.sort_loads.borrow_mut().insert(depth, handle);
+        }
     }
 
     fn finish_awaited_sort(
@@ -2410,44 +2471,31 @@ impl Browser {
             }
         }
     }
-    /// `Complete`; any other outcome abandons the sort without reordering so
-    /// a partial pass is never published as correct. Viewport fills need no
-    /// outcome handling beyond dropping their handle: unfilled rows keep
-    /// their placeholders and retry on their next bind.
+    /// Only `Complete` sorts: a partial pass is never published as correct, and
+    /// unfilled rows keep placeholders for their next bind.
     fn handle_metadata_finished(self: &Rc<Self>, request_id: RequestId, outcome: MetadataOutcome) {
         let awaiting = *self.sort_awaiting_fill.borrow();
-        if let Some((generation, depth, fill_request, preferences)) = awaiting
-            && fill_request == request_id
+        if let Some(awaiting) = awaiting
+            && awaiting.fill_request == request_id
         {
-            self.sort_loads.borrow_mut().remove(&depth);
+            self.sort_loads.borrow_mut().remove(&awaiting.depth);
             if outcome == MetadataOutcome::Complete
-                && self.pending_sort.get() == Some((generation, depth))
+                && self.pending_sort.get() == Some((awaiting.generation, awaiting.depth))
             {
-                self.finish_awaited_sort(depth, generation, preferences);
+                self.finish_awaited_sort(awaiting.depth, awaiting.generation, awaiting.preferences);
             } else {
-                self.abandon_awaited_sort(depth, generation, outcome);
+                self.abandon_awaited_sort(awaiting.depth, awaiting.generation, outcome);
             }
             return;
         }
-        // A viewport fill (or a superseded sort fill) ending: drop its
-        // handle. A superseded sort whose column reloaded already had its
-        // indicator closed by the reload path; belt-and-braces abandon here
-        // in case the reload raced the terminal.
-        if let Some(depth) = self.state.borrow().depth_for_request(request_id) {
-            self.metadata_loads.borrow_mut().remove(&depth);
-        }
-        if let Some((generation, depth, _, _)) = awaiting
-            && self.state.borrow().depth_for_request(request_id).is_none()
-            && self.pending_sort.get() == Some((generation, depth))
-        {
-            self.abandon_awaited_sort(depth, generation, outcome);
+        // Only a fill's own id releases its handle; terminals from superseded fills
+        // cannot affect a sort or a newer request.
+        if let Some(fill) = self.fill_tokens.borrow_mut().remove(&request_id) {
+            self.metadata_loads.borrow_mut().remove(&fill.depth);
         }
     }
 
-    /// Abandons a waiting sort after a non-complete fill: the prior correct
-    /// order is preserved, the indicator stops, and the failure is logged so
-    /// a re-sort retry starts from clean state. Every `SortingStarted` still
-    /// pairs with exactly one `SortingFinished`.
+    /// Every `SortingStarted` still pairs with exactly one `SortingFinished`.
     fn abandon_awaited_sort(&self, depth: usize, generation: u64, outcome: MetadataOutcome) {
         self.sort_awaiting_fill.borrow_mut().take();
         self.sort_loads.borrow_mut().remove(&depth);
@@ -2465,10 +2513,10 @@ impl Browser {
     }
     fn cancel_pending_sort_for(&self, depth: usize) {
         let awaiting = *self.sort_awaiting_fill.borrow();
-        if let Some((generation, awaiting_depth, _, _)) = awaiting
-            && awaiting_depth == depth
+        if let Some(awaiting) = awaiting
+            && awaiting.depth == depth
         {
-            self.abandon_awaited_sort(depth, generation, MetadataOutcome::Cancelled);
+            self.abandon_awaited_sort(depth, awaiting.generation, MetadataOutcome::Cancelled);
             return;
         }
         self.sort_loads.borrow_mut().remove(&depth);
@@ -2477,15 +2525,11 @@ impl Browser {
             .get()
             .is_some_and(|(_, pending_depth)| pending_depth == depth)
         {
-            // Sort debounce armed but its fill never started: no provider
-            // work to cancel, just close the indicator.
             self.pending_sort.set(None);
             self.emit(BrowserEvent::SortingFinished { depth });
         }
     }
 
-    /// Drops everything deferred for columns at or beyond `len`: viewport
-    /// truncation, navigation, reload, and close path.
     fn truncate_deferred_from(self: &Rc<Self>, len: usize) {
         if let Some(source) = self.metadata_timer.borrow_mut().take() {
             source.remove();
@@ -2493,7 +2537,6 @@ impl Browser {
         self.metadata_pending
             .borrow_mut()
             .retain(|depth, _| *depth < len);
-        // Re-arm the settle timer when younger depths still queue fills.
         if !self.metadata_pending.borrow().is_empty() {
             let weak: Weak<Self> = Rc::downgrade(self);
             let source = gio::glib::timeout_add_local_once(METADATA_FILL_DEBOUNCE, move || {
@@ -2507,27 +2550,31 @@ impl Browser {
             .borrow_mut()
             .retain(|depth, _| *depth < len);
         let state = self.state.borrow();
-        self.fill_tokens.borrow_mut().retain(|request_id, _| {
-            state
-                .depth_for_request(*request_id)
-                .is_some_and(|depth| depth < len)
+        self.fill_tokens.borrow_mut().retain(|_, fill| {
+            fill.depth < len
+                && state.request_id_for_depth(fill.depth) == Some(fill.directory_request)
         });
         let awaiting = *self.sort_awaiting_fill.borrow();
-        if let Some((generation, depth, _, _)) = awaiting
-            && depth >= len
+        if let Some(awaiting) = awaiting
+            && awaiting.depth >= len
         {
-            self.abandon_awaited_sort(depth, generation, MetadataOutcome::Cancelled);
+            self.abandon_awaited_sort(
+                awaiting.depth,
+                awaiting.generation,
+                MetadataOutcome::Cancelled,
+            );
         } else {
             self.sort_loads.borrow_mut().retain(|depth, _| *depth < len);
         }
         self.coalesce_pending
             .borrow_mut()
             .retain(|depth, _| *depth < len);
+        self.remote_terminals
+            .borrow_mut()
+            .retain(|depth, _| *depth < len);
         self.last_batch_selection
             .borrow_mut()
             .retain(|depth, _| *depth < len);
-        // Staged loads and sorts die with their columns; staged publishes
-        // cancel without emitting, since both model and state reset.
         self.staging.borrow_mut().retain(|depth, _| *depth < len);
         self.sorting.borrow_mut().retain(|depth, _| *depth < len);
         self.staged_publishes
@@ -2540,8 +2587,6 @@ impl Browser {
         }
     }
 
-    /// Re-sorts a freshly loaded column whose sort key needs metadata the
-    /// streaming enumeration skipped. Name and type sorts never land here.
     fn ensure_sorted_after_load(self: &Rc<Self>, depth: usize) {
         let (needs, preferences) = {
             let state = self.state.borrow();
@@ -2578,11 +2623,10 @@ impl Browser {
         let pending: Vec<(usize, Vec<ViewportTarget>)> =
             self.metadata_pending.borrow_mut().drain().collect();
         for (depth, targets) in pending {
-            // Refresh the load identity: the column may have reloaded while
-            // these rows queued, and a superseded fill must not apply.
-            let Some(request_id) = self.state.borrow().request_id_for_depth(depth) else {
+            let Some(directory_request) = self.state.borrow().request_id_for_depth(depth) else {
                 continue;
             };
+            let fill_request = self.new_request_id();
             let weak: Weak<Self> = Rc::downgrade(self);
             let emit = Rc::new(move |event| {
                 if let Some(browser) = weak.upgrade() {
@@ -2593,27 +2637,37 @@ impl Browser {
                 .iter()
                 .map(|target| (target.position, target.location.clone()))
                 .collect();
-            // Stored before the provider runs: synchronous fills answer
-            // inside the call, and their chunks join against these tokens.
-            self.fill_tokens.borrow_mut().insert(request_id, tokens);
+            // Stored before the provider runs: synchronous fills answer inside the call.
+            self.fill_tokens
+                .borrow_mut()
+                .retain(|_, fill| fill.depth != depth);
+            self.metadata_loads.borrow_mut().remove(&depth);
+            self.fill_tokens.borrow_mut().insert(
+                fill_request,
+                ViewportFill {
+                    depth,
+                    directory_request,
+                    tokens,
+                },
+            );
             let handle = self.source.fill_metadata(
                 MetadataRequest {
-                    id: request_id,
+                    id: fill_request,
                     entries: targets.into_iter().map(|target| target.location).collect(),
                     full: false,
                     time_budget: METADATA_FILL_TIME_BUDGET,
                 },
                 emit,
             );
-            self.metadata_loads.borrow_mut().insert(depth, handle);
+            if self.fill_tokens.borrow().contains_key(&fill_request) {
+                self.metadata_loads.borrow_mut().insert(depth, handle);
+            }
         }
     }
 
-    /// Drops everything a discarded load queued: metadata fills and
-    /// coalesced batches alike. Coalesced rows are safe to drop because
-    /// every site that clears loads replaces the data source wholesale.
-    /// A pending sort's indicator closes here: its fill handle is dropped,
-    /// which aborts provider work without a terminal event.
+    /// Drops everything a discarded load queued. Coalesced rows are safe to drop
+    /// because every site that clears loads replaces the data source wholesale;
+    /// dropping a sort's fill handle aborts provider work without a terminal event.
     fn cancel_deferred_work(&self) {
         if let Some(source) = self.metadata_timer.borrow_mut().take() {
             source.remove();
@@ -2622,20 +2676,21 @@ impl Browser {
         self.metadata_loads.borrow_mut().clear();
         self.fill_tokens.borrow_mut().clear();
         let awaiting = self.sort_awaiting_fill.borrow_mut().take();
-        if let Some((generation, depth, _, _)) = awaiting {
-            self.abandon_awaited_sort(depth, generation, MetadataOutcome::Cancelled);
+        if let Some(awaiting) = awaiting {
+            self.abandon_awaited_sort(
+                awaiting.depth,
+                awaiting.generation,
+                MetadataOutcome::Cancelled,
+            );
         } else {
             self.sort_loads.borrow_mut().clear();
             if let Some((_, depth)) = self.pending_sort.take() {
-                // Sort debounce armed but its fill never started.
                 self.emit(BrowserEvent::SortingFinished { depth });
             }
         }
         self.coalesce_pending.borrow_mut().clear();
+        self.remote_terminals.borrow_mut().clear();
         self.last_batch_selection.borrow_mut().clear();
-        // Staged snapshots, in-flight sorts, and staged publications die
-        // with their loads: late completions find no staging entry and a
-        // retired request id, so they publish nothing.
         self.staging.borrow_mut().clear();
         self.sorting.borrow_mut().clear();
         self.staged_publishes.borrow_mut().clear();
@@ -2664,10 +2719,8 @@ impl Browser {
         } else {
             REMOTE_DIRECTORY_BATCH_SIZE
         };
-        // Loads sorted by size or date stat inline: the column's own key
-        // decides, falling back to the application preference for columns
-        // that do not exist yet. Sorting placeholders and re-sorting a full
-        // directory afterwards costs more than one stat per file up front.
+        // Size/date loads stat inline: sorting placeholders and re-sorting afterwards
+        // costs more than one stat per file up front.
         let sort_key = self
             .state
             .borrow()
@@ -2783,18 +2836,15 @@ impl Browser {
         self.metadata_loads.borrow_mut().remove(&depth);
         self.metadata_pending.borrow_mut().remove(&depth);
         self.coalesce_pending.borrow_mut().remove(&depth);
+        self.remote_terminals.borrow_mut().remove(&depth);
         self.last_batch_selection.borrow_mut().remove(&depth);
         self.cancel_pending_sort_for(depth);
-        // The retired load's staging, sort, and publication die with it;
-        // late completions find a retired request id and publish nothing.
         self.staging.borrow_mut().remove(&depth);
         self.sorting.borrow_mut().remove(&depth);
         self.cancel_publish(depth);
-        // Tokens belong to live loads: the retired request id no longer
-        // resolves, so its tokens drop here instead of leaking.
-        self.fill_tokens
-            .borrow_mut()
-            .retain(|request_id, _| self.state.borrow().depth_for_request(*request_id).is_some());
+        self.fill_tokens.borrow_mut().retain(|_, fill| {
+            self.state.borrow().request_id_for_depth(fill.depth) == Some(fill.directory_request)
+        });
     }
 
     pub fn reload_active(self: &Rc<Self>) {
@@ -2849,9 +2899,6 @@ impl Browser {
         });
     }
 
-    /// Depth and nativeness of a column load, if `request_id` still owns
-    /// one. Nativeness splits publication policy: native loads stage and
-    /// sort once, remote loads stream progressively.
     fn load_target(&self, request_id: RequestId) -> Option<(usize, bool)> {
         let state = self.state.borrow();
         let depth = state.depth_for_request(request_id)?;
@@ -2869,11 +2916,6 @@ impl Browser {
             self.refresh_column(depth);
             return;
         }
-        // A staged or sorting load owns no published rows yet: queue the
-        // delta for the completion's single reconcile instead of racing the
-        // snapshot. Removed locations also filter staged batches so a late
-        // batch never resurrects them; an upserted location leaves the set
-        // so recreations still land.
         if let Some(staging) = self.staging.borrow_mut().get_mut(&depth) {
             match &change {
                 DirectoryChange::Remove(location) => {
@@ -2895,8 +2937,8 @@ impl Browser {
             sorting.deltas.push((watched.clone(), change));
             return;
         }
-        // A staged publication covers a converged model again first: deltas
-        // splice positions that only exist past the tails.
+        // A staged publication converges the model first: deltas splice positions
+        // that only exist past the tails.
         self.drain_publish(depth);
         let path_update = self
             .state
@@ -2938,9 +2980,6 @@ impl Browser {
                 request_id,
                 entries,
             } => {
-                // Native open loads stage identity batches with no merge
-                // walk and no UI events; everything else stays progressive
-                // (remote first paint, peek batches, stragglers).
                 let target = self.load_target(request_id);
                 let open = self.state.borrow().open_load_depth(request_id);
                 match (target, open) {
@@ -2984,11 +3023,8 @@ impl Browser {
                 request_id,
                 truncated,
             } => {
-                // A staged native load sorts off-thread and publishes
-                // staged; everything else lands coalesced rows first, then
-                // closes the load. Bound to a variable first: an if-let
-                // scrutinee borrow would stay live across the flush and
-                // panic inside it.
+                // Bound to a variable first: an if-let scrutinee borrow would stay live
+                // across the flush and panic inside it.
                 let target = self.load_target(request_id);
                 let open = self.state.borrow().open_load_depth(request_id);
                 match (target, open) {
@@ -2997,16 +3033,14 @@ impl Browser {
                         self.finish_staged_load(depth, request_id, truncated);
                     }
                     (Some((depth, _)), Some(_)) => {
+                        self.remote_terminals.borrow_mut().insert(
+                            depth,
+                            RemoteTerminal::Finished {
+                                request_id,
+                                truncated,
+                            },
+                        );
                         self.flush_coalesced_capped(Some(depth));
-                        let mut state = self.state.borrow_mut();
-                        if let Some(depth) = state.finish(request_id, truncated) {
-                            drop(state);
-                            self.emit(BrowserEvent::LoadFinished { depth, truncated });
-                            // A column sorted by size or date loaded
-                            // placeholders; stat the column and sort once
-                            // the pass lands.
-                            self.ensure_sorted_after_load(depth);
-                        }
                     }
                     _ => {
                         let mut state = self.state.borrow_mut();
@@ -3017,21 +3051,36 @@ impl Browser {
                     }
                 }
             }
+            DirectoryEvent::MetadataIncomplete { request_id } => {
+                let target = self.load_target(request_id);
+                let open = self.state.borrow().open_load_depth(request_id);
+                if let Some((depth, true)) = target.filter(|_| open.is_some()) {
+                    self.stage_batch(request_id, depth, Vec::new());
+                    if let Some(staging) = self.staging.borrow_mut().get_mut(&depth) {
+                        staging.metadata_incomplete = true;
+                    }
+                }
+            }
             DirectoryEvent::Failed {
                 request_id,
                 message,
             } => {
-                // Staged and sorting loads die with the enumeration: drop
-                // their state so no late sort can publish, then follow the
-                // standard failure path.
                 let target = self.load_target(request_id);
                 let open = self.state.borrow().open_load_depth(request_id);
                 if let Some((depth, true)) = target.filter(|_| open.is_some()) {
                     self.staging.borrow_mut().remove(&depth);
                     self.sorting.borrow_mut().remove(&depth);
                     self.cancel_publish(depth);
-                } else if let Some((depth, _)) = target {
+                } else if let Some((depth, false)) = target.filter(|_| open.is_some()) {
+                    self.remote_terminals.borrow_mut().insert(
+                        depth,
+                        RemoteTerminal::Failed {
+                            request_id,
+                            message,
+                        },
+                    );
                     self.flush_coalesced_capped(Some(depth));
+                    return;
                 }
                 let mut state = self.state.borrow_mut();
                 if let Some(depth) = state.fail(request_id, message.clone()) {
@@ -3046,16 +3095,19 @@ impl Browser {
                 request_id,
                 updates,
             } => {
-                // Full sort fills apply by location: the column is about to
-                // be re-sorted wholesale, so positional tokens would only add
+                // Full sort fills apply by location: positional tokens would only add
                 // validation churn to an already O(n log n) path.
                 let awaiting_sort = self
                     .sort_awaiting_fill
                     .borrow()
-                    .is_some_and(|(_, _, fill_id, _)| fill_id == request_id);
-                if awaiting_sort {
+                    .as_ref()
+                    .copied()
+                    .filter(|fill| fill.fill_request == request_id);
+                if let Some(awaiting) = awaiting_sort {
                     let mut state = self.state.borrow_mut();
-                    if let Some((depth, positions)) = state.apply_metadata(request_id, updates) {
+                    if let Some((depth, positions)) =
+                        state.apply_metadata(awaiting.directory_request, updates)
+                    {
                         let filled = filled_entries(&state, depth, &positions);
                         tracing::debug!(
                             request_id = request_id.0,
@@ -3069,17 +3121,14 @@ impl Browser {
                             updates: filled,
                         });
                     }
-                    // Sorts wait for the fill's terminal outcome, never for a
-                    // chunk: sorting here would publish a partially statted
-                    // column as correctly ordered.
                     return;
                 }
-                // Viewport fills apply in O(requested rows) against the
-                // tokens captured at bind time. Rows that moved under the
-                // fill go stale and keep their placeholders; their next bind
-                // re-requests them, so only stale rows retry.
-                let tokens = self.fill_tokens.borrow().get(&request_id).cloned();
-                let Some(tokens) = tokens else {
+                let fill = self
+                    .fill_tokens
+                    .borrow()
+                    .get(&request_id)
+                    .map(|fill| (fill.directory_request, fill.tokens.clone()));
+                let Some((directory_request, tokens)) = fill else {
                     return;
                 };
                 let token_positions: HashMap<&Location, usize> = tokens
@@ -3094,7 +3143,7 @@ impl Browser {
                 }
                 let mut state = self.state.borrow_mut();
                 if let Some((depth, positions, stale)) =
-                    state.apply_positioned_metadata(request_id, positioned)
+                    state.apply_positioned_metadata(directory_request, positioned)
                 {
                     let filled = filled_entries(&state, depth, &positions);
                     tracing::debug!(
@@ -3117,7 +3166,6 @@ impl Browser {
                 request_id,
                 outcome,
             } => {
-                self.fill_tokens.borrow_mut().remove(&request_id);
                 self.handle_metadata_finished(request_id, outcome);
             }
         }
@@ -3137,7 +3185,6 @@ impl Browser {
     }
 }
 
-/// Clones the freshly filled entries for a view refresh payload.
 fn filled_entries(
     state: &NavigationState,
     depth: usize,

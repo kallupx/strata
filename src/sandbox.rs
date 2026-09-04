@@ -235,18 +235,14 @@ fn spawn_renderer(command: &mut Command) -> io::Result<Child> {
     command.process_group(0).spawn()
 }
 
-/// Opens a pidfd for prompt child-exit wakeups. `None` on kernels without
-/// pidfd support: both wait loops fall back to interval polling.
+/// `None` on kernels without pidfd support; wait loops fall back to interval polling.
 fn child_pidfd(child: &Child) -> Option<rustix::fd::OwnedFd> {
     let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).ok()?)?;
     rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).ok()
 }
 
-/// Sleeps until the child exits, the deadline passes, or a cancellation
-/// quantum elapses. A pidfd wakes the instant the child exits instead of up
-/// to a poll interval later; poll errors degrade to a short sleep and the
-/// loop's re-check, and the deadline bounds every path, so no syscall
-/// failure can spin, stall, or turn into a successful decoder verdict.
+/// A pidfd wakes on child exit; poll errors degrade to a short sleep, and the
+/// deadline bounds every path.
 fn wait_step(pidfd: Option<&rustix::fd::OwnedFd>, deadline: Instant) {
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
     let remaining = deadline.saturating_duration_since(Instant::now());

@@ -389,10 +389,6 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
             update_area.set_visible(false);
         }
     });
-    // The settings shell builds on first open, never during startup: even
-    // the cheap pages are widgets the user may never need, and the heavy
-    // pages (Updates detection, release notes, theme swatches) build on
-    // first selection from there.
     let settings_layer: Rc<RefCell<Option<gtk::Box>>> = Rc::new(RefCell::new(None));
     let ensure_settings_layer = {
         let browser = browser.clone();
@@ -464,18 +460,13 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
     install_modal_focus_trap(&window);
     install_keyboard_navigation(&window, &browser, &sidebar, &sidebar_toggle, &preview);
     let browser_controller = browser.browser();
-    schedule_sidebar_devices(&sidebar);
+    schedule_after_first_paint(&window, &sidebar);
     window.connect_destroy(move |_| {
         browser_controller.clear_observer();
         sidebar.disconnect();
     });
-    // Present before navigating: the window maps while the directory streams
-    // in behind the loading state, instead of holding first paint for
-    // validation and enumeration. Navigation runs from idle so mapping and
-    // the first frame are never queued behind enumeration setup.
     window.present();
     crate::metrics::mark_window_presented();
-    crate::metrics::mark_first_themed_frame();
     let pending_location = location.unwrap_or_else(home_directory);
     let idle_browser = browser.clone();
     glib::idle_add_local_once(move || {
@@ -489,20 +480,32 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
     schedule_due_update_check(&theme_manager, &update_notice);
 }
 
-/// Populates dynamic sidebar volumes and mounts after the first painted
-/// frame, on idle. Static places render synchronously with the shell;
-/// devices append at the end later, so focus and layout never jump.
-fn schedule_sidebar_devices(sidebar: &SidebarView) {
+fn schedule_after_first_paint(window: &gtk::ApplicationWindow, sidebar: &SidebarView) {
     let state = sidebar.state.clone();
-    glib::idle_add_local_once(move || {
-        state.rebuild();
+    let armed = Cell::new(false);
+    window.connect_map(move |window| {
+        if armed.get() {
+            return;
+        }
+        let Some(clock) = window.frame_clock() else {
+            return;
+        };
+        armed.set(true);
+        let handler = Rc::new(RefCell::new(None));
+        let handler_for_paint = handler.clone();
+        let state = state.clone();
+        let id = clock.connect_after_paint(move |clock| {
+            if let Some(id) = handler_for_paint.borrow_mut().take() {
+                clock.disconnect(id);
+            }
+            crate::metrics::mark_first_themed_frame();
+            let state = state.clone();
+            glib::idle_add_local_once(move || state.rebuild());
+        });
+        handler.replace(Some(id));
     });
 }
 
-/// Schedules the process-wide due update check: eight seconds after mapping
-/// so it never competes with first paint, then on idle so it never steals
-/// input. A due online notice normally lands within about ten seconds after
-/// initial load. See `settings::maybe_run_due_update_check`.
 fn schedule_due_update_check(
     manager: &Rc<ThemeManager>,
     notice: &super::settings::UpdateNoticeHandler,
@@ -1248,8 +1251,6 @@ impl SidebarState {
         self.sync_active_place();
     }
 
-    /// Renders every static place without touching the volume monitor:
-    /// safe to run synchronously with the shell during startup.
     fn append_static_places(self: &Rc<Self>) {
         self.append_place(
             crate::assets::icons::HOME,
@@ -1290,10 +1291,6 @@ impl SidebarState {
         }
     }
 
-    /// Enumerates volumes and mounts. Deferred past the first painted frame
-    /// on idle: volume enumeration can block on remote backends, and the
-    /// DEVICES section appends at the end, so late population never moves
-    /// focus or existing rows.
     fn append_devices(self: &Rc<Self>) {
         let volumes = self.volume_monitor.volumes();
         let mounts: Vec<_> = self
@@ -1338,8 +1335,6 @@ impl SidebarState {
             self.rebuild();
         }
     }
-    /// Whether a browser event can change the active location or place.
-    /// Pure so the fan-out gate stays unit-testable without widgets.
     fn event_changes_active_place(event: &BrowserEvent) -> bool {
         matches!(
             event,
@@ -2038,9 +2033,6 @@ fn build_sidebar(view: BrowserView, theme_manager: Rc<super::theme::ThemeManager
 
     let weak = Rc::downgrade(&state);
     state.browser.observe(move |event| {
-        // The active place follows the active location only: batch,
-        // metadata, sort-progress, and operation traffic never moves it,
-        // so syncing on every event is pure overhead per listing batch.
         if !SidebarState::event_changes_active_place(event) {
             return;
         }
@@ -2086,9 +2078,6 @@ fn build_sidebar(view: BrowserView, theme_manager: Rc<super::theme::ThemeManager
             state.rebuild();
         }
     }));
-    // Static places render with the shell; dynamic volumes arrive on idle
-    // after the first frame (see `schedule_sidebar_devices`), so volume
-    // enumeration never blocks first paint.
     state.append_static_places();
     state.sync_active_place();
     SidebarView {
