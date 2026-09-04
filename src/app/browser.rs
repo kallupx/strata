@@ -2993,6 +2993,7 @@ impl Browser {
                 let open = self.state.borrow().open_load_depth(request_id);
                 match (target, open) {
                     (Some((depth, true)), Some(_)) => {
+                        self.stage_batch(request_id, depth, Vec::new());
                         self.finish_staged_load(depth, request_id, truncated);
                     }
                     (Some((depth, _)), Some(_)) => {

@@ -2837,6 +2837,28 @@ fn native_initial_load_publishes_sorted_once() {
 }
 
 #[test]
+fn empty_native_initial_load_finishes_without_a_batch() {
+    let (browser, events, source) = scripted_browser(ScriptedSource::manual(vec![], vec![]));
+    browser.navigate(Location::local("/fixture"));
+    let (request_id, emit) = source.enumerate_calls.borrow()[0].clone();
+
+    emit(DirectoryEvent::Finished {
+        request_id,
+        truncated: false,
+    });
+
+    assert_eq!(replaced_count(&events), 1);
+    assert!(column_names(&browser, 0).is_empty());
+    assert!(events.borrow().iter().any(|event| matches!(
+        event,
+        BrowserEvent::LoadFinished {
+            depth: 0,
+            truncated: false
+        }
+    )));
+}
+
+#[test]
 fn staged_load_reconciles_monitor_deltas_without_resurrection() {
     let (browser, events, source) = scripted_browser(ScriptedSource::manual(vec![], vec![]));
     browser.navigate(Location::local("/fixture"));
