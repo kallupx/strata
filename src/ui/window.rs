@@ -24,6 +24,7 @@ use super::{
     motion::{animations_enabled, emphasized_deceleration},
     preview::PreviewDrawer,
     search::SearchDialog,
+    theme::ThemeManager,
 };
 
 const SIDEBAR_WIDTH: i32 = 208;
@@ -51,9 +52,14 @@ pub fn present(application: &gtk::Application) {
 }
 
 pub fn present_location(application: &gtk::Application, location: Option<PathBuf>) {
+    let present_started = std::time::Instant::now();
     crate::assets::register_icon_theme();
     let theme_manager = super::theme::ThemeManager::shared();
     load_styles();
+    tracing::debug!(
+        elapsed_ms = present_started.elapsed().as_millis() as u64,
+        "present theme and styles ready"
+    );
 
     let window = gtk::ApplicationWindow::builder()
         .application(application)
@@ -77,14 +83,14 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
     let preview_for_selection = preview.clone();
     let weak_controller = Rc::downgrade(&controller);
     controller.observe(move |event| match event {
-        BrowserEvent::PreviewRequested { entry } => preview_for_selection.show(entry),
+        BrowserEvent::PreviewRequested { entry } => preview_for_selection.show(entry.clone()),
         BrowserEvent::FocusChanged {
             depth,
             position: Some(position),
         } if preview_for_selection.is_open() => {
             if let Some(entry) = weak_controller
                 .upgrade()
-                .and_then(|browser| browser.entry_at(depth, position))
+                .and_then(|browser| browser.entry_at(*depth, *position))
             {
                 if entry.is_directory() {
                     preview_for_selection.close();
@@ -383,23 +389,46 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
             update_area.set_visible(false);
         }
     });
-    let settings_layer = super::settings::build_layer(
-        &browser,
-        &settings,
-        &blurred_root,
-        theme_manager,
-        update_notice,
-        install_guard,
-    );
-    window_overlay.add_overlay(&settings_layer);
-    let shown_settings = settings_layer.clone();
+    // The settings shell builds on first open, never during startup: even
+    // the cheap pages are widgets the user may never need, and the heavy
+    // pages (Updates detection, release notes, theme swatches) build on
+    // first selection from there.
+    let settings_layer: Rc<RefCell<Option<gtk::Box>>> = Rc::new(RefCell::new(None));
+    let ensure_settings_layer = {
+        let browser = browser.clone();
+        let settings_button = settings.clone();
+        let blurred = blurred_root.clone();
+        let themes = theme_manager.clone();
+        let notice = update_notice.clone();
+        let guard = install_guard.clone();
+        let overlay = window_overlay.clone();
+        let layers = settings_layer.clone();
+        Rc::new(move || {
+            if let Some(layer) = layers.borrow().clone() {
+                return layer;
+            }
+            let layer = super::settings::build_layer(
+                &browser,
+                &settings_button,
+                &blurred,
+                themes.clone(),
+                notice.clone(),
+                guard.clone(),
+            );
+            overlay.add_overlay(&layer);
+            layers.borrow_mut().replace(layer.clone());
+            layer
+        })
+    };
+    let shown_settings = ensure_settings_layer.clone();
     let settings_button = settings.clone();
     let settings_blurred_root = blurred_root.clone();
     settings.connect_clicked(move |_| {
-        show_settings(&shown_settings, &settings_button, &settings_blurred_root);
+        let layer = shown_settings();
+        show_settings(&layer, &settings_button, &settings_blurred_root);
     });
     let settings_shortcut = gtk::EventControllerKey::new();
-    let shown_settings = settings_layer.clone();
+    let shown_settings = ensure_settings_layer.clone();
     let settings_button = settings.clone();
     let shortcut_blurred_root = blurred_root.clone();
     settings_shortcut.connect_key_pressed(move |_, key, _, modifiers| {
@@ -407,7 +436,8 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
         {
             return glib::Propagation::Proceed;
         }
-        show_settings(&shown_settings, &settings_button, &shortcut_blurred_root);
+        let layer = shown_settings();
+        show_settings(&layer, &settings_button, &shortcut_blurred_root);
         glib::Propagation::Stop
     });
     window.add_controller(settings_shortcut);
@@ -433,17 +463,58 @@ pub fn present_location(application: &gtk::Application, location: Option<PathBuf
     window.add_controller(rename_cancel);
     install_modal_focus_trap(&window);
     install_keyboard_navigation(&window, &browser, &sidebar, &sidebar_toggle, &preview);
-    browser.navigate(location.unwrap_or_else(home_directory));
-
     let browser_controller = browser.browser();
+    schedule_sidebar_devices(&sidebar);
     window.connect_destroy(move |_| {
         browser_controller.clear_observer();
         sidebar.disconnect();
     });
+    // Present before navigating: the window maps while the directory streams
+    // in behind the loading state, instead of holding first paint for
+    // validation and enumeration. Navigation runs from idle so mapping and
+    // the first frame are never queued behind enumeration setup.
     window.present();
     crate::metrics::mark_window_presented();
+    crate::metrics::mark_first_themed_frame();
+    let pending_location = location.unwrap_or_else(home_directory);
+    let idle_browser = browser.clone();
+    glib::idle_add_local_once(move || {
+        let started = std::time::Instant::now();
+        idle_browser.navigate(pending_location);
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "present navigation started"
+        );
+    });
+    schedule_due_update_check(&theme_manager, &update_notice);
 }
 
+/// Populates dynamic sidebar volumes and mounts after the first painted
+/// frame, on idle. Static places render synchronously with the shell;
+/// devices append at the end later, so focus and layout never jump.
+fn schedule_sidebar_devices(sidebar: &SidebarView) {
+    let state = sidebar.state.clone();
+    glib::idle_add_local_once(move || {
+        state.rebuild();
+    });
+}
+
+/// Schedules the process-wide due update check: eight seconds after mapping
+/// so it never competes with first paint, then on idle so it never steals
+/// input. A due online notice normally lands within about ten seconds after
+/// initial load. See `settings::maybe_run_due_update_check`.
+fn schedule_due_update_check(
+    manager: &Rc<ThemeManager>,
+    notice: &super::settings::UpdateNoticeHandler,
+) {
+    let manager = manager.clone();
+    let notice = notice.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_secs(8), move || {
+        glib::idle_add_local_once(move || {
+            super::settings::maybe_run_due_update_check(&manager, &notice);
+        });
+    });
+}
 fn animate_sidebar(
     paned: &gtk::Paned,
     sidebar: &gtk::Widget,
@@ -1172,6 +1243,14 @@ impl SidebarState {
         }
         self.place_rows.borrow_mut().clear();
 
+        self.append_static_places();
+        self.append_devices();
+        self.sync_active_place();
+    }
+
+    /// Renders every static place without touching the volume monitor:
+    /// safe to run synchronously with the shell during startup.
+    fn append_static_places(self: &Rc<Self>) {
         self.append_place(
             crate::assets::icons::HOME,
             "Home",
@@ -1209,7 +1288,13 @@ impl SidebarState {
                 self.append_pinned_place(index, &name, location);
             }
         }
+    }
 
+    /// Enumerates volumes and mounts. Deferred past the first painted frame
+    /// on idle: volume enumeration can block on remote backends, and the
+    /// DEVICES section appends at the end, so late population never moves
+    /// focus or existing rows.
+    fn append_devices(self: &Rc<Self>) {
         let volumes = self.volume_monitor.volumes();
         let mounts: Vec<_> = self
             .volume_monitor
@@ -1236,7 +1321,6 @@ impl SidebarState {
                 }
             }
         }
-        self.sync_active_place();
     }
 
     fn pin_location(self: &Rc<Self>, location: Location, name: String) {
@@ -1253,6 +1337,17 @@ impl SidebarState {
             save_pinned_places(&self.pinned_places.borrow());
             self.rebuild();
         }
+    }
+    /// Whether a browser event can change the active location or place.
+    /// Pure so the fan-out gate stays unit-testable without widgets.
+    fn event_changes_active_place(event: &BrowserEvent) -> bool {
+        matches!(
+            event,
+            BrowserEvent::Reset
+                | BrowserEvent::ColumnAdded { .. }
+                | BrowserEvent::ColumnsTruncated { .. }
+                | BrowserEvent::FocusChanged { .. }
+        )
     }
 
     fn sync_active_place(&self) {
@@ -1942,7 +2037,13 @@ fn build_sidebar(view: BrowserView, theme_manager: Rc<super::theme::ThemeManager
     });
 
     let weak = Rc::downgrade(&state);
-    state.browser.observe(move |_| {
+    state.browser.observe(move |event| {
+        // The active place follows the active location only: batch,
+        // metadata, sort-progress, and operation traffic never moves it,
+        // so syncing on every event is pure overhead per listing batch.
+        if !SidebarState::event_changes_active_place(event) {
+            return;
+        }
         if let Some(state) = weak.upgrade() {
             state.sync_active_place();
         }
@@ -1985,8 +2086,11 @@ fn build_sidebar(view: BrowserView, theme_manager: Rc<super::theme::ThemeManager
             state.rebuild();
         }
     }));
-    state.rebuild();
-
+    // Static places render with the shell; dynamic volumes arrive on idle
+    // after the first frame (see `schedule_sidebar_devices`), so volume
+    // enumeration never blocks first paint.
+    state.append_static_places();
+    state.sync_active_place();
     SidebarView {
         widget: shell.upcast(),
         state,

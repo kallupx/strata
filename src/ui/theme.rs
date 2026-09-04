@@ -23,6 +23,11 @@ thread_local! {
     static SOURCE_STYLE_PATH_INSTALLED: Cell<bool> = const { Cell::new(false) };
     static SOURCE_BUFFERS: RefCell<Vec<glib::WeakRef<sourceview5::Buffer>>> = const { RefCell::new(Vec::new()) };
     static CHANNEL_LISTENERS: RefCell<Vec<ChannelListener>> = const { RefCell::new(Vec::new()) };
+    /// Latest theme tokens awaiting installation. File generation and the
+    /// style-manager rescan wait for the first source preview buffer, so
+    /// ordinary startup performs no SourceView I/O at all.
+    static PENDING_STYLE_TOKENS: RefCell<Option<ThemeTokens>> = const { RefCell::new(None) };
+    static STYLE_SCHEME_DIRTY: Cell<bool> = const { Cell::new(true) };
 }
 
 struct ChannelListener {
@@ -740,7 +745,7 @@ impl ThemeManager {
             .load_from_string(&tokens_css(tokens, self.text_size().root_font_px()));
         crate::assets::set_primary_icon_color(&tokens.accent);
         crate::assets::set_danger_icon_color(&tokens.danger);
-        install_source_style_scheme(tokens);
+        stage_source_style_scheme(tokens);
     }
 
     fn save_preferences(&self) {
@@ -984,6 +989,7 @@ fn source_style_scheme() -> Option<sourceview5::StyleScheme> {
 }
 
 pub(super) fn register_source_buffer(buffer: &sourceview5::Buffer) {
+    ensure_source_style_scheme_installed();
     buffer.set_style_scheme(source_style_scheme().as_ref());
     SOURCE_BUFFERS.with(|buffers| {
         let mut buffers = buffers.borrow_mut();
@@ -994,10 +1000,37 @@ pub(super) fn register_source_buffer(buffer: &sourceview5::Buffer) {
     });
 }
 
-fn install_source_style_scheme(tokens: &ThemeTokens) {
+/// Stages theme tokens for the source preview style without touching disk:
+/// an explicit theme switch while previews are live reinstalls immediately,
+/// otherwise installation waits for the first source buffer.
+fn stage_source_style_scheme(tokens: &ThemeTokens) {
+    PENDING_STYLE_TOKENS.with(|pending| pending.replace(Some(tokens.clone())));
+    STYLE_SCHEME_DIRTY.with(|dirty| dirty.set(true));
+    let live = SOURCE_BUFFERS.with(|buffers| {
+        buffers
+            .borrow_mut()
+            .retain(|buffer| buffer.upgrade().is_some());
+        !buffers.borrow().is_empty()
+    });
+    if live {
+        ensure_source_style_scheme_installed();
+    }
+}
+
+/// Writes the staged style scheme and rescans the style manager, once per
+/// staged token set. Called on the first source preview buffer (and on
+/// theme switches while buffers are live), never during ordinary startup.
+fn ensure_source_style_scheme_installed() {
+    if !STYLE_SCHEME_DIRTY.with(|dirty| dirty.get()) {
+        return;
+    }
+    let pending = PENDING_STYLE_TOKENS.with(|pending| pending.borrow().clone());
+    let Some(tokens) = pending else {
+        return;
+    };
     let directory = glib::user_cache_dir().join("strata").join("source-styles");
     if let Err(error) = fs::create_dir_all(&directory).and_then(|()| {
-        let value = source_style_scheme_xml(tokens);
+        let value = source_style_scheme_xml(&tokens);
         crate::storage::atomic_write(&directory.join("strata-current.xml"), value.as_bytes())
     }) {
         tracing::warn!(%error, "unable to write preview syntax style");
@@ -1011,6 +1044,7 @@ fn install_source_style_scheme(tokens: &ThemeTokens) {
         }
     });
     manager.force_rescan();
+    STYLE_SCHEME_DIRTY.with(|dirty| dirty.set(false));
     let scheme = manager.scheme("strata-current");
     SOURCE_BUFFERS.with(|buffers| {
         buffers.borrow_mut().retain(|buffer| {
