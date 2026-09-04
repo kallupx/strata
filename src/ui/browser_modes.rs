@@ -690,9 +690,36 @@ impl ModeViews {
                     }
                 }
             }
-            BrowserEvent::EntriesReplaced { depth, entries } => {
+            BrowserEvent::EntriesReplaced { depth, count } => {
                 for pane in self.panes_at(*depth) {
-                    replace_entries(pane, entries);
+                    replace_entries(pane, &self.browser, *count);
+                }
+            }
+            BrowserEvent::EntriesPublished {
+                depth,
+                position,
+                count,
+            } => {
+                for pane in self.panes_at(*depth) {
+                    let values = self
+                        .browser
+                        .with_entries(
+                            *depth,
+                            *position..position.saturating_add(*count),
+                            |entries| {
+                                entries
+                                    .iter()
+                                    .map(super::browser::entry_model_value)
+                                    .collect::<Vec<_>>()
+                            },
+                        )
+                        .unwrap_or_default();
+                    let values: Vec<_> = values.iter().map(String::as_str).collect();
+                    pane.model.splice(*position as u32, 0, &values);
+                    sync_grid_groups(pane);
+                    if !pane.spinner.is_spinning() {
+                        show_count(pane);
+                    }
                 }
             }
             BrowserEvent::SortingStarted { depth } => {
@@ -911,7 +938,7 @@ impl ModeViews {
             &snapshot.location.display_name(),
         );
         configure_grid_density(&pane, self.density);
-        apply_snapshot(&pane, &snapshot);
+        apply_snapshot(&pane, &snapshot, &self.browser);
         self.install_context_menu(&pane);
         self.grid_root.append(&pane.shell);
         self.grid_panes.push(pane);
@@ -942,7 +969,7 @@ impl ModeViews {
             depth,
             &snapshot.location.display_name(),
         );
-        apply_snapshot(&pane, &snapshot);
+        apply_snapshot(&pane, &snapshot, &self.browser);
         self.install_context_menu(&pane);
         self.explorer_root.append(&pane.shell);
         self.explorer_pane = Some(pane);
@@ -2939,11 +2966,15 @@ fn refresh_cut_pane(pane: &Pane, browser: &Browser, cuts: &[Location]) {
     }
 }
 
-fn replace_entries(pane: &Pane, entries: &[FileEntry]) {
-    let values: Vec<String> = entries
-        .iter()
-        .map(super::browser::entry_model_value)
-        .collect();
+fn replace_entries(pane: &Pane, browser: &Browser, count: usize) {
+    let values = browser
+        .with_entries(pane.depth, 0..count, |entries| {
+            entries
+                .iter()
+                .map(super::browser::entry_model_value)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let values_ref: Vec<&str> = values.iter().map(String::as_str).collect();
     pane.model.splice(0, pane.model.n_items(), &values_ref);
     sync_grid_groups(pane);
@@ -2977,8 +3008,8 @@ fn show_count(pane: &Pane) {
     }
 }
 
-fn apply_snapshot(pane: &Pane, snapshot: &BrowserColumnSnapshot) {
-    replace_entries(pane, &snapshot.entries);
+fn apply_snapshot(pane: &Pane, snapshot: &BrowserColumnSnapshot, browser: &Browser) {
+    replace_entries(pane, browser, snapshot.count);
     set_selections(pane, &snapshot.selected_positions);
     pane.truncated_hint.set_visible(snapshot.truncated);
     if snapshot.loading {

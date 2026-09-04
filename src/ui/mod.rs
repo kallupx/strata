@@ -4,6 +4,7 @@ mod blur;
 mod browser;
 mod browser_modes;
 mod controls;
+mod entry_list_model;
 mod marquee;
 mod motion;
 mod preview;

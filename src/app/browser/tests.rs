@@ -570,7 +570,6 @@ fn a_completed_trash_operation_can_be_undone_once() {
         size: MetadataValue::Unknown,
         modified_unix_seconds: MetadataValue::Unknown,
         is_hidden: false,
-        is_hidden: false,
     };
 
     browser.delete(vec![entry], false);
@@ -1631,6 +1630,7 @@ fn batch_entry(name: &str) -> FileEntry {
         kind: EntryKind::File,
         size: MetadataValue::Unknown,
         modified_unix_seconds: MetadataValue::Unknown,
+        is_hidden: false,
     }
 }
 

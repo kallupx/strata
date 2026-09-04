@@ -44,6 +44,7 @@ const PEEK_TIME_BUDGET: Duration = Duration::from_secs(3);
 #[derive(Clone, Debug)]
 pub struct BrowserColumnSnapshot {
     pub location: Location,
+    pub count: usize,
     pub selected_positions: Vec<usize>,
     pub loading: bool,
     pub error: Option<String>,
@@ -963,6 +964,7 @@ impl Browser {
         let column = state.columns.get(depth)?;
         Some(BrowserColumnSnapshot {
             location: column.location.clone(),
+            count: column.entries.len(),
             selected_positions: state.selected_positions(depth),
             loading: column.load_state == crate::app::navigation::LoadState::Loading,
             error: match &column.load_state {

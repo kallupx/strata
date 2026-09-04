@@ -34,6 +34,7 @@ use super::{
         message_dialog_description, message_dialog_layout, modal_layout, segmented_control,
         wrap_dialog_text,
     },
+    entry_list_model::EntryListModel,
     motion::{animations_enabled, emphasized_deceleration},
 };
 
@@ -62,7 +63,7 @@ struct ColumnView {
     shell: gtk::Box,
     animation_generation: Rc<Cell<u64>>,
     presentation: LoadPresentation,
-    model: gtk::StringList,
+    model: EntryListModel,
     filtered_model: gtk::FilterListModel,
     /// Cached visible<->source index translation. Shares the ViewState
     /// model-generation clock, so every splice invalidates every column at
@@ -3767,9 +3768,9 @@ impl ViewState {
                 self.sync_active_location();
             }
             BrowserEvent::ColumnAdded { depth, location } => {
-                self.set_location(&location);
+                self.set_location(location);
                 if self.mode_views.borrow().mode() == BrowserMode::Columns {
-                    self.append_column(depth, &location);
+                    self.append_column(*depth, location);
                 }
             }
             BrowserEvent::EntriesInserted { depth, insertions } => {
@@ -3783,11 +3784,14 @@ impl ViewState {
                         column.presentation.show_content();
                     }
                     for insertion in insertions {
-                        let mut labels = Vec::with_capacity(insertion.entries.len());
-                        labels.extend(insertion.entries.iter().map(entry_model_value));
-                        let labels: Vec<_> = labels.iter().map(String::as_str).collect();
-                        column.model.splice(insertion.position as u32, 0, &labels);
+                        // Invalidate filtered position maps before the model
+                        // emits its synchronous items-changed notification.
                         touch_source_model(&column);
+                        column.model.splice(
+                            insertion.position as u32,
+                            0,
+                            insertion.entries.len() as u32,
+                        );
                     }
                     let count = column.entry_count.get() + entry_count;
                     column.entry_count.set(count);
@@ -3809,10 +3813,8 @@ impl ViewState {
                         column.presentation.show_content();
                         set_column_busy(&column, false);
                     }
-                    let labels = entry_model_values(&self.browser, *depth, 0, *count);
-                    let labels: Vec<_> = labels.iter().map(String::as_str).collect();
-                    column.model.splice(0, column.model.n_items(), &labels);
                     touch_source_model(&column);
+                    column.model.replace(*count as u32);
                     column.entry_count.set(*count);
                     set_filter_placeholder(&column, *count);
                     update_empty_trash_sensitivity(&column, *count);
@@ -3828,10 +3830,8 @@ impl ViewState {
                     if *count > 0 && !column.spinner.is_spinning() {
                         column.presentation.show_content();
                     }
-                    let labels = entry_model_values(&self.browser, *depth, *position, *count);
-                    let labels: Vec<_> = labels.iter().map(String::as_str).collect();
-                    column.model.splice(*position as u32, 0, &labels);
                     touch_source_model(&column);
+                    column.model.splice(*position as u32, 0, *count as u32);
                     let total = column.entry_count.get().saturating_add(*count);
                     column.entry_count.set(total);
                     set_filter_placeholder(&column, total);
@@ -3914,12 +3914,12 @@ impl ViewState {
                 if let Some(column) = self.columns.borrow().get(*depth) {
                     let mut count = column.entry_count.get();
                     for splice in splices {
-                        let labels: Vec<_> = splice.entries.iter().map(entry_model_value).collect();
-                        let labels: Vec<_> = labels.iter().map(String::as_str).collect();
-                        column
-                            .model
-                            .splice(splice.position as u32, splice.removed as u32, &labels);
                         touch_source_model(column);
+                        column.model.splice(
+                            splice.position as u32,
+                            splice.removed as u32,
+                            splice.entries.len() as u32,
+                        );
                         count = count
                             .saturating_sub(splice.removed)
                             .saturating_add(splice.entries.len());
@@ -3945,8 +3945,8 @@ impl ViewState {
                 if let Some(column) = self.columns.borrow().get(*depth) {
                     column.syncing_selection.set(true);
                     column.selection.set_model(None::<&gio::ListModel>);
-                    column.model.splice(0, column.model.n_items(), &[]);
                     touch_source_model(column);
+                    column.model.replace(0);
                     column.entry_count.set(0);
                     set_filter_placeholder(column, 0);
                     column.truncated_hint.set_visible(false);
@@ -3958,10 +3958,11 @@ impl ViewState {
             }
             BrowserEvent::HiddenToggled { show_hidden } => {
                 for column in self.columns.borrow().iter() {
-                    column.show_hidden.set(show_hidden);
+                    column.show_hidden.set(*show_hidden);
+                    touch_source_model(column);
                     column.filter.changed(gtk::FilterChange::Different);
                 }
-                self.mode_views.borrow().set_show_hidden(show_hidden);
+                self.mode_views.borrow().set_show_hidden(*show_hidden);
             }
             BrowserEvent::LoadFinished { depth, truncated } => {
                 if let Some(column) = self.columns.borrow().get(*depth) {
@@ -4177,15 +4178,15 @@ impl ViewState {
             } => {
                 let retryable_entries = retryable_delete_entries(
                     self.pending_delete_entries.take(),
-                    &retryable_locations,
+                    retryable_locations,
                 );
                 if retryable_entries.is_empty() {
-                    show_error_dialog(&self.overlay, "Completed with errors", &message);
-                } else if has_non_retryable_failures {
+                    show_error_dialog(&self.overlay, "Completed with errors", message);
+                } else if *has_non_retryable_failures {
                     let weak_state = Rc::downgrade(self);
                     show_delete_error_dialog(
                         &self.overlay,
-                        &message,
+                        message,
                         Rc::new(move || {
                             if let Some(state) = weak_state.upgrade() {
                                 state.show_delete_confirmation(retryable_entries.clone());
@@ -4299,21 +4300,16 @@ impl ViewState {
             self.append_column(depth, &snapshot.location);
         }
         for (column, snapshot) in self.columns.borrow().iter().zip(snapshots) {
-            let labels = snapshot
-                .entries
-                .iter()
-                .map(entry_model_value)
-                .collect::<Vec<_>>();
-            let labels = labels.iter().map(String::as_str).collect::<Vec<_>>();
-            column.model.splice(0, column.model.n_items(), &labels);
-            column.entry_count.set(snapshot.entries.len());
-            set_filter_placeholder(column, snapshot.entries.len());
-            update_empty_trash_sensitivity(column, snapshot.entries.len());
+            touch_source_model(column);
+            column.model.replace(snapshot.count as u32);
+            column.entry_count.set(snapshot.count);
+            set_filter_placeholder(column, snapshot.count);
+            update_empty_trash_sensitivity(column, snapshot.count);
             column.truncated_hint.set_visible(snapshot.truncated);
             let positions = snapshot
                 .selected_positions
                 .into_iter()
-                .filter_map(|position| filtered_position_for_source(column, position))
+                .filter_map(|position| column.map.view_position(position))
                 .collect::<Vec<_>>();
             set_column_selections(column, &positions);
             if snapshot.loading {
@@ -4326,7 +4322,7 @@ impl ViewState {
                     column
                         .presentation
                         .show_error(&format!("Unable to read this directory\n{message}"));
-                } else if snapshot.entries.is_empty() {
+                } else if snapshot.count == 0 {
                     column.presentation.show_empty();
                 } else {
                     column.presentation.show_content();
@@ -4346,7 +4342,7 @@ impl ViewState {
         };
         if let Some((focused_depth, position, _)) = self.browser.focused_item()
             && focused_depth == depth
-            && let Some(position) = filtered_position_for_source(column, position)
+            && let Some(position) = column.map.view_position(position)
         {
             column
                 .list
@@ -4496,7 +4492,15 @@ impl ViewState {
         column.append(&filter_revealer);
 
         let entry_count = Rc::new(Cell::new(0));
-        let model = gtk::StringList::new(&[]);
+        let browser_for_model = self.browser.clone();
+        let model = EntryListModel::new(Rc::new(move |position| {
+            let position = position as usize;
+            browser_for_model
+                .with_entries(depth, position..position.saturating_add(1), |entries| {
+                    entries.first().map(entry_model_value)
+                })
+                .flatten()
+        }));
         let filter_query = Rc::new(RefCell::new(String::new()));
         let initial_show_hidden = self
             .browser
@@ -4507,6 +4511,7 @@ impl ViewState {
         let filtered_model = gtk::FilterListModel::new(Some(model.clone()), Some(filter.clone()));
         let map = ViewMap::new(
             filter_query.clone(),
+            show_hidden.clone(),
             self.source_generation.clone(),
             model.clone(),
             filtered_model.clone(),
@@ -5679,30 +5684,22 @@ pub(crate) struct PositionMap {
 
 pub(crate) const NO_FILTERED_POSITION: u32 = u32::MAX;
 
-/// Rebuilds the map in a single monotonic pass over both models: the filter
-/// preserves source order, so one joint walk emits both directions.
 fn rebuild_position_map(
-    source: &gtk::StringList,
-    filtered: &gtk::FilterListModel,
+    source: &EntryListModel,
     query: &str,
+    show_hidden: bool,
     generation: u64,
 ) -> PositionMap {
-    let mut forward = Vec::with_capacity(filtered.n_items() as usize);
-    let mut reverse = vec![NO_FILTERED_POSITION; source.n_items() as usize];
-    let n_source = source.n_items();
-    let mut source_position = 0;
-    for filtered_position in 0..filtered.n_items() {
-        let Some(item) = filtered.item(filtered_position) else {
+    let n_source = source.n_items() as usize;
+    let mut forward = Vec::new();
+    let mut reverse = vec![NO_FILTERED_POSITION; n_source];
+    for (source_position, filtered_position) in reverse.iter_mut().enumerate() {
+        let Some(text) = source.value(source_position as u32) else {
             continue;
         };
-        while source_position < n_source {
-            let candidate = source_position;
-            source_position += 1;
-            if source.item(candidate).is_some_and(|value| value == item) {
-                forward.push(candidate as usize);
-                reverse[candidate as usize] = filtered_position;
-                break;
-            }
+        if (show_hidden || !model_is_hidden(&text)) && pane_filter_matches(&text, query) {
+            *filtered_position = forward.len() as u32;
+            forward.push(source_position);
         }
     }
     PositionMap {
@@ -5722,8 +5719,9 @@ fn rebuild_position_map(
 pub(crate) struct ViewMap {
     cache: Rc<RefCell<PositionMap>>,
     query: Rc<RefCell<String>>,
+    show_hidden: Rc<Cell<bool>>,
     generation: Rc<Cell<u64>>,
-    source: gtk::StringList,
+    source: EntryListModel,
     filter: gtk::FilterListModel,
     placeholder: Option<gtk::StringList>,
 }
@@ -5731,14 +5729,16 @@ pub(crate) struct ViewMap {
 impl ViewMap {
     pub(crate) fn new(
         query: Rc<RefCell<String>>,
+        show_hidden: Rc<Cell<bool>>,
         generation: Rc<Cell<u64>>,
-        source: gtk::StringList,
+        source: EntryListModel,
         filter: gtk::FilterListModel,
         placeholder: Option<gtk::StringList>,
     ) -> Self {
         Self {
             cache: Rc::new(RefCell::new(PositionMap::default())),
             query,
+            show_hidden,
             generation,
             source,
             filter,
@@ -5758,19 +5758,16 @@ impl ViewMap {
     pub(crate) fn source_position(&self, visible_position: u32) -> Option<usize> {
         let filter_position = visible_position.checked_sub(self.placeholder_count())?;
         let query = self.query.borrow();
-        if query.is_empty() {
-            // No query: the filter passes everything in order. Cross-check
-            // both models so a transitional state degrades to a safe miss
-            // instead of a wrong row; no scan, no map, same cost at row 10
-            // and row 90,000.
-            let source_item = self.source.item(filter_position)?;
-            let visible_item = self.filter.item(filter_position)?;
-            return (source_item == visible_item).then_some(filter_position as usize);
+        if query.is_empty() && self.show_hidden.get() {
+            if filter_position < self.source.n_items() && filter_position < self.filter.n_items() {
+                return Some(filter_position as usize);
+            }
+            return None;
         }
         let mut cache = self.cache.borrow_mut();
         let generation = self.generation.get();
         if cache.query != *query || cache.generation != generation {
-            *cache = rebuild_position_map(&self.source, &self.filter, &query, generation);
+            *cache = rebuild_position_map(&self.source, &query, self.show_hidden.get(), generation);
         }
         cache.forward.get(filter_position as usize).copied()
     }
@@ -5779,16 +5776,17 @@ impl ViewMap {
     /// [`ViewMap::source_position`].
     pub(crate) fn view_position(&self, source_position: usize) -> Option<u32> {
         let query = self.query.borrow();
-        if query.is_empty() {
-            let position = source_position as u32;
-            let source_item = self.source.item(position)?;
-            let visible_item = self.filter.item(position)?;
-            return (source_item == visible_item).then_some(position + self.placeholder_count());
+        if query.is_empty() && self.show_hidden.get() {
+            let position = source_position as u64;
+            if position < self.source.n_items() as u64 && position < self.filter.n_items() as u64 {
+                return Some(position as u32 + self.placeholder_count());
+            }
+            return None;
         }
         let mut cache = self.cache.borrow_mut();
         let generation = self.generation.get();
         if cache.query != *query || cache.generation != generation {
-            *cache = rebuild_position_map(&self.source, &self.filter, &query, generation);
+            *cache = rebuild_position_map(&self.source, &query, self.show_hidden.get(), generation);
         }
         let position = *cache.reverse.get(source_position)?;
         (position != NO_FILTERED_POSITION).then_some(position + self.placeholder_count())
@@ -7816,19 +7814,6 @@ pub(super) fn entry_model_value(entry: &FileEntry) -> String {
     value.push('\t');
     value.push_str(name);
     value
-}
-
-fn entry_model_values(
-    browser: &Browser,
-    depth: usize,
-    position: usize,
-    count: usize,
-) -> Vec<String> {
-    browser
-        .with_entries(depth, position..position.saturating_add(count), |entries| {
-            entries.iter().map(entry_model_value).collect()
-        })
-        .unwrap_or_default()
 }
 
 fn model_display_name(value: &str) -> &str {
