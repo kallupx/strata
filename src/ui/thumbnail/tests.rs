@@ -9,10 +9,11 @@ use gtk::glib;
 
 use super::{
     ACTIVE_REQUESTS, ActiveRequest, CacheHit, CachedThumbnail, MAX_CACHE_ENTRIES,
-    MAX_QUEUED_THUMBNAILS, MAX_THUMBNAIL_WORKERS, PENDING_THUMBNAILS, PendingTarget,
-    PendingThumbnail, THUMBNAIL_QUEUE, ThumbnailCache, ThumbnailKey, ThumbnailKind, ThumbnailQueue,
-    cancel_thumbnail, finish_thumbnail_targets, retry_deferred_thumbnail, schedule_or_defer,
-    take_pending_targets, thumbnail_kind,
+    MAX_PERSIST_QUEUE, MAX_QUEUED_THUMBNAILS, MAX_THUMBNAIL_WORKERS, PENDING_THUMBNAILS,
+    PendingTarget, PendingThumbnail, PersistJob, PersistQueue, SETTLE_VIEWS, SettledPark,
+    THUMBNAIL_QUEUE, ThumbnailCache, ThumbnailKey, ThumbnailKind, ThumbnailQueue, ViewSettle,
+    cancel_thumbnail, finish_thumbnail_targets, fire_settled_thumbnails, note_metadata,
+    retry_deferred_thumbnail, schedule_or_defer, take_pending_targets, thumbnail_kind,
 };
 
 fn key(index: usize) -> ThumbnailKey {
@@ -76,16 +77,19 @@ fn thumbnail_queue_bounds_waiting_and_running_jobs() {
     }
     assert!(!queue.enqueue(key(MAX_QUEUED_THUMBNAILS)));
 
-    for _ in 0..MAX_THUMBNAIL_WORKERS {
-        assert!(queue.begin_next().is_some());
+    for index in 0..MAX_THUMBNAIL_WORKERS {
+        assert_eq!(queue.begin_next(), Some(key(index)));
     }
     assert!(queue.begin_next().is_none());
     queue.finish();
-    assert!(queue.begin_next().is_some());
+    assert_eq!(queue.begin_next(), Some(key(MAX_THUMBNAIL_WORKERS)));
 }
 
 #[test]
 fn saturated_queue_defers_the_live_request() {
+    let _serial = crate::test_support::ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .expect("the async test lock should not be poisoned");
     let image_id = 99;
     let request = 7;
     ACTIVE_REQUESTS.with(|requests| {
@@ -115,7 +119,18 @@ fn saturated_queue_defers_the_live_request() {
             image: glib::WeakRef::new(),
         },
     );
-
+    // Bypass the settle delay: the fire defers the live request against the
+    // saturated render queue.
+    fire_settled_thumbnails();
+    // The fire takes the fallback group's timer, so nothing is left armed:
+    // nothing pumps it in this test, and a later test sharing this thread
+    // must not inherit the fire. The drain is asserted through the per-view
+    // settle map the park resolved (no viewport ancestor: group zero).
+    SETTLE_VIEWS.with(|views| {
+        let settle = &views.borrow()[&0];
+        assert!(settle.timer.is_none());
+        assert!(settle.pending.is_empty());
+    });
     ACTIVE_REQUESTS.with(|requests| {
         let requests = requests.borrow();
         let deferred = requests[&image_id]
@@ -173,6 +188,7 @@ fn failed_jobs_release_their_active_requests() {
         }],
         None,
         64,
+        "test",
     );
 
     ACTIVE_REQUESTS.with(|requests| assert!(requests.borrow().is_empty()));
@@ -259,4 +275,109 @@ fn failed_thumbnails_expire_and_share_the_cache_bound() {
 fn rejects_files_without_a_thumbnail_provider() {
     assert_eq!(thumbnail_kind(Path::new("README.md")), None);
     assert_eq!(thumbnail_kind(Path::new("no-extension")), None);
+}
+
+#[test]
+fn viewport_eligibility_covers_visible_plus_overscan() {
+    use super::rect_eligible;
+    // Fully inside a 1000x760 viewport.
+    assert!(rect_eligible(10.0, 10.0, 100.0, 40.0, 1000.0, 760.0));
+    // Partial boundary rows count: hanging off every edge.
+    assert!(rect_eligible(-20.0, 100.0, 100.0, 40.0, 1000.0, 760.0));
+    assert!(rect_eligible(950.0, 100.0, 100.0, 40.0, 1000.0, 760.0));
+    assert!(rect_eligible(100.0, -20.0, 100.0, 40.0, 1000.0, 760.0));
+    assert!(rect_eligible(100.0, 750.0, 100.0, 40.0, 1000.0, 760.0));
+    // Within the 25% prefetch band but off-screen.
+    assert!(rect_eligible(100.0, -190.0, 100.0, 40.0, 1000.0, 760.0));
+    assert!(rect_eligible(
+        100.0,
+        760.0 + 100.0,
+        100.0,
+        40.0,
+        1000.0,
+        760.0
+    ));
+    // Past the band: a flung row earns nothing until it settles on screen.
+    assert!(!rect_eligible(100.0, -300.0, 100.0, 40.0, 1000.0, 760.0));
+    assert!(!rect_eligible(
+        100.0,
+        760.0 + 500.0,
+        100.0,
+        40.0,
+        1000.0,
+        760.0
+    ));
+    assert!(!rect_eligible(2000.0, 100.0, 100.0, 40.0, 1000.0, 760.0));
+    assert!(!rect_eligible(-500.0, 100.0, 100.0, 40.0, 1000.0, 760.0));
+    // GTK pre-binds offscreen rows with a zero-sized allocation. Neither
+    // those rows nor a degenerate viewport may start thumbnail work.
+    assert!(!rect_eligible(0.0, 4.0, 0.0, 0.0, 1000.0, 760.0));
+    assert!(!rect_eligible(0.0, 4.0, -1.0, 40.0, 1000.0, 760.0));
+    assert!(!rect_eligible(0.0, 0.0, 100.0, 40.0, 0.0, 0.0));
+}
+
+#[test]
+fn metadata_fill_updates_thumbnail_waiting_for_settle() {
+    let path = PathBuf::from("pending.png");
+    SETTLE_VIEWS.with(|views| {
+        views.borrow_mut().insert(
+            0,
+            ViewSettle {
+                viewport: glib::WeakRef::new(),
+                pending: vec![SettledPark {
+                    key: ThumbnailKey {
+                        path: path.clone(),
+                        modified: None,
+                        file_size: None,
+                        thumbnail_size: 64,
+                    },
+                    kind: ThumbnailKind::Image,
+                    target: PendingTarget {
+                        image_id: 1,
+                        request: 1,
+                        image: glib::WeakRef::new(),
+                    },
+                    wait_for_metadata: true,
+                }],
+                timer: None,
+                first_park: None,
+                hooked: false,
+            },
+        );
+    });
+
+    note_metadata(&path, Some(42), Some(99));
+
+    SETTLE_VIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        let park = &views[&0].pending[0];
+        assert_eq!(park.key.modified, Some(42));
+        assert_eq!(park.key.file_size, Some(99));
+        assert!(!park.wait_for_metadata);
+        views.clear();
+    });
+}
+
+#[test]
+fn persist_queue_bounds_and_drains_oldest_first() {
+    let mut queue = PersistQueue::new();
+    for index in 0..MAX_PERSIST_QUEUE + 5 {
+        queue.push(PersistJob {
+            path: PathBuf::from(index.to_string()),
+            mtime: 1,
+            png: vec![1],
+        });
+    }
+    // Bounded: the five oldest renders dropped instead of growing the queue
+    // behind a slow disk.
+    assert_eq!(queue.len(), MAX_PERSIST_QUEUE);
+    assert_eq!(
+        queue.pop_front().expect("queue should drain").path,
+        PathBuf::from("5")
+    );
+    let mut drained = 1;
+    while queue.pop_front().is_some() {
+        drained += 1;
+    }
+    assert_eq!(drained, MAX_PERSIST_QUEUE);
 }

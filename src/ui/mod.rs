@@ -11,6 +11,7 @@ mod search;
 mod settings;
 mod theme;
 mod thumbnail;
+mod thumbnail_cache;
 mod window;
 
 pub use window::{present, present_location};

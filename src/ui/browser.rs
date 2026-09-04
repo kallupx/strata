@@ -64,6 +64,11 @@ struct ColumnView {
     presentation: LoadPresentation,
     model: gtk::StringList,
     filtered_model: gtk::FilterListModel,
+    /// Cached visible<->source index translation. Shares the ViewState
+    /// model-generation clock, so every splice invalidates every column at
+    /// once; binds and selection syncs are O(1) afterwards.
+    map: ViewMap,
+    model_generation: Rc<Cell<u64>>,
     header_actions: gtk::Box,
     filter_entry: gtk::Entry,
     filter_button: gtk::ToggleButton,
@@ -74,6 +79,9 @@ struct ColumnView {
     bound_rows: Rc<RefCell<Vec<BoundRow>>>,
     entry_count: Rc<Cell<usize>>,
     spinner: gtk::Spinner,
+    /// Delayed initial-spinner timer: fast loads settle before it ever
+    /// fires, so no spinner flashes for work that finishes in ~120 ms.
+    spinner_delay: Rc<RefCell<Option<glib::SourceId>>>,
     truncated_hint: gtk::Image,
     empty_trash_button: Option<gtk::Button>,
     new_entry_row: gtk::Box,
@@ -295,6 +303,10 @@ pub(super) struct ViewState {
     hovered_column: Cell<Option<usize>>,
     cut_locations: RefCell<Vec<Location>>,
     horizontal_scroll_generation: Rc<Cell<u64>>,
+    /// Bumped on every shared source-model mutation. Every column and mode
+    /// pane holds a clone and keys its cached position map on it, so one
+    /// counter invalidates every map at once with no per-view bookkeeping.
+    source_generation: Rc<Cell<u64>>,
     peek: RefCell<Option<PeekView>>,
     pending_peek: RefCell<Option<glib::SourceId>>,
     pending_close: RefCell<Option<glib::SourceId>>,
@@ -434,6 +446,7 @@ impl BrowserView {
         browser.observe_preferences(move |sorting| {
             preferences_for_sorting.set_sort_preferences(sorting);
         });
+        let source_generation = Rc::new(Cell::new(0u64));
         let mode_views = ModeViews::new(&scroller, browser.clone());
         overlay.set_child(Some(&mode_views.widget()));
         let state = Rc::new(ViewState {
@@ -451,6 +464,7 @@ impl BrowserView {
             hovered_column: Cell::new(None),
             cut_locations: RefCell::new(Vec::new()),
             horizontal_scroll_generation: Rc::new(Cell::new(0)),
+            source_generation,
             peek: RefCell::new(None),
             pending_peek: RefCell::new(None),
             pending_close: RefCell::new(None),
@@ -696,7 +710,7 @@ impl BrowserView {
         let Some(column) = columns.get(depth) else {
             return false;
         };
-        if filtered_position_for_source(column, position) != Some(0) {
+        if column.map.view_position(position) != Some(0) {
             return false;
         }
         let mut control = column.header_actions.first_child();
@@ -1458,13 +1472,11 @@ impl ViewState {
                 let (Some(item), Some(row)) = (bound.item.upgrade(), bound.row.upgrade()) else {
                     return false;
                 };
-                let is_cut = source_position_for_filtered(
-                    &column.model,
-                    &column.filtered_model,
-                    item.position(),
-                )
-                .and_then(|position| self.browser.entry_at(depth, position))
-                .is_some_and(|entry| cut_lookup.contains(&entry.location));
+                let is_cut = column
+                    .map
+                    .source_position(item.position())
+                    .and_then(|position| self.browser.entry_at(depth, position))
+                    .is_some_and(|entry| cut_lookup.contains(&entry.location));
                 set_cut_path_style(&row, is_cut);
                 true
             });
@@ -3216,7 +3228,7 @@ impl ViewState {
         let Some(column) = columns.get(depth) else {
             return false;
         };
-        let Some(filtered_position) = filtered_position_for_source(column, source_position) else {
+        let Some(filtered_position) = column.map.view_position(source_position) else {
             return false;
         };
         let row = column.bound_rows.borrow().iter().find_map(|bound| {
@@ -3741,15 +3753,17 @@ impl ViewState {
         self.location_stack.set_visible_child_name("breadcrumbs");
     }
 
-    fn handle(self: &Rc<Self>, event: BrowserEvent) {
-        self.mode_views.borrow_mut().handle(&event);
+    fn handle(self: &Rc<Self>, event: &BrowserEvent) {
+        // The Columns view owns every depth's source model and applies its
+        // own mutations first; mode views then borrow the settled models to
+        // wrap (never copy) for the active Grid/Explorer pane.
         match event {
             BrowserEvent::Reset => {
                 self.pending_location_credentials.take();
                 self.truncate(0);
             }
             BrowserEvent::ColumnsTruncated { len } => {
-                self.truncate(len);
+                self.truncate(*len);
                 self.sync_active_location();
             }
             BrowserEvent::ColumnAdded { depth, location } => {
@@ -3764,52 +3778,132 @@ impl ViewState {
                     .iter()
                     .map(|insertion| insertion.entries.len())
                     .sum();
-                if let Some(column) = self.columns.borrow().get(depth).cloned() {
+                if let Some(column) = self.columns.borrow().get(*depth).cloned() {
                     if entry_count > 0 && !column.spinner.is_spinning() {
                         column.presentation.show_content();
                     }
                     for insertion in insertions {
-                        let labels: Vec<_> =
-                            insertion.entries.iter().map(entry_model_value).collect();
+                        let mut labels = Vec::with_capacity(insertion.entries.len());
+                        labels.extend(insertion.entries.iter().map(entry_model_value));
                         let labels: Vec<_> = labels.iter().map(String::as_str).collect();
                         column.model.splice(insertion.position as u32, 0, &labels);
+                        touch_source_model(&column);
                     }
                     let count = column.entry_count.get() + entry_count;
                     column.entry_count.set(count);
                     set_filter_placeholder(&column, count);
                     update_empty_trash_sensitivity(&column, count);
+                    // Correct rows arrived: assistive technology leaves the
+                    // busy state even while later batches still stream.
+                    set_column_busy(&column, false);
                     crate::metrics::mark_batch_rendered(entry_count, render_started);
+                    crate::metrics::record_stage(
+                        "ui-publication",
+                        render_started.elapsed().as_millis() as u64,
+                    );
                 }
             }
-            BrowserEvent::EntriesReplaced { depth, entries } => {
-                if self.mode_views.borrow().mode() == BrowserMode::Columns
-                    && let Some(column) = self.columns.borrow().get(depth).cloned()
-                {
-                    if !entries.is_empty() {
+            BrowserEvent::EntriesReplaced { depth, count } => {
+                if let Some(column) = self.columns.borrow().get(*depth).cloned() {
+                    if *count > 0 {
                         column.presentation.show_content();
+                        set_column_busy(&column, false);
                     }
-                    let labels: Vec<_> = entries.iter().map(entry_model_value).collect();
+                    let labels = entry_model_values(&self.browser, *depth, 0, *count);
                     let labels: Vec<_> = labels.iter().map(String::as_str).collect();
                     column.model.splice(0, column.model.n_items(), &labels);
-                    column.entry_count.set(entries.len());
-                    set_filter_placeholder(&column, entries.len());
-                    update_empty_trash_sensitivity(&column, entries.len());
+                    touch_source_model(&column);
+                    column.entry_count.set(*count);
+                    set_filter_placeholder(&column, *count);
+                    update_empty_trash_sensitivity(&column, *count);
+                }
+            }
+            BrowserEvent::EntriesPublished {
+                depth,
+                position,
+                count,
+            } => {
+                let render_started = Instant::now();
+                if let Some(column) = self.columns.borrow().get(*depth).cloned() {
+                    if *count > 0 && !column.spinner.is_spinning() {
+                        column.presentation.show_content();
+                    }
+                    let labels = entry_model_values(&self.browser, *depth, *position, *count);
+                    let labels: Vec<_> = labels.iter().map(String::as_str).collect();
+                    column.model.splice(*position as u32, 0, &labels);
+                    touch_source_model(&column);
+                    let total = column.entry_count.get().saturating_add(*count);
+                    column.entry_count.set(total);
+                    set_filter_placeholder(&column, total);
+                    update_empty_trash_sensitivity(&column, total);
+                    set_column_busy(&column, false);
+                    crate::metrics::mark_batch_rendered(*count, render_started);
+                    crate::metrics::record_stage(
+                        "ui-publication",
+                        render_started.elapsed().as_millis() as u64,
+                    );
+                }
+            }
+            BrowserEvent::MetadataFilled { depth, updates } => {
+                // Metadata waiters promote before any mode check: a row may
+                // wait in a hidden view while another mode is active.
+                for (_, entry) in updates.iter() {
+                    super::thumbnail::note_metadata_entry(entry);
+                }
+                if self.mode_views.borrow().mode() == BrowserMode::Columns
+                    && let Some(column) = self.columns.borrow().get(*depth).cloned()
+                {
+                    // In-place refresh of realized rows only: no model mutation,
+                    // so no rebind, thumbnail restart, or filter re-evaluation.
+                    // Realized rows resolve their current source position through
+                    // the filter mapping, so resort/insert shifts need no extra
+                    // bookkeeping and dead rows prune themselves here.
+                    let filled: HashMap<usize, &FileEntry> = updates
+                        .iter()
+                        .map(|(position, entry)| (*position, entry))
+                        .collect();
+                    if !filled.is_empty() {
+                        column.bound_rows.borrow_mut().retain(|bound| {
+                            let (Some(item), Some(row)) =
+                                (bound.item.upgrade(), bound.row.upgrade())
+                            else {
+                                return false;
+                            };
+                            let position = column.map.source_position(item.position());
+                            if let Some(position) = position
+                                && let Some(&entry) = filled.get(&position)
+                                && let Some(size) = row
+                                    .first_child()
+                                    .and_downcast::<gtk::Image>()
+                                    .and_then(|icon| icon.next_sibling())
+                                    .and_then(|middle| middle.downcast::<gtk::Overlay>().ok())
+                                    .and_then(|middle| middle.last_child())
+                                    .and_downcast::<gtk::Label>()
+                            {
+                                let text = column_size_text(Some(entry));
+                                size.set_label(&text);
+                                size.set_visible(!text.is_empty());
+                            }
+                            true
+                        });
+                    }
                 }
             }
             BrowserEvent::SortingStarted { depth } => {
                 self.overlay.set_cursor_from_name(Some("wait"));
-                if let Some(column) = self.columns.borrow().get(depth) {
+                if let Some(column) = self.columns.borrow().get(*depth) {
                     column.spinner.set_tooltip_text(Some("Sorting…"));
                     column.spinner.set_visible(true);
                     column.spinner.start();
+                    set_column_busy(column, true);
                 }
             }
             BrowserEvent::SortingFinished { depth } => {
                 self.overlay.set_cursor(None::<&gtk::gdk::Cursor>);
-                if let Some(column) = self.columns.borrow().get(depth) {
-                    column.spinner.stop();
-                    column.spinner.set_visible(false);
+                if let Some(column) = self.columns.borrow().get(*depth) {
+                    stop_column_spinner(column);
                     column.spinner.set_tooltip_text(None);
+                    set_column_busy(column, false);
                 }
             }
             BrowserEvent::EntriesSpliced {
@@ -3817,7 +3911,7 @@ impl ViewState {
                 splices,
                 selected,
             } => {
-                if let Some(column) = self.columns.borrow().get(depth) {
+                if let Some(column) = self.columns.borrow().get(*depth) {
                     let mut count = column.entry_count.get();
                     for splice in splices {
                         let labels: Vec<_> = splice.entries.iter().map(entry_model_value).collect();
@@ -3825,6 +3919,7 @@ impl ViewState {
                         column
                             .model
                             .splice(splice.position as u32, splice.removed as u32, &labels);
+                        touch_source_model(column);
                         count = count
                             .saturating_sub(splice.removed)
                             .saturating_add(splice.entries.len());
@@ -3834,7 +3929,7 @@ impl ViewState {
                     set_column_selection(
                         column,
                         selected
-                            .and_then(|position| filtered_position_for_source(column, position))
+                            .and_then(|position| column.map.view_position(position))
                             .unwrap_or(gtk::INVALID_LIST_POSITION),
                     );
                     if count == 0 {
@@ -3842,20 +3937,22 @@ impl ViewState {
                     } else {
                         column.presentation.show_content();
                     }
+                    set_column_busy(column, false);
                     update_empty_trash_sensitivity(column, count);
                 }
             }
             BrowserEvent::ColumnReloaded { depth } => {
-                if let Some(column) = self.columns.borrow().get(depth) {
+                if let Some(column) = self.columns.borrow().get(*depth) {
                     column.syncing_selection.set(true);
                     column.selection.set_model(None::<&gio::ListModel>);
-                    column.filtered_model.set_model(None::<&gio::ListModel>);
                     column.model.splice(0, column.model.n_items(), &[]);
+                    touch_source_model(column);
                     column.entry_count.set(0);
                     set_filter_placeholder(column, 0);
                     column.truncated_hint.set_visible(false);
                     column.spinner.set_visible(true);
                     column.spinner.start();
+                    set_column_busy(column, true);
                     column.presentation.show_loading();
                 }
             }
@@ -3867,24 +3964,24 @@ impl ViewState {
                 self.mode_views.borrow().set_show_hidden(show_hidden);
             }
             BrowserEvent::LoadFinished { depth, truncated } => {
-                if let Some(column) = self.columns.borrow().get(depth) {
+                if let Some(column) = self.columns.borrow().get(*depth) {
                     if column.selection.model().is_none() {
                         column.filtered_model.set_model(Some(&column.model));
                         column.selection.set_model(Some(&column.filtered_model));
                         column.syncing_selection.set(false);
                     }
-                    column.spinner.stop();
-                    column.spinner.set_visible(false);
-                    column.truncated_hint.set_visible(truncated);
+                    stop_column_spinner(column);
+                    column.truncated_hint.set_visible(*truncated);
                     let count = column.entry_count.get();
                     if count == 0 {
                         column.presentation.show_empty();
                     } else {
                         column.presentation.show_content();
                     }
+                    set_column_busy(column, false);
                     update_empty_trash_sensitivity(column, count);
                 }
-                if self.browser.active_depth() == Some(depth) {
+                if self.browser.active_depth() == Some(*depth) {
                     let names = self.pending_select.take();
                     if !names.is_empty() {
                         let weak = Rc::downgrade(self);
@@ -3897,26 +3994,26 @@ impl ViewState {
                 }
             }
             BrowserEvent::LoadFailed { depth, message } => {
-                if let Some(column) = self.columns.borrow().get(depth) {
+                if let Some(column) = self.columns.borrow().get(*depth) {
                     if column.selection.model().is_none() {
                         column.filtered_model.set_model(Some(&column.model));
                         column.selection.set_model(Some(&column.filtered_model));
                         column.syncing_selection.set(false);
                     }
-                    column.spinner.stop();
-                    column.spinner.set_visible(false);
+                    stop_column_spinner(column);
                     column
                         .presentation
                         .show_error(&format!("Unable to read this directory\n{message}"));
+                    set_column_busy(column, false);
                 }
             }
-            BrowserEvent::PeekStarted { location } => self.append_peek(&location),
+            BrowserEvent::PeekStarted { location } => self.append_peek(location),
             BrowserEvent::PeekEntriesAdded { entries } => {
                 if let Some(peek) = self.peek.borrow().as_ref() {
                     if !entries.is_empty() {
                         peek.presentation.show_content();
                     }
-                    append_peek_entries(peek, entries, self.peek_behavior.item_limit);
+                    append_peek_entries(peek, entries.clone(), self.peek_behavior.item_limit);
                 }
             }
             BrowserEvent::PeekFinished => {
@@ -3945,10 +4042,10 @@ impl ViewState {
                 focused,
                 take_focus,
             } => {
-                if let Some(column) = self.columns.borrow().get(depth) {
+                if let Some(column) = self.columns.borrow().get(*depth) {
                     let filtered_positions: Vec<_> = positions
-                        .into_iter()
-                        .filter_map(|position| filtered_position_for_source(column, position))
+                        .iter()
+                        .filter_map(|position| column.map.view_position(*position))
                         .collect();
                     set_column_selections(column, &filtered_positions);
                     // A background batch delivered for a column that already has a
@@ -3958,23 +4055,23 @@ impl ViewState {
                     if self.active_rename.borrow().is_none()
                         && self.active_new_entry.borrow().is_none()
                     {
-                        if let Some(focused) = filtered_position_for_source(column, focused) {
+                        if let Some(focused) = column.map.view_position(*focused) {
                             column
                                 .list
                                 .scroll_to(focused, gtk::ListScrollFlags::FOCUS, None);
                         }
-                        if take_focus && self.mode_views.borrow().mode() == BrowserMode::Columns {
+                        if *take_focus && self.mode_views.borrow().mode() == BrowserMode::Columns {
                             column.list.grab_focus();
                         }
                     }
                 }
             }
             BrowserEvent::FocusChanged { depth, position } => {
-                if let Some(column) = self.columns.borrow().get(depth) {
+                if let Some(column) = self.columns.borrow().get(*depth) {
                     let editing = self.active_rename.borrow().is_some()
                         || self.active_new_entry.borrow().is_some();
                     if let Some(filtered_position) =
-                        position.and_then(|position| filtered_position_for_source(column, position))
+                        position.and_then(|position| column.map.view_position(position))
                     {
                         set_column_selection(column, filtered_position);
                         if !editing {
@@ -3992,7 +4089,7 @@ impl ViewState {
             }
             BrowserEvent::PreviewRequested { .. } => {}
             BrowserEvent::OpenRequested { location } => {
-                open_location(&location, &self.overlay);
+                open_location(location, &self.overlay);
             }
             BrowserEvent::RenameCompleted => {
                 self.cancel_rename();
@@ -4002,20 +4099,20 @@ impl ViewState {
                 if let Some(rename) = self.active_rename.borrow().as_ref() {
                     rename.field.set_sensitive(true);
                     rename.field.add_css_class("error");
-                    rename.field.set_tooltip_text(Some(&message));
+                    rename.field.set_tooltip_text(Some(message));
                     rename.field.grab_focus();
                 }
             }
             BrowserEvent::TransferStarted { total, moving } => {
                 let browser = self.browser.clone();
                 self.show_file_operation_progress(
-                    total,
-                    if moving {
+                    *total,
+                    if *moving {
                         crate::assets::icons::FOLDER
                     } else {
                         crate::assets::icons::COPY
                     },
-                    if moving {
+                    if *moving {
                         "Moving items"
                     } else {
                         "Copying items"
@@ -4025,18 +4122,18 @@ impl ViewState {
                 );
             }
             BrowserEvent::TransferProgress { completed, total } => {
-                self.update_delete_progress(completed, total);
+                self.update_delete_progress(*completed, *total);
             }
             BrowserEvent::TransferFinished { moved_locations } => {
                 if !moved_locations.is_empty() {
-                    self.complete_cut_transfer(&moved_locations);
+                    self.complete_cut_transfer(moved_locations);
                 }
                 self.dismiss_delete_progress();
             }
             BrowserEvent::DeletionStarted { total } => {
                 let browser = self.browser.clone();
                 self.show_file_operation_progress(
-                    total,
+                    *total,
                     crate::assets::icons::TRASH,
                     "Deleting items",
                     "Cancelling will not undo completed changes",
@@ -4044,13 +4141,13 @@ impl ViewState {
                 );
             }
             BrowserEvent::DeletionProgress { completed, total } => {
-                self.update_delete_progress(completed, total);
+                self.update_delete_progress(*completed, *total);
             }
             BrowserEvent::DeletionFinished => self.dismiss_delete_progress(),
             BrowserEvent::RestorationStarted { total } => {
                 let browser = self.browser.clone();
                 self.show_file_operation_progress(
-                    total,
+                    *total,
                     crate::assets::icons::FOLDER,
                     "Restoring items",
                     "Cancelling will not undo completed changes",
@@ -4058,7 +4155,7 @@ impl ViewState {
                 );
             }
             BrowserEvent::RestorationProgress { completed, total } => {
-                self.update_delete_progress(completed, total);
+                self.update_delete_progress(*completed, *total);
             }
             BrowserEvent::RestorationFinished => self.dismiss_delete_progress(),
             BrowserEvent::OperationFailed { message } => {
@@ -4071,7 +4168,7 @@ impl ViewState {
                         return;
                     }
                 }
-                show_error_dialog(&self.overlay, "Unable to complete operation", &message);
+                show_error_dialog(&self.overlay, "Unable to complete operation", message);
             }
             BrowserEvent::OperationCompletedWithErrors {
                 message,
@@ -4107,23 +4204,24 @@ impl ViewState {
             } => {
                 let message = format!(
                     "{} completed, {} failed, and {} not attempted.\n\nCompleted changes were not reverted.",
-                    item_count_label(completed),
-                    item_count_label(failed),
-                    item_count_label(not_attempted),
+                    item_count_label(*completed),
+                    item_count_label(*failed),
+                    item_count_label(*not_attempted),
                 );
                 let browser = self.browser.clone();
+                let affected = affected_locations.clone();
                 show_error_dialog_after_close(
                     &self.overlay,
                     "Operation cancelled",
                     &message,
-                    Rc::new(move || browser.refresh_after_cancellation(&affected_locations)),
+                    Rc::new(move || browser.refresh_after_cancellation(&affected)),
                 );
             }
             BrowserEvent::NavigationRejected {
                 parent_depth,
                 error,
             } => {
-                self.handle_navigation_rejected(parent_depth, error);
+                self.handle_navigation_rejected(*parent_depth, error.clone());
             }
             BrowserEvent::EmptyTrashRequested => {
                 self.load_trash_summary();
@@ -4133,14 +4231,14 @@ impl ViewState {
                 match error {
                     LocationValidationError::NotMounted(location) => {
                         self.mount_then_navigate_with_credentials(
-                            location,
+                            location.clone(),
                             MountStrategy::EnclosingVolume,
                             credentials,
                         );
                     }
                     LocationValidationError::Mountable(location) => {
                         self.mount_then_navigate_with_credentials(
-                            location,
+                            location.clone(),
                             MountStrategy::Mountable,
                             credentials,
                         );
@@ -4155,7 +4253,7 @@ impl ViewState {
             BrowserEvent::ArchiveStarted { total } => {
                 let browser = self.browser.clone();
                 self.show_file_operation_progress(
-                    total,
+                    *total,
                     crate::assets::icons::FILE_ARCHIVE,
                     "Working",
                     "This may take a moment",
@@ -4163,13 +4261,13 @@ impl ViewState {
                 );
             }
             BrowserEvent::ArchiveProgress { completed, total } => {
-                self.update_archive_progress(completed, total);
+                self.update_archive_progress(*completed, *total);
             }
             BrowserEvent::ArchiveCompleted { select_name, .. } => {
                 self.dismiss_delete_progress();
                 self.pending_extract_retry.replace(None);
                 if !select_name.is_empty() {
-                    self.pending_select.borrow_mut().push(select_name);
+                    self.pending_select.borrow_mut().push(select_name.clone());
                 }
                 if let Some(dest) = self.pending_navigate.take() {
                     self.browser.navigate(dest);
@@ -4183,7 +4281,12 @@ impl ViewState {
                 }
             }
         }
-        self.refresh_active_path_rows();
+        // Active-path styling depends on row positions and the active child:
+        // recompute only for events that can move rows or the active child,
+        if Self::event_refreshes_active_path(event) {
+            self.refresh_active_path_rows();
+        }
+        self.mode_views.borrow_mut().handle(event);
     }
 
     fn rebuild_columns(self: &Rc<Self>) {
@@ -4252,12 +4355,30 @@ impl ViewState {
         column.list.grab_focus();
     }
 
+    /// Whether a browser event can move rows or the active child, requiring an
+    /// active-path styling pass. Pure so the fan-out gate stays unit-testable
+    /// without widgets.
+    fn event_refreshes_active_path(event: &BrowserEvent) -> bool {
+        matches!(
+            event,
+            BrowserEvent::Reset
+                | BrowserEvent::ColumnAdded { .. }
+                | BrowserEvent::ColumnsTruncated { .. }
+                | BrowserEvent::FocusChanged { .. }
+                | BrowserEvent::SelectionSetChanged { .. }
+                | BrowserEvent::EntriesInserted { .. }
+                | BrowserEvent::EntriesPublished { .. }
+                | BrowserEvent::EntriesSpliced { .. }
+                | BrowserEvent::EntriesReplaced { .. }
+        )
+    }
+
     fn refresh_active_path_rows(&self) {
         for (depth, column) in self.columns.borrow().iter().enumerate() {
             let active = self
                 .browser
                 .active_child_position(depth)
-                .and_then(|position| filtered_position_for_source(column, position));
+                .and_then(|position| column.map.view_position(position));
             column.bound_rows.borrow_mut().retain(|bound| {
                 let (Some(item), Some(row)) = (bound.item.upgrade(), bound.row.upgrade()) else {
                     return false;
@@ -4305,7 +4426,7 @@ impl ViewState {
         heading_box.append(&heading);
         heading_box.append(&truncated_hint);
         let spinner = gtk::Spinner::new();
-        spinner.start();
+        spinner.set_visible(false);
         header.append(&heading_box);
         header.append(&spinner);
         let header_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -4384,13 +4505,19 @@ impl ViewState {
         let show_hidden = Rc::new(Cell::new(initial_show_hidden));
         let filter = entry_filter(show_hidden.clone(), filter_query.clone());
         let filtered_model = gtk::FilterListModel::new(Some(model.clone()), Some(filter.clone()));
+        let map = ViewMap::new(
+            filter_query.clone(),
+            self.source_generation.clone(),
+            model.clone(),
+            filtered_model.clone(),
+            None,
+        );
         let selection = gtk::MultiSelection::new(Some(filtered_model.clone()));
         let syncing_selection = Rc::new(Cell::new(false));
         let modified_selection = Rc::new(Cell::new(false));
         let focused_filtered = Rc::new(Cell::new(None::<u32>));
         let weak_browser = Rc::downgrade(&self.browser);
-        let source_for_selection = model.clone();
-        let filtered_for_selection = filtered_model.clone();
+        let map_for_selection = map.clone();
         let syncing_selection_changed = syncing_selection.clone();
         let focused_filtered_changed = focused_filtered.clone();
         let filter_for_column = filter.clone();
@@ -4399,11 +4526,7 @@ impl ViewState {
                 return;
             }
             let filtered_positions = bitset_positions(&selection.selection());
-            let mapped_positions = source_positions_for_filtered(
-                &source_for_selection,
-                &filtered_for_selection,
-                &filtered_positions,
-            );
+            let mapped_positions = map_for_selection.source_positions(&filtered_positions);
             let source_positions: Vec<_> = mapped_positions
                 .iter()
                 .map(|(_, source_position)| *source_position)
@@ -4430,9 +4553,43 @@ impl ViewState {
                 browser.set_selection(depth, &source_positions, focused_source);
             }
         });
-        filter_entry.connect_changed(move |entry| {
-            *filter_query.borrow_mut() = entry.text().to_lowercase();
-            filter.changed(gtk::FilterChange::Different);
+        let map_for_filter = map.clone();
+        let query_for_filter = filter_query.clone();
+        let filter_for_settled = filter.clone();
+        let model_for_filter = filtered_model.clone();
+        let weak_state_for_filter = Rc::downgrade(self);
+        let selection_for_filter = selection.clone();
+        let syncing_for_filter = syncing_selection.clone();
+        debounce_filter_entry(&filter_entry, move |text| {
+            let settled = text.to_lowercase();
+            apply_filter_query(
+                &model_for_filter,
+                &filter_for_settled,
+                &query_for_filter,
+                settled,
+            );
+            // The filter reshuffles visible positions, so the GTK bitset goes
+            // stale: re-assert it from the NavigationState truth (selected
+            // locations survive filtering by design) through the rebuilt map
+            // instead of leaving the highlight on the wrong rows.
+            let Some(state) = weak_state_for_filter.upgrade() else {
+                return;
+            };
+            let positions: Vec<u32> = state
+                .browser
+                .selected_positions(depth)
+                .into_iter()
+                .filter_map(|position| map_for_filter.view_position(position))
+                .collect();
+            if let Some(column) = state.columns.borrow().get(depth) {
+                syncing_for_filter.set(true);
+                apply_selection_plan(
+                    &selection_for_filter,
+                    column.filtered_model.n_items(),
+                    &positions,
+                );
+                syncing_for_filter.set(false);
+            }
         });
 
         let factory = gtk::SignalListItemFactory::new();
@@ -4442,8 +4599,7 @@ impl ViewState {
         let modified_selection_for_rows = modified_selection.clone();
         let selection_for_rows = selection.clone();
         let mouse_selection_anchor = Rc::new(Cell::new(None::<u32>));
-        let source_for_hover = model.clone();
-        let filtered_for_hover = filtered_model.clone();
+        let map_for_hover = map.clone();
         let mouse_selection_anchor_for_background = mouse_selection_anchor.clone();
         factory.connect_setup(move |_, item| {
             let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
@@ -4497,15 +4653,10 @@ impl ViewState {
             let list_item = item.clone();
             let anchor: gtk::Widget = row.clone().upcast();
             let weak_state_for_enter = weak_state.clone();
-            let source_for_enter = source_for_hover.clone();
-            let filtered_for_enter = filtered_for_hover.clone();
+            let map_for_enter = map_for_hover.clone();
             motion.connect_enter(move |_, _, _| {
                 if let Some(state) = weak_state_for_enter.upgrade() {
-                    let source_position = source_position_for_filtered(
-                        &source_for_enter,
-                        &filtered_for_enter,
-                        list_item.position(),
-                    );
+                    let source_position = map_for_enter.source_position(list_item.position());
                     let entry = source_position
                         .and_then(|position| state.browser.entry_at(depth, position));
                     if let Some(entry) = entry {
@@ -4531,15 +4682,10 @@ impl ViewState {
                 .build();
             let weak_state_for_drag = weak_state.clone();
             let dragged_item = item.clone();
-            let source_for_drag = source_for_hover.clone();
-            let filtered_for_drag = filtered_for_hover.clone();
+            let map_for_drag = map_for_hover.clone();
             drag.connect_prepare(move |source, x, y| {
                 let state = weak_state_for_drag.upgrade()?;
-                let source_position = source_position_for_filtered(
-                    &source_for_drag,
-                    &filtered_for_drag,
-                    dragged_item.position(),
-                )?;
+                let source_position = map_for_drag.source_position(dragged_item.position())?;
                 let entry = state.browser.entry_at(depth, source_position)?;
                 let selected = state.browser.selected_entries();
                 let entries = if selected
@@ -4568,18 +4714,14 @@ impl ViewState {
             drop.connect_motion(|target, _, _| file_drop_action(target));
             let weak_state_for_accept = weak_state.clone();
             let accepted_item = item.clone();
-            let source_for_accept = source_for_hover.clone();
-            let filtered_for_accept = filtered_for_hover.clone();
+            let map_for_accept = map_for_hover.clone();
             drop.connect_accept(move |_, offered| {
                 let Some(state) = weak_state_for_accept.upgrade() else {
                     return false;
                 };
-                let entry = source_position_for_filtered(
-                    &source_for_accept,
-                    &filtered_for_accept,
-                    accepted_item.position(),
-                )
-                .and_then(|position| state.browser.entry_at(depth, position));
+                let entry = map_for_accept
+                    .source_position(accepted_item.position())
+                    .and_then(|position| state.browser.entry_at(depth, position));
                 entry.is_some_and(|entry| {
                     entry.is_directory()
                         && offered
@@ -4589,20 +4731,17 @@ impl ViewState {
             });
             let weak_state_for_drop = weak_state.clone();
             let dropped_item = item.clone();
-            let source_for_drop = source_for_hover.clone();
-            let filtered_for_drop = filtered_for_hover.clone();
+            let map_for_drop = map_for_hover.clone();
             drop.connect_drop(move |target, value, _, _| {
                 let Some(state) = weak_state_for_drop.upgrade() else {
                     return false;
                 };
-                let Some(destination) = source_position_for_filtered(
-                    &source_for_drop,
-                    &filtered_for_drop,
-                    dropped_item.position(),
-                )
-                .and_then(|position| state.browser.entry_at(depth, position))
-                .filter(FileEntry::is_directory)
-                .map(|entry| entry.location) else {
+                let Some(destination) = map_for_drop
+                    .source_position(dropped_item.position())
+                    .and_then(|position| state.browser.entry_at(depth, position))
+                    .filter(FileEntry::is_directory)
+                    .map(|entry| entry.location)
+                else {
                     return false;
                 };
                 transfer_dropped_files(&state, target, value, destination)
@@ -4610,15 +4749,14 @@ impl ViewState {
             row.add_controller(drop);
 
             let selection_click = gtk::GestureClick::new();
+            let weak_state_for_click = weak_state.clone();
             selection_click.set_button(1);
             selection_click.set_propagation_phase(gtk::PropagationPhase::Capture);
             let clicked_item = item.clone();
             let selection_for_click = selection_for_rows.clone();
             let selection_anchor_for_click = mouse_selection_anchor.clone();
             let modified_for_click = modified_selection_for_rows.clone();
-            let weak_state_for_click = weak_state.clone();
-            let source_for_click = source_for_hover.clone();
-            let filtered_for_click = filtered_for_hover.clone();
+            let map_for_click = map_for_hover.clone();
             selection_click.connect_pressed(move |gesture, press_count, _, _| {
                 let position = clicked_item.position();
                 if position == gtk::INVALID_LIST_POSITION {
@@ -4657,8 +4795,7 @@ impl ViewState {
                 }
                 modified_for_click.set(false);
 
-                let source_position =
-                    source_position_for_filtered(&source_for_click, &filtered_for_click, position);
+                let source_position = map_for_click.source_position(position);
                 if let (Some(state), Some(source_position)) =
                     (weak_state_for_click.upgrade(), source_position)
                 {
@@ -4698,8 +4835,7 @@ impl ViewState {
                 row: weak_row,
             });
         });
-        let source_for_bind = model.clone();
-        let filtered_for_bind = filtered_model.clone();
+        let map_for_bind = map.clone();
         let weak_state_for_bind = Rc::downgrade(self);
         factory.connect_bind(move |_, item| {
             let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
@@ -4739,8 +4875,7 @@ impl ViewState {
             rename.set_visible(false);
             label.set_visible(true);
             spacer.set_visible(true);
-            let source_position =
-                source_position_for_filtered(&source_for_bind, &filtered_for_bind, item.position());
+            let source_position = map_for_bind.source_position(item.position());
             let state = weak_state_for_bind.upgrade();
             let browser = state.as_ref().map(|state| &state.browser);
             let entry = source_position.and_then(|position| browser?.entry_at(depth, position));
@@ -4760,22 +4895,42 @@ impl ViewState {
                 }),
             );
             if let Some(entry) = entry.as_ref() {
-                super::thumbnail::set_thumbnail_or_icon(&icon, entry, entry_icon(entry), 17, 17);
+                // Like the grid and explorer binds: hidden views bind, but
+                // only the visible mode earns decodes and fills.
+                let mode_active = state
+                    .as_ref()
+                    .is_some_and(|state| state.mode_views.borrow().mode() == BrowserMode::Columns);
+                if mode_active {
+                    super::thumbnail::set_thumbnail_or_icon(
+                        &icon,
+                        entry,
+                        entry_icon(entry),
+                        17,
+                        17,
+                    );
+                } else {
+                    crate::assets::set_primary_icon(&icon, entry_icon(entry));
+                }
                 icon.set_opacity(if entry.is_directory() { 1.0 } else { 0.72 });
                 chevron.set_visible(entry.is_directory());
+                // Bound rows are the visible window: backfill the size/mtime
+                // the streaming enumeration skipped. Debounced per depth, so
+                // a fling binds hundreds of rows but stats one settled set.
+                if mode_active
+                    && let Some(state) = state.as_ref()
+                    && let Some(position) = source_position
+                    && metadata_needs_fill(entry)
+                {
+                    state
+                        .browser
+                        .request_metadata_fill(depth, position, entry.location.clone());
+                }
             } else {
                 super::thumbnail::show_fallback_icon(&icon, crate::assets::icons::DOCUMENTS, 17);
                 icon.set_opacity(0.72);
                 chevron.set_visible(false);
             }
-            let size_text = entry
-                .filter(|entry| !entry.is_directory())
-                .and_then(|entry| match entry.size {
-                    crate::model::MetadataValue::Known(bytes) => Some(format_file_size(bytes)),
-                    crate::model::MetadataValue::Unknown
-                    | crate::model::MetadataValue::Unavailable => None,
-                })
-                .unwrap_or_default();
+            let size_text = column_size_text(entry.as_ref());
             size.set_label(&size_text);
             size.set_visible(!size_text.is_empty());
         });
@@ -4824,14 +4979,9 @@ impl ViewState {
         list.add_controller(selection_keys);
 
         let weak_browser = Rc::downgrade(&self.browser);
-        let source_for_activation = model.clone();
-        let filtered_for_activation = filtered_model.clone();
+        let map_for_activation = map.clone();
         list.connect_activate(move |_, position| {
-            let source_position = source_position_for_filtered(
-                &source_for_activation,
-                &filtered_for_activation,
-                position,
-            );
+            let source_position = map_for_activation.source_position(position);
             if let (Some(browser), Some(source_position)) =
                 (weak_browser.upgrade(), source_position)
             {
@@ -4927,11 +5077,8 @@ impl ViewState {
                 (row == picked).then_some(item.position())
             })
         });
-        let source_for_context = model.clone();
-        let filtered_for_context = filtered_model.clone();
-        let source_position = Rc::new(move |position| {
-            source_position_for_filtered(&source_for_context, &filtered_for_context, position)
-        });
+        let map_for_context = map.clone();
+        let source_position = Rc::new(move |position| map_for_context.source_position(position));
         install_item_context_menu(
             self,
             list.upcast_ref(),
@@ -5016,6 +5163,8 @@ impl ViewState {
             presentation,
             model,
             filtered_model,
+            map,
+            model_generation: self.source_generation.clone(),
             header_actions,
             filter_entry,
             filter_button,
@@ -5026,6 +5175,7 @@ impl ViewState {
             bound_rows,
             entry_count,
             spinner,
+            spinner_delay: Rc::new(RefCell::new(None)),
             truncated_hint,
             empty_trash_button: is_trash.then_some(empty_trash),
             new_entry_row,
@@ -5035,11 +5185,16 @@ impl ViewState {
             filter: filter_for_column,
         });
 
+        // Accessible loading state immediately; the prominent spinner only
+        // after the delay, so fast loads never flash it.
+        if let Some(column) = self.columns.borrow().last() {
+            set_column_busy(column, true);
+            arm_column_spinner(column);
+        }
         self.refresh_active_path_rows();
         animate_column_entry(&shell, &column, &animation_generation);
         self.reveal_column(shell);
     }
-
     fn reveal_column(self: &Rc<Self>, shell: gtk::Box) {
         let animation_id = self.horizontal_scroll_generation.get().saturating_add(1);
         self.horizontal_scroll_generation.set(animation_id);
@@ -5381,6 +5536,67 @@ pub(super) fn format_file_size(bytes: u64) -> String {
     format!("{} {}", formatted.trim_end_matches(".0"), UNITS[unit])
 }
 
+/// Whether a bound row still needs a viewport metadata fill: files missing
+/// size or mtime, or directories missing mtime. Directory size stays unknown
+/// by design and never qualifies.
+pub(super) fn metadata_needs_fill(entry: &FileEntry) -> bool {
+    entry.modified_unix_seconds == crate::model::MetadataValue::Unknown
+        || (!entry.is_directory() && entry.size == crate::model::MetadataValue::Unknown)
+}
+
+/// Size label text for a columns row, shared by the bind and the in-place
+/// metadata refresh so both render identical strings.
+fn column_size_text(entry: Option<&FileEntry>) -> String {
+    entry
+        .filter(|entry| !entry.is_directory())
+        .and_then(|entry| match entry.size {
+            crate::model::MetadataValue::Known(bytes) => Some(format_file_size(bytes)),
+            crate::model::MetadataValue::Unknown | crate::model::MetadataValue::Unavailable => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Delay before a new column's header spinner becomes prominent. Fast loads
+/// settle first, so no spinner flashes for work that finishes in ~120 ms.
+const COLUMN_SPINNER_DELAY: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Arms the delayed initial spinner for a freshly appended column.
+fn arm_column_spinner(column: &ColumnView) {
+    cancel_column_spinner(column);
+    let spinner = column.spinner.clone();
+    let delay = column.spinner_delay.clone();
+    *column.spinner_delay.borrow_mut() = Some(glib::timeout_add_local_once(
+        COLUMN_SPINNER_DELAY,
+        move || {
+            // Spent: disarm so a later cancel never removes a fired id
+            // (GLib refuses, and the unwrap would abort the main loop).
+            delay.borrow_mut().take();
+            spinner.set_visible(true);
+            spinner.start();
+        },
+    ));
+}
+/// Cancels a pending delayed spinner without touching a running one.
+fn cancel_column_spinner(column: &ColumnView) {
+    if let Some(source) = column.spinner_delay.borrow_mut().take() {
+        source.remove();
+    }
+}
+
+/// Stops a column's spinner outright, including a still-pending delay.
+fn stop_column_spinner(column: &ColumnView) {
+    cancel_column_spinner(column);
+    column.spinner.stop();
+    column.spinner.set_visible(false);
+}
+
+/// Marks a column's list busy (or settled) for assistive technology.
+fn set_column_busy(column: &ColumnView, busy: bool) {
+    column
+        .list
+        .update_state(&[gtk::accessible::State::Busy(busy)]);
+}
+
 fn set_filter_placeholder(column: &ColumnView, count: usize) {
     let noun = if count == 1 { "item" } else { "items" };
     column
@@ -5388,39 +5604,262 @@ fn set_filter_placeholder(column: &ColumnView, count: usize) {
         .set_placeholder_text(Some(&format!("Filter {count} {noun}…")));
 }
 
-fn source_position_for_filtered(
-    source: &gtk::StringList,
-    filtered: &gtk::FilterListModel,
-    filtered_position: u32,
-) -> Option<usize> {
-    source_positions_for_filtered(source, filtered, &[filtered_position])
-        .first()
-        .map(|(_, source)| *source)
+/// Debounce applied to every filter entry: rapid keystrokes collapse into a
+/// single settled evaluation instead of one full re-filter per character.
+/// Re-filtering 100k rows costs far more than a frame, so per-keystroke
+/// evaluation is the typing jank; one evaluation per pause is not.
+pub(crate) const FILTER_DEBOUNCE_DELAY: Duration = Duration::from_millis(60);
+
+/// Routes a filter entry through the shared debounce: each edit cancels the
+/// pending evaluation and arms a fresh one, so only the latest query after
+/// a typing pause reaches `on_settled` with its settled text.
+pub(crate) fn debounce_filter_entry(entry: &gtk::Entry, on_settled: impl Fn(String) + 'static) {
+    let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let on_settled = Rc::new(on_settled);
+    entry.connect_changed(move |entry| {
+        cancel_source(&pending);
+        let slot = pending.clone();
+        let callback = on_settled.clone();
+        let text = entry.text().to_string();
+        *pending.borrow_mut() = Some(glib::timeout_add_local_once(
+            FILTER_DEBOUNCE_DELAY,
+            move || {
+                slot.borrow_mut().take();
+                callback(text);
+            },
+        ));
+    });
+}
+/// Picks the cheapest `FilterChange` for a settled query edit. Typing
+/// narrows the previous query, so matches can only shrink and the model
+/// skips already-hidden rows; deleting widens it and must reconsider them.
+/// Anything else re-evaluates everything.
+pub(crate) fn filter_change_for(previous: &str, settled: &str) -> gtk::FilterChange {
+    if settled.starts_with(previous) && settled.len() > previous.len() {
+        gtk::FilterChange::MoreStrict
+    } else if previous.starts_with(settled) && previous.len() > settled.len() {
+        gtk::FilterChange::LessStrict
+    } else {
+        gtk::FilterChange::Different
+    }
 }
 
-fn source_positions_for_filtered(
+pub(crate) fn apply_filter_query(
+    model: &gtk::FilterListModel,
+    filter: &gtk::CustomFilter,
+    query: &RefCell<String>,
+    settled: String,
+) {
+    let previous = query.borrow().clone();
+    let change = filter_change_for(&previous, &settled);
+    *query.borrow_mut() = settled;
+    if query.borrow().is_empty() {
+        model.set_filter(None::<&gtk::Filter>);
+    } else if previous.is_empty() {
+        model.set_filter(Some(filter));
+    } else {
+        filter.changed(change);
+    }
+}
+
+/// Cached source<->visible index map for one (query, model generation). A
+/// full re-filter or model splice rebuilds it once in O(n); every bind,
+/// activation, and selection sync after that is O(1). With no query active
+/// the filter passes everything in order, so callers take the identity fast
+/// path and never build (or even touch) the map.
+#[derive(Default)]
+pub(crate) struct PositionMap {
+    query: String,
+    generation: u64,
+    /// Visible position -> source position, in visible order.
+    forward: Vec<usize>,
+    /// Source position -> visible position (`NO_FILTERED_POSITION` = hidden).
+    reverse: Vec<u32>,
+}
+
+pub(crate) const NO_FILTERED_POSITION: u32 = u32::MAX;
+
+/// Rebuilds the map in a single monotonic pass over both models: the filter
+/// preserves source order, so one joint walk emits both directions.
+fn rebuild_position_map(
     source: &gtk::StringList,
     filtered: &gtk::FilterListModel,
-    filtered_positions: &[u32],
-) -> Vec<(u32, usize)> {
+    query: &str,
+    generation: u64,
+) -> PositionMap {
+    let mut forward = Vec::with_capacity(filtered.n_items() as usize);
+    let mut reverse = vec![NO_FILTERED_POSITION; source.n_items() as usize];
+    let n_source = source.n_items();
     let mut source_position = 0;
-    filtered_positions
-        .iter()
-        .filter_map(|filtered_position| {
-            let item = filtered.item(*filtered_position)?;
-            while source_position < source.n_items() {
-                let candidate_position = source_position;
-                source_position += 1;
-                if source
-                    .item(candidate_position)
-                    .is_some_and(|candidate| candidate == item)
-                {
-                    return Some((*filtered_position, candidate_position as usize));
-                }
+    for filtered_position in 0..filtered.n_items() {
+        let Some(item) = filtered.item(filtered_position) else {
+            continue;
+        };
+        while source_position < n_source {
+            let candidate = source_position;
+            source_position += 1;
+            if source.item(candidate).is_some_and(|value| value == item) {
+                forward.push(candidate as usize);
+                reverse[candidate as usize] = filtered_position;
+                break;
             }
-            None
-        })
-        .collect()
+        }
+    }
+    PositionMap {
+        query: query.to_owned(),
+        generation,
+        forward,
+        reverse,
+    }
+}
+
+/// Everything a view needs to translate between its visible positions and
+/// source positions: the shared model-generation clock, the folded query,
+/// the map cache, and the two models. Columns views carry no placeholder
+/// (`placeholder: None`); Grid/Explorer flatten a placeholder row above the
+/// filter output, so their visible positions shift by its live row count.
+#[derive(Clone)]
+pub(crate) struct ViewMap {
+    cache: Rc<RefCell<PositionMap>>,
+    query: Rc<RefCell<String>>,
+    generation: Rc<Cell<u64>>,
+    source: gtk::StringList,
+    filter: gtk::FilterListModel,
+    placeholder: Option<gtk::StringList>,
+}
+
+impl ViewMap {
+    pub(crate) fn new(
+        query: Rc<RefCell<String>>,
+        generation: Rc<Cell<u64>>,
+        source: gtk::StringList,
+        filter: gtk::FilterListModel,
+        placeholder: Option<gtk::StringList>,
+    ) -> Self {
+        Self {
+            cache: Rc::new(RefCell::new(PositionMap::default())),
+            query,
+            generation,
+            source,
+            filter,
+            placeholder,
+        }
+    }
+
+    fn placeholder_count(&self) -> u32 {
+        self.placeholder
+            .as_ref()
+            .map_or(0, |placeholder| placeholder.n_items())
+    }
+
+    /// Visible (flatten) position -> source position. O(1): identity-checked
+    /// without a query, cache hit otherwise, one O(n) rebuild per
+    /// (query, generation) at most.
+    pub(crate) fn source_position(&self, visible_position: u32) -> Option<usize> {
+        let filter_position = visible_position.checked_sub(self.placeholder_count())?;
+        let query = self.query.borrow();
+        if query.is_empty() {
+            // No query: the filter passes everything in order. Cross-check
+            // both models so a transitional state degrades to a safe miss
+            // instead of a wrong row; no scan, no map, same cost at row 10
+            // and row 90,000.
+            let source_item = self.source.item(filter_position)?;
+            let visible_item = self.filter.item(filter_position)?;
+            return (source_item == visible_item).then_some(filter_position as usize);
+        }
+        let mut cache = self.cache.borrow_mut();
+        let generation = self.generation.get();
+        if cache.query != *query || cache.generation != generation {
+            *cache = rebuild_position_map(&self.source, &self.filter, &query, generation);
+        }
+        cache.forward.get(filter_position as usize).copied()
+    }
+
+    /// Source position -> visible (flatten) position. Same cost profile as
+    /// [`ViewMap::source_position`].
+    pub(crate) fn view_position(&self, source_position: usize) -> Option<u32> {
+        let query = self.query.borrow();
+        if query.is_empty() {
+            let position = source_position as u32;
+            let source_item = self.source.item(position)?;
+            let visible_item = self.filter.item(position)?;
+            return (source_item == visible_item).then_some(position + self.placeholder_count());
+        }
+        let mut cache = self.cache.borrow_mut();
+        let generation = self.generation.get();
+        if cache.query != *query || cache.generation != generation {
+            *cache = rebuild_position_map(&self.source, &self.filter, &query, generation);
+        }
+        let position = *cache.reverse.get(source_position)?;
+        (position != NO_FILTERED_POSITION).then_some(position + self.placeholder_count())
+    }
+
+    /// Batch variant for selection sync: one cache ensure, then O(1) per
+    /// position. Preserves the (visible, source) pair order of the input.
+    pub(crate) fn source_positions(&self, visible_positions: &[u32]) -> Vec<(u32, usize)> {
+        visible_positions
+            .iter()
+            .filter_map(|position| {
+                self.source_position(*position)
+                    .map(|source| (*position, source))
+            })
+            .collect()
+    }
+}
+
+/// How a position list reaches the GTK selection: whole-model and single
+/// contiguous runs use native bulk ops (one call, no per-row round trips);
+/// only genuinely scattered sets fall back to per-item selection.
+pub(crate) enum SelectionPlan<'a> {
+    All,
+    Range { position: u32, count: u32 },
+    Items(&'a [u32]),
+}
+
+pub(crate) fn plan_selection(n_items: u32, positions: &[u32]) -> SelectionPlan<'_> {
+    let contiguous =
+        !positions.is_empty() && positions.windows(2).all(|pair| pair[1] == pair[0] + 1);
+    if contiguous && positions.len() as u32 == n_items && positions[0] == 0 {
+        SelectionPlan::All
+    } else if contiguous {
+        SelectionPlan::Range {
+            position: positions[0],
+            count: positions.len() as u32,
+        }
+    } else {
+        SelectionPlan::Items(positions)
+    }
+}
+
+/// Applies `positions` (visible indexes into a model of `n_items` rows)
+/// with the cheapest native op. Callers hold their syncing guard.
+pub(crate) fn apply_selection_plan(
+    selection: &gtk::MultiSelection,
+    n_items: u32,
+    positions: &[u32],
+) {
+    match plan_selection(n_items, positions) {
+        SelectionPlan::All => {
+            selection.select_all();
+        }
+        SelectionPlan::Range { position, count } => {
+            selection.select_range(position, count, true);
+        }
+        SelectionPlan::Items(items) => {
+            selection.unselect_all();
+            for position in items {
+                selection.select_item(*position, false);
+            }
+        }
+    }
+}
+/// Advances the shared source-model generation after a splice. Every column
+/// and mode pane keys its cached position map on this clock, so one bump
+/// invalidates every map at once with no per-view bookkeeping.
+fn touch_source_model(column: &ColumnView) {
+    column
+        .model_generation
+        .set(column.model_generation.get().saturating_add(1));
 }
 
 fn set_column_selection(column: &ColumnView, position: u32) {
@@ -5434,10 +5873,13 @@ fn set_column_selection(column: &ColumnView, position: u32) {
 
 fn set_column_selections(column: &ColumnView, positions: &[u32]) {
     column.syncing_selection.set(true);
-    column.selection.unselect_all();
-    for position in positions {
-        column.selection.select_item(*position, false);
-    }
+    // Select All over 100k rows used to issue 100k `select_item` calls;
+    // full coverage and single contiguous runs now use one native bulk op.
+    apply_selection_plan(
+        &column.selection,
+        column.filtered_model.n_items(),
+        positions,
+    );
     column.syncing_selection.set(false);
 }
 
@@ -5446,16 +5888,6 @@ fn bitset_positions(bitset: &gtk::Bitset) -> Vec<u32> {
         return Vec::new();
     };
     std::iter::once(first).chain(iterator).collect()
-}
-
-fn filtered_position_for_source(column: &ColumnView, source_position: usize) -> Option<u32> {
-    let item = column.model.item(source_position as u32)?;
-    (0..column.filtered_model.n_items()).find(|position| {
-        column
-            .filtered_model
-            .item(*position)
-            .is_some_and(|candidate| candidate == item)
-    })
 }
 
 pub(super) fn install_folder_context_menu(
@@ -7377,7 +7809,26 @@ pub(super) fn entry_model_value(entry: &FileEntry) -> String {
         'f'
     };
     let hidden = if entry.is_hidden { 'h' } else { 'v' };
-    format!("{kind}{hidden}\t{}", entry.display_name)
+    let name = entry.display_name.as_str();
+    let mut value = String::with_capacity(name.len() + 3);
+    value.push(kind);
+    value.push(hidden);
+    value.push('\t');
+    value.push_str(name);
+    value
+}
+
+fn entry_model_values(
+    browser: &Browser,
+    depth: usize,
+    position: usize,
+    count: usize,
+) -> Vec<String> {
+    browser
+        .with_entries(depth, position..position.saturating_add(count), |entries| {
+            entries.iter().map(entry_model_value).collect()
+        })
+        .unwrap_or_default()
 }
 
 fn model_display_name(value: &str) -> &str {
@@ -7484,6 +7935,14 @@ pub(super) fn entry_icon(entry: &FileEntry) -> &'static str {
     icon_for_name(&entry.display_name)
 }
 
+/// Full-directory filter predicate shared by every view mode. Source models
+/// carry `kind\tname` values; matching runs against the display name so a
+/// shared model filters identically in Columns, Grid, and Explorer.
+/// `query` must already be folded to lowercase by the caller.
+pub(super) fn pane_filter_matches(value: &str, query: &str) -> bool {
+    query.is_empty() || model_display_name(value).to_lowercase().contains(query)
+}
+
 fn icon_for_name(name: &str) -> &'static str {
     let extension = name
         .rsplit_once('.')
@@ -7576,12 +8035,12 @@ fn peek_horizontal_placement(
 fn append_peek_entries(peek: &PeekView, entries: Vec<FileEntry>, limit: usize) {
     let remaining = limit.max(1).saturating_sub(peek.entry_count.get());
     let entries = entries.into_iter().take(remaining).collect::<Vec<_>>();
-    let values = entries.iter().map(entry_model_value).collect::<Vec<_>>();
+    let mut values = Vec::with_capacity(entries.len());
+    values.extend(entries.iter().map(entry_model_value));
     peek.entry_count.set(peek.entry_count.get() + entries.len());
     peek.entries.borrow_mut().extend(entries);
-    for value in values {
-        peek.model.append(&value);
-    }
+    let refs: Vec<_> = values.iter().map(String::as_str).collect();
+    peek.model.splice(peek.model.n_items(), 0, &refs);
 }
 
 fn cancel_source(source: &RefCell<Option<glib::SourceId>>) {
