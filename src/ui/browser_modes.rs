@@ -1584,7 +1584,8 @@ fn build_grid_view(
         };
         let source_position =
             source_position_for_view(&source_for_bind, Some(&filtered_for_bind), item.position());
-        let entry = browser_for_bind.upgrade().and_then(|browser| {
+        let browser = browser_for_bind.upgrade();
+        let entry = browser.as_ref().and_then(|browser| {
             source_position.and_then(|position| browser.entry_at(depth, position))
         });
         if let Some(entry) = entry {
@@ -1600,6 +1601,11 @@ fn build_grid_view(
                 26,
                 thumbnail_size_for_bind.get(),
             );
+            if let Some(position) = metadata_fill_position(source_position, &entry)
+                && let Some(browser) = browser.as_ref()
+            {
+                browser.request_metadata_fill(depth, position, entry.location.clone());
+            }
             icon.set_opacity(if entry.is_directory() { 1.0 } else { 0.72 });
         } else {
             card.remove_css_class("cut-item");
@@ -2305,7 +2311,8 @@ fn build_explorer_pane(
             Some(&view_model_for_bind),
             item.position(),
         );
-        let entry = browser_for_bind.upgrade().and_then(|browser| {
+        let browser = browser_for_bind.upgrade();
+        let entry = browser.as_ref().and_then(|browser| {
             source_position.and_then(|position| browser.entry_at(depth, position))
         });
         if let Some(entry) = entry {
@@ -2319,6 +2326,11 @@ fn build_explorer_pane(
                 18,
                 18,
             );
+            if let Some(position) = metadata_fill_position(source_position, &entry)
+                && let Some(browser) = browser.as_ref()
+            {
+                browser.request_metadata_fill(depth, position, entry.location.clone());
+            }
             name.set_label(&entry.display_name);
             size.set_label(&entry_size(&entry));
             kind.set_label(entry_type(&entry));
@@ -2824,6 +2836,10 @@ fn source_position_for_view(
     (0..source.n_items())
         .find(|candidate| source.item(*candidate).is_some_and(|value| value == item))
         .map(|position| position as usize)
+}
+
+fn metadata_fill_position(position: Option<usize>, entry: &FileEntry) -> Option<usize> {
+    position.filter(|_| super::browser::metadata_needs_fill(entry))
 }
 
 fn view_position_for_source(
