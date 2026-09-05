@@ -130,13 +130,27 @@ fn save_modal(mode: BrowserMode, root: &Path) {
         current_filter: None,
         choices: Vec::new(),
     };
+    ThemeManager::shared().set_browser_mode(mode);
     let state =
         build_chooser(request, Arc::new(AtomicBool::new(false)), |_| {}).expect("save chooser");
     state.view.set_view_mode(mode);
     settle();
     focus_window();
     let filename = state.filename.as_ref().expect("filename");
-    filename.grab_focus();
+    assert!(
+        focused(&state).is_ancestor(filename),
+        "Save initially focuses its filename"
+    );
+    assert!(
+        filename.selection_bounds().is_some(),
+        "the suggested filename starts selected"
+    );
+    gtk::prelude::GtkWindowExt::set_focus(&state.window, None::<&gtk::Widget>);
+    key("Right");
+    assert!(
+        focused(&state).is_ancestor(filename),
+        "an arrow restores missing Save focus to the filename"
+    );
     key("ctrl+a");
     assert!(filename.selection_bounds().is_some());
     key("Left");
@@ -211,12 +225,35 @@ fn keyboard_only_controls_and_file_navigation_work_in_every_chooser_view() {
                     Choice::boolean("compress", "Compress files", false),
                 ],
             };
+            ThemeManager::shared().set_browser_mode(mode);
+            ThemeManager::shared().set_group_by_type(grouped);
             let state =
                 build_chooser(request, Arc::new(AtomicBool::new(false)), |_| {}).expect("chooser");
             state.view.set_view_mode(mode);
             state.view.set_group_by_type(grouped);
             settle();
             focus_window();
+            assert!(
+                focused(&state).has_css_class("sidebar-toggle"),
+                "Open starts with a focused top-bar control: {mode:?}, focus={:?}, visible={}, items={}",
+                focused(&state),
+                state.window.gets_focus_visible(),
+                state.view.item_view_has_focus()
+            );
+            assert!(
+                state.window.gets_focus_visible(),
+                "startup focus is visible"
+            );
+            for arrow in ["Left", "Right", "Up", "Down"] {
+                gtk::prelude::GtkWindowExt::set_focus(&state.window, None::<&gtk::Widget>);
+                state.window.set_focus_visible(false);
+                key(arrow);
+                assert!(
+                    focused(&state).has_css_class("sidebar-toggle"),
+                    "{arrow} establishes missing focus"
+                );
+                assert!(state.window.gets_focus_visible());
+            }
             let browser = state.view.browser();
             let deadline = Instant::now() + Duration::from_secs(5);
             while browser.entry_at(0, 21).is_none() {

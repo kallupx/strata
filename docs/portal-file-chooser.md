@@ -93,6 +93,9 @@ On a desktop that does not manage the frontend as a systemd user unit, log out a
 
 ## Keyboard navigation
 
+- Open dialogs start with visible focus on the sidebar toggle. Save dialogs focus
+  and select the suggested filename. If focus is lost, an arrow restores it without
+  requiring a click.
 - Tab/Shift+Tab traverse controls; arrows move between toolbar icons and options.
 - Up from the first file row reaches the pane toolbar; Down returns to files.
 - Grid arrows follow the visual rows and columns. Explorer arrows follow the

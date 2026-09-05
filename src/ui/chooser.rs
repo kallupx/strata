@@ -987,6 +987,20 @@ fn build_chooser(
     apply_external_parent(&window, state.request.parent.as_ref());
     browser.navigate(Location::local(&state.request.initial_directory));
     window.present();
+    if let Some(filename) = state.filename.as_ref() {
+        filename.grab_focus();
+        filename.select_region(0, -1);
+    } else {
+        sidebar_toggle.grab_focus();
+    }
+    window.set_focus_visible(true);
+    let initial_focus = gtk::prelude::RootExt::focus(&window).map(|widget| widget.downgrade());
+    // View initialization also queues focus work; restore the chooser's target afterward.
+    glib::idle_add_local_once(move || {
+        if let Some(widget) = initial_focus.and_then(|widget| widget.upgrade()) {
+            widget.grab_focus();
+        }
+    });
     Some(state)
 }
 
@@ -1165,6 +1179,25 @@ fn install_shortcuts(
         let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
         let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
         let focused = gtk::prelude::RootExt::focus(&state.window);
+        if !control
+            && !alt
+            && !shift
+            && !modifiers.contains(gtk::gdk::ModifierType::SUPER_MASK)
+            && super::focus_navigation::arrow_direction(key).is_some()
+        {
+            state.window.set_focus_visible(true);
+            if focused
+                .as_ref()
+                .is_none_or(|widget| !widget.is_mapped() || !widget.is_sensitive())
+            {
+                if let Some(filename) = state.filename.as_ref() {
+                    filename.grab_focus();
+                } else {
+                    sidebar_toggle.grab_focus();
+                }
+                return glib::Propagation::Stop;
+            }
+        }
         let sidebar_has_focus = focused.as_ref().is_some_and(|focused| {
             focused == &sidebar_widget || focused.is_ancestor(&sidebar_widget)
         });
