@@ -1120,7 +1120,10 @@ fn single_pane_arrow_action(
     }
 }
 
-fn is_browser_navigation_key(key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType) -> bool {
+pub(super) fn is_browser_navigation_key(
+    key: gtk::gdk::Key,
+    modifiers: gtk::gdk::ModifierType,
+) -> bool {
     if modifiers
         .intersects(gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::SUPER_MASK)
     {

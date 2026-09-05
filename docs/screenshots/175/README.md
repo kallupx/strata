@@ -10,6 +10,9 @@ After, captured using disposable sample files on a private D-Bus session:
 - `preview.png`: native image preview and application-supplied image filter.
 - `save.png`, `overwrite.png`: suggested filename, compact options, toolbar New Folder icon, and shared themed overwrite modal.
 - `grid.png`: multiple selection across type groups in Grid.
+- `focus-chooser-explorer-before.png`: missing keyboard cursor and stale hover treatment after pointer input.
+- `focus-main-{columns,grid,explorer}.png`, `focus-chooser-{columns,grid,explorer}.png`: matching shared selection fills and keyboard cursors after switching from pointer to keyboard navigation.
+- `focus-main-explorer-light.png`, `focus-chooser-explorer-light.png`: the same comparison in Classic Light.
 - `context-menu-before.png`, `context-menu.png`, `context-menu-light.png`: right-click behavior before and after adding the chooser-only Rename/Properties menu.
 - `folder-context-menu.png`, `chooser-rename.png`, `chooser-properties.png`: empty-space New Folder, inline rename, and shared themed Properties in the chooser.
 - `save-light.png`: Filter, Encoding, and Compress files on one compact row in Classic Light.

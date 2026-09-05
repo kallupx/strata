@@ -93,6 +93,9 @@ On a desktop that does not manage the frontend as a systemd user unit, log out a
 
 ## Keyboard navigation
 
+- File selection fills, keyboard cursor outlines, and pointer-hover suppression
+  use the main app's shared input-ownership styling, including when switching back
+  to keyboard navigation after using the mouse.
 - Open dialogs start with visible keyboard focus. Save dialogs focus
   and select the suggested filename. If focus is lost, an arrow restores it without
   requiring a click.

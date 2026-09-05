@@ -1179,6 +1179,17 @@ fn install_shortcuts(
         let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
         let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
         let focused = gtk::prelude::RootExt::focus(&state.window);
+        if !focused
+            .as_ref()
+            .is_some_and(super::focus_navigation::in_popover)
+            && (super::window::is_sidebar_focus_shortcut(key, modifiers)
+                || (!focused
+                    .as_ref()
+                    .is_some_and(super::focus_navigation::editable)
+                    && super::window::is_browser_navigation_key(key, modifiers)))
+        {
+            state.view.keyboard_navigation();
+        }
         if !control
             && !alt
             && !shift

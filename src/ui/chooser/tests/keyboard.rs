@@ -294,6 +294,43 @@ fn keyboard_only_controls_and_file_navigation_work_in_every_chooser_view() {
                     "first visual group takes focus"
                 );
             }
+            let retained = browser.selected_entries();
+            let tool = std::env::var_os("STRATA_TEST_XDOTOOL").unwrap_or_else(|| "xdotool".into());
+            for (x, y) in [(500, 300), (510, 310)] {
+                assert!(
+                    Command::new(&tool)
+                        .args([
+                            "search",
+                            "--onlyvisible",
+                            "--name",
+                            "^Strata keyboard regression$",
+                            "mousemove",
+                            "--window",
+                            "%1",
+                            &x.to_string(),
+                            &y.to_string(),
+                        ])
+                        .status()
+                        .expect("pointer movement")
+                        .success()
+                );
+                settle();
+            }
+            assert!(
+                !state.view.widget().has_css_class("keyboard-navigation"),
+                "pointer input uses shared pointer styling"
+            );
+            assert_eq!(
+                browser.selected_entries(),
+                retained,
+                "pointer movement preserves selection fills"
+            );
+            key("Down");
+            assert!(
+                state.view.widget().has_css_class("keyboard-navigation"),
+                "arrow navigation restores the shared keyboard cursor styling"
+            );
+            key("Up");
             let before_toolbar = selected(&state);
             key("Up");
             assert!(
