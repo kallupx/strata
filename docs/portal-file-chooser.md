@@ -137,7 +137,17 @@ Portal backend selection happens before a request is sent. Keeping the existing 
 
 ### Test a build without changing your desktop portal
 
-From the repository root, build Strata and run the dedicated client (requires Python with PyGObject/Gio and `dbus-daemon`):
+From the repository root, use `make run-chooser-dev` to rebuild and open an isolated Save chooser with application choices. Requires Python with PyGObject/Gio and `dbus-daemon`.
+
+```bash
+make run-chooser-dev
+make run-chooser-dev CHOOSER_CASE=multiple CHOOSER_ARGS="--view grid --group-by-type"
+make run-chooser-dev CHOOSER_ARGS="--choices --theme classic-light"
+```
+
+This target disables accessibility integration only for the test session, whose private bus does not provide a working accessibility registry. `make run-dev` still launches the normal app.
+
+You can also build Strata and run the dedicated client directly:
 
 ```bash
 cargo build

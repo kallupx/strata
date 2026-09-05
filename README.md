@@ -387,6 +387,8 @@ Build requirements are the latest stable Rust toolchain, a C toolchain, `pkg-con
 sudo pacman -S --needed base-devel rust bubblewrap ffmpeg ffmpegthumbnailer fontconfig \
   gst-libav gst-plugins-good gtk4 gtksourceview5 poppler-glib
 make start-dev        # rebuild and restart as files change
+make run-dev          # build and launch the main app once
+make run-chooser-dev  # build and open an isolated Save chooser with choices
 ./scripts/check.sh    # format, compile, Clippy, tests, and optional policy checks
 ```
 
