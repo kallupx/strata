@@ -59,6 +59,12 @@ fn main() -> gtk::glib::ExitCode {
     }
     if arguments
         .get(1)
+        .is_some_and(|value| value == "--dismiss-portal-prompt")
+    {
+        return finish_portal_setup(portal_setup::dismiss_prompt());
+    }
+    if arguments
+        .get(1)
         .is_some_and(|value| value == "--uninstall-portal")
     {
         return finish_portal_setup(portal_setup::uninstall());

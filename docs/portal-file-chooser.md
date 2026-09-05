@@ -6,7 +6,34 @@ The chooser is deliberately limited to local files and folders. It uses the main
 
 Wayland applications can provide an exported parent handle. X11 parent handles are not attached; these requests appear as standalone windows.
 
+## Opt in through the app or installer
+
+On the first normal launch after updating to a version with this feature, Strata
+asks once whether to replace your Open and Save dialogs. **Nothing changes without
+consent.** “Not now”, Escape, closing the offer, or clicking outside it keeps your
+current chooser. Portal requests themselves never show the offer.
+
+You can always enable Strata later through **Settings → General → System file
+chooser → Configure…**. The same control restores your previous chooser when
+Strata is configured. File chooser replacement is separate from making Strata the
+default file manager, folder handler, or “Open file location” handler.
+
+The installer asks separately, defaulting to **No**, after placing the binary at
+its permanent path. A declined installer offer is remembered so the app does not
+ask again. For unattended installation, `--with-file-chooser` opts in;
+`--without-file-chooser` keeps your current chooser and suppresses the in-app offer.
+A plain `--non-interactive` install does neither: the app can still ask on its first
+normal launch. These options require a release containing portal support.
+
+The offer is remembered in `${XDG_CONFIG_HOME:-~/.config}/strata/portal-opt-in-v1`,
+shared by the installer, CLI, and all app windows. Administrators can suppress only
+the offer with `strata --dismiss-portal-prompt`, without changing portal preferences.
+
 ## Per-user installation
+
+Ensure `xdg-desktop-portal` is installed. The Arch/Omarchy installer includes it
+when file chooser integration is selected. Close active file dialogs before
+enabling or restoring the chooser: setup restarts the portal frontend.
 
 Install Strata at a stable absolute path, then run:
 
@@ -63,6 +90,29 @@ systemctl --user restart xdg-desktop-portal.service
 ```
 
 On a desktop that does not manage the frontend as a systemd user unit, log out and back in instead.
+
+## Keyboard navigation
+
+- Tab/Shift+Tab traverse controls; arrows move between toolbar icons and options.
+- Up from the first file row reaches the pane toolbar; Down returns to files.
+- Grid arrows follow the visual rows and columns. Explorer arrows follow the
+  displayed order, including type grouping. Shift+arrows extend or shrink a range
+  across groups; plain arrows select only the focused item.
+- Space/Enter activate focused buttons and toggles. Down or Enter opens a focused
+  dropdown; its arrows and Enter select an option.
+- Text fields keep their cursor keys and Ctrl+A. Ctrl+L edits the location;
+  Ctrl+F opens the pane filter; Ctrl+Shift+N creates a folder.
+- Ctrl+Shift+B focuses the sidebar; Right returns to files. Space on a file toggles
+  preview. Ctrl+Enter accepts a selected folder in a folder-selection request.
+- Escape dismisses the innermost menu, inline edit, filter, preview, or confirmation
+  before cancelling the request. Confirmation dialogs initially focus Cancel.
+
+The X11 keyboard regression test requires `xdotool` (or `STRATA_TEST_XDOTOOL`) and
+isolated XDG directories. Run it alone under a test display:
+
+```bash
+cargo test keyboard_only_controls_and_file_navigation_work_in_every_chooser_view -- --ignored
+```
 
 ## Verification
 

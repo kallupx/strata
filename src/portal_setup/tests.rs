@@ -150,6 +150,103 @@ fn portal_activation_accepts_only_the_effective_user_or_root_as_owners() {
     assert!(!trusted_owner(1_001, 1_000));
 }
 
+#[test]
+fn the_one_time_offer_never_changes_the_current_chooser() {
+    let fixture = fixture();
+    let context = context(fixture.path());
+    let config = context.portal_directory().join("portals.conf");
+    fs::create_dir_all(config.parent().expect("config parent")).expect("config directory");
+    let original = "[preferred]\ndefault=gtk;\n";
+    fs::write(&config, original).expect("portal config");
+
+    assert!(super::take_prompt_offer_at(&context).expect("first offer"));
+    assert!(!super::take_prompt_offer_at(&context).expect("later launch"));
+    assert_eq!(
+        fs::read_to_string(config).expect("unchanged config"),
+        original
+    );
+    assert!(!context.data_home.exists());
+    assert!(!context.state_directory().exists());
+}
+
+#[test]
+fn dismissing_the_offer_does_not_prevent_later_explicit_installation() {
+    let fixture = fixture();
+    let context = context(fixture.path());
+    super::dismiss_prompt_at(&context).expect("installer declines offer");
+    assert!(!super::take_prompt_offer_at(&context).expect("no duplicate app offer"));
+    install_at(&context, &executable(fixture.path())).expect("enable from Settings");
+    let status = super::status_at(&context).expect("configured status");
+    assert!(status.configured);
+    assert!(status.has_installation);
+    uninstall_at(&context).expect("restore previous chooser");
+    assert!(
+        !super::status_at(&context)
+            .expect("restored status")
+            .configured
+    );
+    assert!(!super::take_prompt_offer_at(&context).expect("still dismissed"));
+}
+
+#[test]
+fn an_existing_configured_chooser_is_not_offered_again() {
+    let fixture = fixture();
+    let context = context(fixture.path());
+    install_at(&context, &executable(fixture.path())).expect("existing CLI integration");
+    assert!(!super::take_prompt_offer_at(&context).expect("already configured"));
+    uninstall_at(&context).expect("uninstall");
+    assert!(!super::take_prompt_offer_at(&context).expect("remember prior opt-in"));
+}
+
+#[test]
+fn status_uses_the_active_configuration_and_requires_activation_files() {
+    let fixture = fixture();
+    let context = context(fixture.path());
+    let config = install_at(&context, &executable(fixture.path())).expect("install");
+    fs::write(&config, "[preferred]\ndefault=gtk;\n").expect("change chooser externally");
+    let status = super::status_at(&context).expect("external preference");
+    assert!(!status.configured);
+    assert!(status.has_installation);
+    fs::write(&config, "[preferred]\ndefault=strata;gtk;\n").expect("prefer Strata");
+    assert!(
+        super::status_at(&context)
+            .expect("default preference")
+            .configured
+    );
+    fs::remove_file(
+        context
+            .data_home
+            .join("dbus-1/services")
+            .join(super::SERVICE_FILE),
+    )
+    .expect("remove activation");
+    assert!(
+        !super::status_at(&context)
+            .expect("incomplete integration")
+            .configured
+    );
+}
+
+#[test]
+fn concurrent_launches_claim_only_one_offer() {
+    let fixture = fixture();
+    let workers = (0..8)
+        .map(|_| {
+            let root = fixture.path().to_owned();
+            std::thread::spawn(move || {
+                super::take_prompt_offer_at(&context(&root)).expect("claim offer")
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().expect("offer worker")))
+            .sum::<usize>(),
+        1
+    );
+}
+
 fn context(root: &std::path::Path) -> SetupContext {
     let data_home = root.join("data");
     let config_home = root.join("config");

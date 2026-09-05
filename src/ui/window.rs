@@ -554,6 +554,7 @@ fn present_target(
             "present navigation started"
         );
     });
+    super::portal_preferences::schedule_offer(&window);
     schedule_due_update_check(&theme_manager, &update_notice);
 }
 
@@ -1056,13 +1057,14 @@ pub(super) fn vim_focus_direction(key: gtk::gdk::Key) -> Option<gtk::DirectionTy
 pub(super) fn visible_modal_layer(window: &impl IsA<gtk::Window>) -> Option<gtk::Widget> {
     let overlay = window.child().and_downcast::<gtk::Overlay>()?;
     let mut child = overlay.first_child();
+    let mut topmost = None;
     while let Some(widget) = child {
-        if widget.is_visible() && widget.has_css_class("app-modal-layer") {
-            return Some(widget);
-        }
         child = widget.next_sibling();
+        if widget.is_visible() && widget.has_css_class("app-modal-layer") {
+            topmost = Some(widget);
+        }
     }
-    None
+    topmost
 }
 
 pub(super) fn install_modal_focus_trap(window: &impl IsA<gtk::Window>) {

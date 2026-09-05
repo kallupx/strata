@@ -726,13 +726,45 @@ impl BrowserView {
         }
     }
 
+    pub fn synchronize_native_selection(&self, extend: bool) {
+        let position = self.state.mode_views.borrow().focused_position();
+        if let Some((depth, focused)) = position {
+            self.select_native_target(depth, focused, extend);
+        }
+    }
+
+    pub fn cross_type_group(&self, direction: gtk::DirectionType, extend: bool) -> bool {
+        let target = self
+            .state
+            .mode_views
+            .borrow()
+            .group_boundary_target(direction);
+        if let Some((depth, focused)) = target {
+            self.select_native_target(depth, focused, extend);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn select_native_target(&self, depth: usize, focused: usize, extend: bool) {
+        if extend {
+            let order = self.state.mode_views.borrow().visual_order(depth);
+            self.state
+                .browser
+                .extend_visual_selection(depth, focused, &order);
+        } else {
+            self.state.browser.select(depth, focused);
+        }
+    }
+
     pub fn first_column_has_focus(&self) -> bool {
         self.view_mode() == BrowserMode::Columns && self.state.focused_column_depth() == Some(0)
     }
 
     pub fn focus_header_from_top_item(&self) -> bool {
         if self.view_mode() != BrowserMode::Columns {
-            return false;
+            return self.state.mode_views.borrow().focus_header_from_top_item();
         }
         let Some((depth, position, _)) = self.state.browser.focused_item() else {
             return false;
@@ -761,6 +793,9 @@ impl BrowserView {
     }
 
     pub fn header_actions_have_focus(&self) -> bool {
+        if self.view_mode() != BrowserMode::Columns {
+            return self.state.mode_views.borrow().header_has_focus();
+        }
         let focused = self.state.overlay.root().and_then(|root| root.focus());
         self.state.columns.borrow().iter().any(|column| {
             focused.as_ref().is_some_and(|focused| {
@@ -771,6 +806,9 @@ impl BrowserView {
     }
 
     pub fn move_header_focus(&self, direction: gtk::DirectionType) -> bool {
+        if self.view_mode() != BrowserMode::Columns {
+            return self.state.mode_views.borrow().move_header_focus(direction);
+        }
         let focused = self.state.overlay.root().and_then(|root| root.focus());
         let columns = self.state.columns.borrow();
         let Some(index) = columns.iter().position(|column| {
@@ -800,6 +838,9 @@ impl BrowserView {
     }
 
     pub fn focus_items_from_header(&self) -> bool {
+        if self.view_mode() != BrowserMode::Columns {
+            return self.state.mode_views.borrow().focus_items_from_header();
+        }
         let focused = self.state.overlay.root().and_then(|root| root.focus());
         self.state
             .columns
@@ -9006,6 +9047,7 @@ pub(super) fn modal_layer(
         }
     });
     layer.add_controller(click);
+    super::focus_navigation::install(&layer);
     animate_in(&layer);
     layer
 }

@@ -5,7 +5,8 @@ mod tests;
 
 use std::{
     env, fs, io,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    io::Write as _,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -25,6 +26,7 @@ pub(crate) fn install() -> Result<String, String> {
         .map_err(|error| format!("Could not locate the Strata executable: {error}"))?;
     let context = SetupContext::from_environment()?;
     let config = install_at(&context, &executable)?;
+    dismiss_prompt_at(&context)?;
     let restart_warning = refresh_portals();
     Ok(format!(
         "Installed Strata as the per-user file chooser.\nConfiguration: {}{}",
@@ -36,6 +38,7 @@ pub(crate) fn install() -> Result<String, String> {
 pub(crate) fn uninstall() -> Result<String, String> {
     let context = SetupContext::from_environment()?;
     let preserved_edits = uninstall_at(&context)?;
+    dismiss_prompt_at(&context)?;
     let restart_warning = refresh_portals();
     let edit_note = if preserved_edits {
         "\nKept the remaining portal configuration and removed only Strata."
@@ -45,6 +48,92 @@ pub(crate) fn uninstall() -> Result<String, String> {
     Ok(format!(
         "Removed the per-user Strata file chooser integration.{edit_note}{restart_warning}"
     ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PortalStatus {
+    pub configured: bool,
+    pub has_installation: bool,
+}
+
+pub(crate) fn status() -> Result<PortalStatus, String> {
+    status_at(&SetupContext::from_environment()?)
+}
+
+fn status_at(context: &SetupContext) -> Result<PortalStatus, String> {
+    let metadata = context
+        .data_home
+        .join("xdg-desktop-portal/portals")
+        .join(PORTAL_FILE);
+    let service = context.data_home.join("dbus-1/services").join(SERVICE_FILE);
+    let has_installation = metadata.exists()
+        || service.exists()
+        || context.state_directory().join(STATE_FILE).exists();
+    let preferred = if let Some(path) = active_config(context) {
+        let config = KeyFile::new();
+        config
+            .load_from_data(&read_utf8(&path)?, KeyFileFlags::NONE)
+            .map_err(|error| format!("Could not parse portal configuration: {error}"))?;
+        config
+            .value("preferred", FILE_CHOOSER_KEY)
+            .or_else(|_| config.value("preferred", "default"))
+            .is_ok_and(|value| {
+                backend_values(&value)
+                    .first()
+                    .is_some_and(|name| name == "strata")
+            })
+    } else {
+        false
+    };
+    Ok(PortalStatus {
+        configured: preferred && metadata.is_file() && service.is_file(),
+        has_installation,
+    })
+}
+
+pub(crate) fn dismiss_prompt() -> Result<String, String> {
+    dismiss_prompt_at(&SetupContext::from_environment()?)?;
+    Ok("File chooser offer dismissed. You can enable it later in Settings → General → System file chooser.".into())
+}
+
+pub(crate) fn take_prompt_offer() -> Result<bool, String> {
+    take_prompt_offer_at(&SetupContext::from_environment()?)
+}
+
+fn take_prompt_offer_at(context: &SetupContext) -> Result<bool, String> {
+    if prompt_path(context).exists() {
+        return Ok(false);
+    }
+    if status_at(context)?.configured {
+        dismiss_prompt_at(context)?;
+        return Ok(false);
+    }
+    dismiss_prompt_at(context)
+}
+
+fn prompt_path(context: &SetupContext) -> PathBuf {
+    context.config_home.join("strata/portal-opt-in-v1")
+}
+
+fn dismiss_prompt_at(context: &SetupContext) -> Result<bool, String> {
+    let path = prompt_path(context);
+    let directory = path.parent().expect("portal prompt has a parent");
+    fs::create_dir_all(directory).map_err(|error| path_error("create", directory, error))?;
+    // The installer, CLI, and every app window share one first-offer marker.
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(b"1\n")
+                .map_err(|error| path_error("write", &path, error))?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(path_error("create", &path, error)),
+    }
 }
 
 #[derive(Debug)]
@@ -506,6 +595,6 @@ fn refresh_portals() -> &'static str {
     if dbus_reloaded && portal_restarted {
         ""
     } else {
-        "\nCould not reload every portal service; log out and back in before testing."
+        "\nCould not reload every portal service. Ensure xdg-desktop-portal is installed, then log out and back in before testing."
     }
 }

@@ -630,11 +630,19 @@ pub(crate) fn present_chooser(
     cancelled: Arc<AtomicBool>,
     completion: impl FnOnce(ashpd::backend::Result<SelectedFiles>) + 'static,
 ) {
+    let _ = build_chooser(request, cancelled, completion);
+}
+
+fn build_chooser(
+    request: ChooserRequest,
+    cancelled: Arc<AtomicBool>,
+    completion: impl FnOnce(ashpd::backend::Result<SelectedFiles>) + 'static,
+) -> Option<Rc<ChooserState>> {
     if cancelled.load(Ordering::SeqCst) {
         completion(Err(PortalError::Cancelled(
             "file chooser request was cancelled".into(),
         )));
-        return;
+        return None;
     }
 
     let source = ChooserFileSource::new();
@@ -921,6 +929,11 @@ pub(crate) fn present_chooser(
         BrowserEvent::FocusChanged {
             depth,
             position: Some(position),
+        }
+        | BrowserEvent::SelectionSetChanged {
+            depth,
+            focused: position,
+            ..
         } if preview_for_selection.is_open() => {
             if let Some(entry) = weak_browser
                 .upgrade()
@@ -967,13 +980,14 @@ pub(crate) fn present_chooser(
     });
     if cancelled.load(Ordering::SeqCst) {
         state.cancel();
-        return;
+        return None;
     }
 
     gtk::prelude::WidgetExt::realize(&window);
     apply_external_parent(&window, state.request.parent.as_ref());
     browser.navigate(Location::local(&state.request.initial_directory));
     window.present();
+    Some(state)
 }
 
 pub(crate) fn cancel_chooser(token: &str) {
@@ -1290,6 +1304,20 @@ fn install_shortcuts(
             popover.child_focus(direction);
             return glib::Propagation::Stop;
         }
+        if !alt && let Some(focused) = focused.as_ref() {
+            if super::focus_navigation::in_popover(focused) {
+                return glib::Propagation::Proceed;
+            }
+            if !shift
+                && matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
+                && super::focus_navigation::activate(state.window.upcast_ref())
+            {
+                return glib::Propagation::Stop;
+            }
+            if super::focus_navigation::editable(focused) {
+                return glib::Propagation::Proceed;
+            }
+        }
         let mut header_left_boundary = false;
         if state.view.header_actions_have_focus() && !control && !alt {
             match key {
@@ -1313,7 +1341,8 @@ fn install_shortcuts(
         if sidebar_has_focus
             && !control
             && !alt
-            && let Some(direction) = vim_focus_direction(key)
+            && let Some(direction) =
+                vim_focus_direction(key).or_else(|| super::focus_navigation::arrow_direction(key))
         {
             if direction == gtk::DirectionType::Right {
                 focus_before_sidebar.borrow_mut().take();
@@ -1331,6 +1360,26 @@ fn install_shortcuts(
             return glib::Propagation::Stop;
         }
         if !control && !alt && !state.view.item_view_has_focus() && !header_left_boundary {
+            if !shift && let Some(direction) = super::focus_navigation::arrow_direction(key) {
+                if direction == gtk::DirectionType::Up
+                    && focused.as_ref().is_some_and(|focused| {
+                        let mut widget = Some(focused.clone());
+                        while let Some(current) = widget {
+                            if current.has_css_class("chooser-options") {
+                                return true;
+                            }
+                            widget = current.parent();
+                        }
+                        false
+                    })
+                {
+                    browser.focus_active();
+                    return glib::Propagation::Stop;
+                }
+                if super::focus_navigation::move_focus(state.window.upcast_ref(), direction) {
+                    return glib::Propagation::Stop;
+                }
+            }
             return glib::Propagation::Proceed;
         }
         if key == gtk::gdk::Key::space && !control && !alt {
@@ -1340,6 +1389,35 @@ fn install_shortcuts(
         if key == gtk::gdk::Key::BackSpace && !control && !alt {
             state.view.navigate_up();
             return glib::Propagation::Stop;
+        }
+        if !alt
+            && state.view.view_mode() != super::browser_modes::BrowserMode::Columns
+            && let Some(direction) = super::focus_navigation::arrow_direction(key)
+        {
+            let extend = shift
+                && matches!(
+                    &state.request.kind,
+                    ChooserKind::Open { multiple: true, .. }
+                );
+            if state.view.cross_type_group(direction, extend) {
+                return glib::Propagation::Stop;
+            }
+            if !shift && key == gtk::gdk::Key::Up && state.view.focus_header_from_top_item() {
+                return glib::Propagation::Stop;
+            }
+            // Keep GTK's spatial movement, then reconcile selection in visual order
+            // across the independent collection views used for type groups.
+            let weak = Rc::downgrade(&state);
+            glib::idle_add_local_once(move || {
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                if !state.view.item_view_has_focus() {
+                    return;
+                }
+                state.view.synchronize_native_selection(extend);
+            });
+            return glib::Propagation::Proceed;
         }
         if shift
             && matches!(
