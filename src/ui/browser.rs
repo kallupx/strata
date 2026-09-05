@@ -4004,15 +4004,20 @@ impl ViewState {
             Option<MountPromptDetails>,
         ) + 'static,
     ) {
-        if self.overlay.root().and_downcast::<gtk::Window>().is_none() {
+        let Some(window) = self.overlay.root().and_downcast::<gtk::Window>() else {
             return;
-        }
+        };
         let activity = BrowserView {
             state: self.clone(),
         }
         .begin_global_activity("Connecting…");
         let file = gio_file_for_location(&location);
-        let operation = gio::MountOperation::new();
+        // A native gtk::MountOperation (rather than a bare gio::MountOperation)
+        // is required so GTK's own "ask-question" dialog handles host-key and
+        // certificate trust decisions for us; we only override "ask-password"
+        // below with Strata's own dialog, stopping that one signal's default
+        // handler so the two don't both try to reply.
+        let operation = gtk::MountOperation::new(Some(&window));
         let prompt_overlay = self.overlay.clone();
         let active_prompt = Rc::new(RefCell::new(None::<gtk::Box>));
         let prompt_for_signal = active_prompt.clone();
@@ -4025,6 +4030,12 @@ impl ViewState {
         let already_prompted = Cell::new(credentials_for_signal.borrow().is_some());
         operation.connect_ask_password(
             move |operation, message, default_user, default_domain, flags| {
+                // Suppress GtkMountOperation's own native password dialog: we
+                // reply ourselves (immediately or via our custom prompt)
+                // below. "ask-question" is deliberately left unconnected so
+                // its native default handler still runs for host-key/cert
+                // trust prompts.
+                operation.stop_signal_emission_by_name("ask-password");
                 details_for_signal.replace(Some(MountPromptDetails {
                     message: message.to_owned(),
                     default_user: default_user.to_owned(),
@@ -4032,7 +4043,7 @@ impl ViewState {
                     flags,
                 }));
                 if let Some(credentials) = credentials_for_signal.borrow_mut().take() {
-                    apply_mount_credentials(operation, &credentials);
+                    apply_mount_credentials(operation.upcast_ref(), &credentials);
                     operation.reply(gio::MountOperationResult::Handled);
                     return;
                 }
@@ -4042,7 +4053,7 @@ impl ViewState {
                 let retry = already_prompted.replace(true);
                 let prompt = show_authentication_dialog(
                     &prompt_overlay,
-                    Some(operation),
+                    Some(operation.upcast_ref()),
                     message,
                     (default_user, default_domain),
                     flags,
