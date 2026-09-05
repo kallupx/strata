@@ -3,6 +3,25 @@
 use super::*;
 
 #[test]
+fn recursive_search_arrows_select_and_clamp_results() {
+    assert_eq!(search_result_navigation_position(None, 3, 1), Some(0));
+    assert_eq!(search_result_navigation_position(None, 3, -1), Some(2));
+    assert_eq!(search_result_navigation_position(Some(0), 3, -1), Some(0));
+    assert_eq!(search_result_navigation_position(Some(1), 3, 1), Some(2));
+    assert_eq!(search_result_navigation_position(Some(2), 3, 1), Some(2));
+    assert_eq!(search_result_navigation_position(None, 0, 1), None);
+}
+
+#[test]
+fn recursive_search_activation_accepts_enter_and_right_arrow() {
+    assert!(recursive_search_activation_key(gtk::gdk::Key::Return));
+    assert!(recursive_search_activation_key(gtk::gdk::Key::KP_Enter));
+    assert!(recursive_search_activation_key(gtk::gdk::Key::Right));
+    assert!(!recursive_search_activation_key(gtk::gdk::Key::Left));
+    assert!(!recursive_search_activation_key(gtk::gdk::Key::Down));
+}
+
+#[test]
 fn terminal_shortcut_prefers_one_selected_directory() {
     let entry = |name: &str, kind| FileEntry {
         location: Location::local(format!("/fixture/{name}")),
@@ -11,6 +30,8 @@ fn terminal_shortcut_prefers_one_selected_directory() {
         kind,
         size: crate::model::MetadataValue::Unknown,
         modified_unix_seconds: crate::model::MetadataValue::Unknown,
+        is_hidden: false,
+        mode: crate::model::MetadataValue::Unknown,
     };
     let directory = entry("selected", crate::model::EntryKind::Directory);
     let file = entry("notes.txt", crate::model::EntryKind::File);
@@ -22,6 +43,35 @@ fn terminal_shortcut_prefers_one_selected_directory() {
     assert_eq!(selected_terminal_location(&[directory, file.clone()]), None);
     assert_eq!(selected_terminal_location(&[file]), None);
     assert_eq!(selected_terminal_location(&[]), None);
+}
+
+#[test]
+fn duplicate_transfer_uses_the_selected_entries_parent() {
+    let entry = |path: &str| FileEntry {
+        location: Location::local(path),
+        native_name: Path::new(path).file_name().unwrap_or_default().to_owned(),
+        display_name: path.to_owned(),
+        kind: crate::model::EntryKind::File,
+        size: crate::model::MetadataValue::Unknown,
+        modified_unix_seconds: crate::model::MetadataValue::Unknown,
+        mode: crate::model::MetadataValue::Unknown,
+        is_hidden: false,
+    };
+    let first = entry("/fixture/selected/first.txt");
+    let second = entry("/fixture/selected/second.txt");
+
+    assert_eq!(
+        duplicate_transfer(&[first.clone(), second.clone()]),
+        Some((
+            Location::local("/fixture/selected"),
+            vec![first.location, second.location]
+        ))
+    );
+    assert_eq!(
+        duplicate_transfer(&[entry("/fixture/one.txt"), entry("/other/two.txt")]),
+        None
+    );
+    assert_eq!(duplicate_transfer(&[]), None);
 }
 
 #[cfg(unix)]
@@ -183,6 +233,8 @@ fn delete_confirmation_labels_distinguish_files_and_folders() {
         kind: crate::model::EntryKind::File,
         size: crate::model::MetadataValue::Known(10),
         modified_unix_seconds: crate::model::MetadataValue::Unknown,
+        is_hidden: false,
+        mode: crate::model::MetadataValue::Unknown,
     };
     let mut folder = file.clone();
     folder.kind = crate::model::EntryKind::Directory;
@@ -193,6 +245,104 @@ fn delete_confirmation_labels_distinguish_files_and_folders() {
     assert_eq!(entry_kind_summary(&[file.clone(), file.clone()]), "2 files");
     assert_eq!(entry_kind_summary(&[folder.clone()]), "1 folder");
     assert_eq!(entry_kind_summary(&[file, folder]), "2 items");
+}
+
+#[test]
+fn folder_peek_uses_visible_mode_bounds() {
+    assert_eq!(
+        peek_origin_bounds(BrowserMode::Columns),
+        PeekOriginBounds::Column
+    );
+    assert_eq!(
+        peek_origin_bounds(BrowserMode::Grid),
+        PeekOriginBounds::Anchor
+    );
+    assert_eq!(
+        peek_origin_bounds(BrowserMode::Explorer),
+        PeekOriginBounds::Anchor
+    );
+}
+
+#[test]
+fn folder_peek_prefers_space_to_the_right_of_its_source_column() {
+    assert_eq!(
+        peek_horizontal_placement(100.0, 300.0, 800.0),
+        Some(PeekPlacement {
+            x: 408.0,
+            side: PeekSide::Right,
+        })
+    );
+}
+
+#[test]
+fn folder_peek_uses_the_left_only_when_it_fits_outside_the_source_column() {
+    assert_eq!(
+        peek_horizontal_placement(300.0, 300.0, 700.0),
+        Some(PeekPlacement {
+            x: 36.0,
+            side: PeekSide::Left,
+        })
+    );
+    assert_eq!(peek_horizontal_placement(200.0, 300.0, 700.0), None);
+}
+
+#[test]
+fn folder_peek_animation_moves_toward_its_placement_side() {
+    assert_eq!(
+        peek_transition(PeekSide::Left),
+        gtk::RevealerTransitionType::SlideLeft
+    );
+    assert_eq!(
+        peek_transition(PeekSide::Right),
+        gtk::RevealerTransitionType::SlideRight
+    );
+}
+
+#[test]
+fn folder_peek_animation_is_anchored_to_the_source_side() {
+    assert_eq!(
+        peek_horizontal_layout(
+            PeekPlacement {
+                x: 408.0,
+                side: PeekSide::Right,
+            },
+            800.0,
+        ),
+        (gtk::Align::Start, 408, 0)
+    );
+    assert_eq!(
+        peek_horizontal_layout(
+            PeekPlacement {
+                x: 36.0,
+                side: PeekSide::Left,
+            },
+            700.0,
+        ),
+        (gtk::Align::End, 0, 408)
+    );
+}
+
+#[test]
+fn folder_peek_accepts_an_exact_viewport_fit() {
+    assert_eq!(
+        peek_horizontal_placement(0.0, 300.0, 564.0),
+        Some(PeekPlacement {
+            x: 308.0,
+            side: PeekSide::Right,
+        })
+    );
+}
+
+#[test]
+fn small_operations_delay_progress_while_large_or_unbounded_operations_show_it_immediately() {
+    assert!(!should_show_progress_immediately(1));
+    assert!(!should_show_progress_immediately(
+        IMMEDIATE_PROGRESS_ITEM_COUNT - 1
+    ));
+    assert!(should_show_progress_immediately(
+        IMMEDIATE_PROGRESS_ITEM_COUNT
+    ));
+    assert!(should_show_progress_immediately(0));
 }
 
 #[test]
@@ -255,6 +405,8 @@ fn quick_preview_is_offered_only_for_supported_files() {
         kind,
         size: crate::model::MetadataValue::Unknown,
         modified_unix_seconds: crate::model::MetadataValue::Unknown,
+        is_hidden: false,
+        mode: crate::model::MetadataValue::Unknown,
     };
 
     assert!(entry_supports_quick_preview(&entry(
@@ -264,6 +416,10 @@ fn quick_preview_is_offered_only_for_supported_files() {
     assert!(entry_supports_quick_preview(&entry(
         "notes.txt",
         crate::model::EntryKind::FileSymbolicLink,
+    )));
+    assert!(entry_supports_quick_preview(&entry(
+        ".steampath",
+        crate::model::EntryKind::File,
     )));
     assert!(!entry_supports_quick_preview(&entry(
         "archive.zip",
@@ -277,10 +433,45 @@ fn quick_preview_is_offered_only_for_supported_files() {
     let supported = entry("photo.png", crate::model::EntryKind::File);
     let unsupported = entry("archive.zip", crate::model::EntryKind::File);
     let directory = entry("photos", crate::model::EntryKind::Directory);
-    assert!(entry_responds_to_single_click(&supported, true));
-    assert!(!entry_responds_to_single_click(&supported, false));
-    assert!(!entry_responds_to_single_click(&unsupported, true));
-    assert!(entry_responds_to_single_click(&directory, false));
+    assert!(entry_responds_to_preview_click(&supported, true));
+    assert!(!entry_responds_to_preview_click(&supported, false));
+    assert!(!entry_responds_to_preview_click(&unsupported, true));
+    assert!(!entry_responds_to_preview_click(&directory, true));
+}
+
+#[test]
+fn printing_is_offered_for_text_code_images_and_pdfs() {
+    let entry = |name: &str, kind| FileEntry {
+        location: Location::local(format!("/fixture/{name}")),
+        native_name: name.into(),
+        display_name: name.into(),
+        kind,
+        size: crate::model::MetadataValue::Unknown,
+        modified_unix_seconds: crate::model::MetadataValue::Unknown,
+        mode: crate::model::MetadataValue::Unknown,
+        is_hidden: false,
+    };
+
+    for name in [
+        "notes.txt",
+        "main.rs",
+        "settings.toml",
+        "photo.png",
+        "guide.pdf",
+    ] {
+        assert!(entry_supports_printing(&entry(
+            name,
+            crate::model::EntryKind::File
+        )));
+    }
+    assert!(!entry_supports_printing(&entry(
+        "archive.zip",
+        crate::model::EntryKind::File,
+    )));
+    assert!(!entry_supports_printing(&entry(
+        "notes.txt",
+        crate::model::EntryKind::Directory,
+    )));
 }
 
 #[test]
@@ -356,6 +547,8 @@ fn multi_selection_summary_lists_at_most_three_names() {
         kind: crate::model::EntryKind::File,
         size: crate::model::MetadataValue::Unknown,
         modified_unix_seconds: crate::model::MetadataValue::Unknown,
+        is_hidden: false,
+        mode: crate::model::MetadataValue::Unknown,
     };
 
     assert_eq!(
@@ -375,6 +568,26 @@ fn multi_selection_summary_lists_at_most_three_names() {
         ITEM_CONTEXT_SUMMARY_MAX_CHARS as usize
     );
     assert!(summary.ends_with('…'));
+}
+
+#[test]
+fn context_menu_uses_the_roomier_side_of_the_click() {
+    assert_eq!(
+        context_menu_placement(800, 120.0),
+        (gtk::PositionType::Bottom, 656)
+    );
+    assert_eq!(
+        context_menu_placement(800, 680.0),
+        (gtk::PositionType::Top, 656)
+    );
+}
+
+#[test]
+fn context_menu_keeps_a_positive_scrollable_height_in_a_small_view() {
+    assert_eq!(
+        context_menu_placement(20, 10.0),
+        (gtk::PositionType::Bottom, 1)
+    );
 }
 
 #[test]
@@ -401,6 +614,10 @@ fn transfer_collisions_detect_existing_destination_items() -> Result<(), Box<dyn
     assert!(!transfer_has_collision(
         &Location::local(&source),
         &Location::local(&destination)
+    ));
+    assert!(!transfer_has_collision(
+        &Location::local(&source),
+        &Location::local(&source_dir)
     ));
     std::fs::write(destination.join("photo.jpg"), b"old")?;
     assert!(transfer_has_collision(
@@ -491,6 +708,18 @@ fn properties_permissions_are_formatted_symbolically_and_numerically() {
 }
 
 #[test]
+fn individual_permission_bits_can_be_toggled_without_changing_file_type() {
+    assert_eq!(toggled_permission(0o100644, 0o100), 0o100744);
+    assert_eq!(toggled_permission(0o100744, 0o100), 0o100644);
+}
+
+#[test]
+fn executable_toggle_changes_all_execute_bits_and_preserves_other_bits() {
+    assert_eq!(with_execute_permissions(0o100644, true), 0o100755);
+    assert_eq!(with_execute_permissions(0o100775, false), 0o100664);
+}
+
+#[test]
 fn properties_paths_abbreviate_the_home_directory() {
     let home = glib::home_dir();
 
@@ -528,6 +757,33 @@ fn pointer_preview_handler_ignores_double_click_activation() {
 }
 
 #[test]
+fn pointer_activation_respects_entry_type_click_count_and_modifiers() {
+    let activation = ClickActivation {
+        files: ClickCount::Two,
+        folders: ClickCount::One,
+    };
+
+    assert!(should_activate_single_click(
+        1, true, activation, false, false, false
+    ));
+    assert!(!should_activate_single_click(
+        1, false, activation, false, false, false
+    ));
+    assert!(!should_activate_single_click(
+        2, true, activation, false, false, false
+    ));
+    assert!(!should_activate_single_click(
+        1, true, activation, true, false, false
+    ));
+    assert!(!should_activate_single_click(
+        1, true, activation, false, true, false
+    ));
+    assert!(!should_activate_single_click(
+        1, true, activation, false, false, true
+    ));
+}
+
+#[test]
 fn pressing_an_item_in_a_multi_selection_preserves_the_drag_group() {
     assert!(should_preserve_drag_selection(true, 2));
     assert!(should_preserve_drag_selection(true, 8));
@@ -537,28 +793,56 @@ fn pressing_an_item_in_a_multi_selection_preserves_the_drag_group() {
 
 #[test]
 fn paste_prefers_the_hovered_pane_then_the_deepest_pane() {
-    assert_eq!(paste_destination_depth(Some(1), 3), Some(1));
-    assert_eq!(paste_destination_depth(None, 3), Some(2));
-    assert_eq!(paste_destination_depth(Some(4), 3), Some(2));
-    assert_eq!(paste_destination_depth(None, 0), None);
+    assert_eq!(
+        paste_destination_depth(BrowserMode::Columns, Some(1), Some(2), 3),
+        Some(1)
+    );
+    assert_eq!(
+        paste_destination_depth(BrowserMode::Columns, None, Some(1), 3),
+        Some(2)
+    );
+    assert_eq!(
+        paste_destination_depth(BrowserMode::Columns, Some(4), Some(1), 3),
+        Some(2)
+    );
+    assert_eq!(
+        paste_destination_depth(BrowserMode::Columns, None, None, 0),
+        None
+    );
 }
 
 #[test]
-fn new_folder_prefers_the_hovered_pane_then_falls_back_safely() {
+fn single_pane_paste_uses_the_active_browser_depth() {
+    for mode in [BrowserMode::Grid, BrowserMode::Explorer] {
+        assert_eq!(paste_destination_depth(mode, None, Some(2), 0), Some(2));
+    }
+}
+
+#[test]
+fn new_folder_prefers_the_focused_pane_then_falls_back_safely() {
+    assert_eq!(new_folder_destination_depth(Some(1), Some(2), 3), Some(1));
+    assert_eq!(new_folder_destination_depth(None, Some(2), 3), Some(2));
+    assert_eq!(new_folder_destination_depth(Some(5), Some(1), 3), Some(1));
+    assert_eq!(new_folder_destination_depth(None, None, 3), Some(2));
+    assert_eq!(new_folder_destination_depth(None, None, 0), None);
+}
+
+#[test]
+fn open_terminal_prefers_the_hovered_pane_then_falls_back_safely() {
     assert_eq!(
-        new_folder_destination_depth(Some(1), Some(0), Some(2), 3),
+        terminal_destination_depth(Some(1), Some(0), Some(2), 3),
         Some(1)
     );
     assert_eq!(
-        new_folder_destination_depth(None, Some(0), Some(2), 3),
+        terminal_destination_depth(None, Some(0), Some(2), 3),
         Some(0)
     );
     assert_eq!(
-        new_folder_destination_depth(Some(4), Some(5), Some(1), 3),
+        terminal_destination_depth(Some(4), Some(5), Some(1), 3),
         Some(1)
     );
-    assert_eq!(new_folder_destination_depth(None, None, None, 3), Some(2));
-    assert_eq!(new_folder_destination_depth(None, None, None, 0), None);
+    assert_eq!(terminal_destination_depth(None, None, None, 3), Some(2));
+    assert_eq!(terminal_destination_depth(None, None, None, 0), None);
 }
 
 #[test]
@@ -585,6 +869,43 @@ fn cut_clipboard_locations_match_regardless_of_order() {
             Location::local("/fixture/second")
         ]
     ));
+}
+
+#[test]
+fn cut_matches_gio_equivalent_representations() {
+    let native = Location::local("/fixture/first");
+    let uri = Location::uri("file:///fixture/first");
+
+    assert!(locations_equal(&native, &uri));
+    assert!(same_locations(
+        std::slice::from_ref(&native),
+        std::slice::from_ref(&uri)
+    ));
+    assert!(!same_locations(
+        std::slice::from_ref(&native),
+        std::slice::from_ref(&Location::uri("file:///fixture/other"))
+    ));
+}
+
+#[test]
+fn cleared_shared_cut_is_not_revived_by_stale_view_state() {
+    let native = Location::local("/fixture/first");
+    let uri = Location::uri("file:///fixture/first");
+
+    set_shared_cut(std::slice::from_ref(&native));
+    assert!(is_cut_match(std::slice::from_ref(&uri)));
+
+    clear_shared_cut();
+    assert!(!is_cut_match(std::slice::from_ref(&native)));
+}
+
+#[test]
+fn completed_moves_match_gio_equivalent_cut_entries() {
+    let mut cut = vec![Location::local("/fixture/first")];
+
+    retain_untransferred(&mut cut, &[Location::uri("file:///fixture/first")]);
+
+    assert!(cut.is_empty());
 }
 
 #[test]
@@ -1032,4 +1353,379 @@ fn trash_summary_does_not_stop_enumerating_siblings_after_one_branch_is_depth_tr
         "every sibling should be counted (1 for \"parent\" plus one per sub-N directory), \
          not just the first next_files_future batch"
     );
+}
+
+#[test]
+fn entry_model_value_encodes_hidden_state_and_preserves_display_name() {
+    let visible = FileEntry {
+        location: Location::local("/fixture/photo"),
+        native_name: "photo".into(),
+        display_name: "photo".into(),
+        kind: crate::model::EntryKind::File,
+        size: crate::model::MetadataValue::Unknown,
+        modified_unix_seconds: crate::model::MetadataValue::Unknown,
+        is_hidden: false,
+        mode: crate::model::MetadataValue::Unknown,
+    };
+    let hidden = FileEntry {
+        location: Location::local("/fixture/.config"),
+        native_name: ".config".into(),
+        display_name: ".config".into(),
+        kind: crate::model::EntryKind::Directory,
+        size: crate::model::MetadataValue::Unknown,
+        modified_unix_seconds: crate::model::MetadataValue::Unknown,
+        is_hidden: true,
+        mode: crate::model::MetadataValue::Unknown,
+    };
+
+    let encoded_visible = entry_model_value(&visible);
+    let encoded_hidden = entry_model_value(&hidden);
+
+    assert_eq!(encoded_visible, "fv\tphoto");
+    assert_eq!(encoded_hidden, "dh\t.config");
+
+    assert!(!model_is_hidden(&encoded_visible));
+    assert!(model_is_hidden(&encoded_hidden));
+
+    assert_eq!(model_display_name(&encoded_visible), "photo");
+    assert_eq!(model_display_name(&encoded_hidden), ".config");
+}
+
+#[test]
+fn shell_escape_path_escapes_spaces_and_metacharacters_but_not_filename_unicode() {
+    assert_eq!(
+        shell_escape_path(Path::new("/mnt/Mass 1/Movies\u{2044}TV")),
+        "/mnt/Mass\\ 1/Movies\u{2044}TV"
+    );
+    assert_eq!(
+        shell_escape_path(Path::new("/tmp/archive (final) v1.2.tar.gz")),
+        "/tmp/archive\\ \\(final\\)\\ v1.2.tar.gz"
+    );
+    assert_eq!(
+        shell_escape_path(Path::new("/home/user/plain")),
+        "/home/user/plain"
+    );
+}
+
+#[test]
+fn copy_path_text_adds_trailing_slash_to_directories_only() {
+    let directory = Location::local("/mnt/Mass 1/Movies\u{2044}TV");
+    assert_eq!(
+        copy_path_text(&directory, true),
+        "/mnt/Mass\\ 1/Movies\u{2044}TV/"
+    );
+    assert_eq!(
+        copy_path_text(&directory, false),
+        "/mnt/Mass\\ 1/Movies\u{2044}TV"
+    );
+}
+
+#[test]
+fn copy_path_text_keeps_uris_unescaped() {
+    let remote = Location::uri("smb://server/share/folder");
+    assert_eq!(copy_path_text(&remote, true), "smb://server/share/folder");
+}
+
+#[test]
+fn shell_escape_path_preserves_newlines_and_single_quotes() {
+    assert_eq!(
+        shell_escape_path(Path::new("/tmp/line\nbob's notes")),
+        "'/tmp/line\nbob'\\''s notes'"
+    );
+}
+
+#[test]
+fn pinning_requires_an_available_non_trash_directory() {
+    let entry = |location, kind| FileEntry {
+        location,
+        native_name: "item".into(),
+        display_name: "item".into(),
+        kind,
+        size: crate::model::MetadataValue::Unknown,
+        modified_unix_seconds: crate::model::MetadataValue::Unknown,
+        is_hidden: false,
+        mode: crate::model::MetadataValue::Unknown,
+    };
+    let directory = entry(
+        Location::local("/fixture/folder"),
+        crate::model::EntryKind::Directory,
+    );
+    let file = entry(
+        Location::local("/fixture/file"),
+        crate::model::EntryKind::File,
+    );
+    let trash_directory = entry(
+        Location::uri("trash:///deleted-folder"),
+        crate::model::EntryKind::Directory,
+    );
+
+    assert!(can_pin_entry(&directory, PinStatus::Available));
+    assert!(!can_pin_entry(&directory, PinStatus::Pinned));
+    assert!(!can_pin_entry(&directory, PinStatus::Unavailable));
+    assert!(!can_pin_entry(&file, PinStatus::Available));
+    assert!(!can_pin_entry(&trash_directory, PinStatus::Available));
+}
+
+#[test]
+fn type_groups_name_folders_and_broken_links_directly() {
+    assert_eq!(model_type_group("dv\tprojects"), FOLDER_TYPE_GROUP);
+    assert_eq!(model_type_group("dv\tlinked"), FOLDER_TYPE_GROUP);
+    assert_eq!(model_type_group("xv\tdangling"), "Broken link");
+}
+
+#[test]
+fn files_of_an_unrecognized_type_share_one_group() {
+    assert_eq!(model_type_group("fv\tblob.qqqqq"), "File");
+    assert_eq!(model_type_group("fv\tarchive-index"), "File");
+}
+
+#[test]
+fn type_groups_come_from_the_shared_mime_database() {
+    let expected = gio::content_type_get_description(
+        &gio::content_type_guess(Some(Path::new("notes.json")), None::<&[u8]>).0,
+    );
+
+    assert_eq!(model_type_group("fv\tnotes.json"), expected);
+}
+
+#[test]
+fn repeated_lookups_of_one_suffix_agree() {
+    let first = model_type_group("fv\tone.py");
+    let second = model_type_group("fv\ttwo.py");
+
+    assert_eq!(first, second);
+    assert_ne!(first, "File");
+}
+
+#[test]
+fn retryable_delete_entries_keeps_only_the_named_locations() {
+    let entry = |name: &str| FileEntry {
+        location: Location::local(format!("/fixture/{name}")),
+        native_name: name.into(),
+        display_name: name.into(),
+        kind: crate::model::EntryKind::File,
+        size: crate::model::MetadataValue::Unknown,
+        modified_unix_seconds: crate::model::MetadataValue::Unknown,
+        is_hidden: false,
+        mode: crate::model::MetadataValue::Unknown,
+    };
+    let retryable = entry("share-file.txt");
+    let denied = entry("locked-file.txt");
+    let entries = vec![retryable.clone(), denied];
+
+    let kept = retryable_delete_entries(entries, std::slice::from_ref(&retryable.location));
+
+    assert_eq!(kept, vec![retryable]);
+}
+
+#[test]
+fn retryable_delete_entries_is_empty_when_nothing_matches() {
+    let entry = FileEntry {
+        location: Location::local("/fixture/photo"),
+        native_name: "photo".into(),
+        display_name: "photo".into(),
+        kind: crate::model::EntryKind::File,
+        size: crate::model::MetadataValue::Unknown,
+        modified_unix_seconds: crate::model::MetadataValue::Unknown,
+        is_hidden: false,
+        mode: crate::model::MetadataValue::Unknown,
+    };
+
+    let kept = retryable_delete_entries(vec![entry], &[]);
+
+    assert!(kept.is_empty());
+}
+
+#[test]
+fn move_to_trash_hides_only_for_a_confirmed_unsupported_location() {
+    assert!(!move_to_trash_is_visible(false, Some(false)));
+}
+
+#[test]
+fn move_to_trash_shows_for_a_confirmed_supported_location() {
+    assert!(move_to_trash_is_visible(false, Some(true)));
+}
+
+#[test]
+fn move_to_trash_defaults_to_visible_before_the_check_resolves() {
+    // `None` covers both "the load hasn't finished yet" and "the check itself
+    // couldn't be answered" -- neither should ever hide the only delete option.
+    assert!(move_to_trash_is_visible(false, None));
+}
+
+#[test]
+fn move_to_trash_stays_visible_inside_trash_regardless_of_can_trash() {
+    // Inside Trash this button is really "Permanently delete" under a shared
+    // label; an ordinary location's Trash support is irrelevant there.
+    assert!(move_to_trash_is_visible(true, Some(false)));
+    assert!(move_to_trash_is_visible(true, None));
+}
+
+fn mapped_source(values: &[&str]) -> EntryListModel {
+    let owned: Vec<String> = values.iter().map(|value| (*value).to_owned()).collect();
+    let model = EntryListModel::new(std::rc::Rc::new(move |position| {
+        owned.get(position as usize).cloned()
+    }));
+    model.replace(values.len() as u32);
+    model
+}
+
+#[test]
+fn unfiltered_visible_listings_keep_source_order() {
+    let source = mapped_source(&["fv\ta", "fv\tb", "fv\tc"]);
+    let map = rebuild_position_map(&source, "", true, 1);
+    assert_eq!(map.forward, vec![0, 1, 2]);
+    assert_eq!(map.reverse, vec![0, 1, 2]);
+}
+
+#[test]
+fn hidden_entries_are_omitted_from_the_position_map() {
+    let source = mapped_source(&["fv\talpha", "dh\t.secret", "fv\tzulu"]);
+    let map = rebuild_position_map(&source, "", false, 1);
+    assert_eq!(map.forward, vec![0, 2]);
+    assert_eq!(map.reverse[0], 0);
+    assert_eq!(map.reverse[1], NO_FILTERED_POSITION);
+    assert_eq!(map.reverse[2], 1);
+}
+
+#[test]
+fn filter_queries_keep_matches_near_the_end() {
+    let source = mapped_source(&["fv\talpha", "fv\tbeta", "fv\tzulu"]);
+    let map = rebuild_position_map(&source, "zu", true, 4);
+    assert_eq!(map.forward, vec![2]);
+    assert_eq!(map.query, "zu");
+    assert_eq!(map.generation, 4);
+}
+
+#[test]
+fn filter_change_for_classifies_tightening_and_loosening() {
+    assert_eq!(filter_change_for("", "a"), gtk::FilterChange::MoreStrict);
+    assert_eq!(filter_change_for("a", "ab"), gtk::FilterChange::MoreStrict);
+    assert_eq!(filter_change_for("ab", "a"), gtk::FilterChange::LessStrict);
+    assert_eq!(filter_change_for("a", ""), gtk::FilterChange::LessStrict);
+    assert_eq!(filter_change_for("a", "b"), gtk::FilterChange::Different);
+    assert_eq!(filter_change_for("ab", "ac"), gtk::FilterChange::Different);
+}
+
+const FILTER_QUERY_GTK_CHILD: &str = "STRATA_FILTER_QUERY_GTK_CHILD";
+const FILTER_QUERY_TEST: &str =
+    "ui::browser::tests::notify_filter_query_skips_unchanged_folded_text";
+
+fn assert_notify_filter_query_skips_unchanged_folded_text() {
+    use gtk::prelude::*;
+    use std::{cell::Cell, rc::Rc};
+
+    let filter = gtk::CustomFilter::new(|_| true);
+    let emissions = Rc::new(Cell::new(0u32));
+    let emissions_for_signal = emissions.clone();
+    filter.connect_changed(move |_, _| {
+        emissions_for_signal.set(emissions_for_signal.get() + 1);
+    });
+    let query = std::cell::RefCell::new(String::new());
+
+    notify_filter_query(&filter, &query, "Abc".into());
+    assert_eq!(query.borrow().as_str(), "abc");
+    assert_eq!(emissions.get(), 1);
+
+    notify_filter_query(&filter, &query, "ABC".into());
+    assert_eq!(query.borrow().as_str(), "abc");
+    assert_eq!(emissions.get(), 1);
+}
+
+#[test]
+fn notify_filter_query_skips_unchanged_folded_text() {
+    if std::env::var_os(FILTER_QUERY_GTK_CHILD).is_some() {
+        if gtk::init().is_err() {
+            return;
+        }
+        assert_notify_filter_query_skips_unchanged_folded_text();
+        return;
+    }
+
+    let status =
+        std::process::Command::new(std::env::current_exe().expect("test executable should exist"))
+            .args(["--exact", FILTER_QUERY_TEST])
+            .env(FILTER_QUERY_GTK_CHILD, "1")
+            .status()
+            .expect("isolated GTK filter-query test should start");
+    assert!(status.success(), "isolated GTK filter-query test failed");
+}
+
+#[test]
+fn seeded_filter_keeps_first_character_when_typing_continues() {
+    const CHILD: &str = "STRATA_SEEDED_FILTER_GTK_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("test executable should exist"),
+        )
+        .args([
+            "--exact",
+            "ui::browser::tests::seeded_filter_keeps_first_character_when_typing_continues",
+        ])
+        .env(CHILD, "1")
+        .status()
+        .expect("isolated seeded filter test should start");
+        assert!(status.success());
+        return;
+    }
+    if gtk::init().is_err() {
+        return;
+    }
+    let entry = gtk::Entry::new();
+    let window = gtk::Window::builder().child(&entry).build();
+    window.present();
+    let text = entry
+        .delegate()
+        .expect("entry should have an editable delegate")
+        .downcast::<gtk::Text>()
+        .expect("entry delegate should be GtkText");
+    let suffix = &"LICENSE"[1..];
+    for seed in ["L", "é", "文"] {
+        entry.grab_focus();
+        super::focus_filter_entry(&entry, Some(seed));
+        assert_eq!(entry.selection_bounds(), None);
+        assert_eq!(entry.position(), seed.chars().count() as i32);
+        text.emit_by_name::<()>("insert-at-cursor", &[&suffix]);
+        assert_eq!(entry.text(), format!("{seed}{suffix}"));
+    }
+    super::focus_filter_entry(&entry, None);
+    assert_eq!(entry.text(), format!("文{suffix}"));
+    window.destroy();
+}
+
+const SCROLL_PIN_GTK_CHILD: &str = "STRATA_SCROLL_PIN_GTK_CHILD";
+const SCROLL_PIN_TEST: &str =
+    "ui::browser::tests::waiting_to_scroll_does_not_pin_an_unallocated_view";
+
+fn assert_waiting_to_scroll_does_not_pin_an_unallocated_view() {
+    let model = gtk::StringList::new(&["fv\talpha"]);
+    let selection = gtk::NoSelection::new(Some(model));
+    let list = gtk::ListView::new(Some(selection), Some(gtk::SignalListItemFactory::new()));
+    let weak = list.downgrade();
+    scroll_collection_when_allocated(list.upcast_ref(), 0);
+    drop(list);
+    while glib::MainContext::default().iteration(false) {}
+    assert!(
+        weak.upgrade().is_none(),
+        "deferred scroll must not pin the collection view"
+    );
+}
+
+#[test]
+fn waiting_to_scroll_does_not_pin_an_unallocated_view() {
+    if std::env::var_os(SCROLL_PIN_GTK_CHILD).is_some() {
+        if gtk::init().is_err() {
+            return;
+        }
+        assert_waiting_to_scroll_does_not_pin_an_unallocated_view();
+        return;
+    }
+
+    let status =
+        std::process::Command::new(std::env::current_exe().expect("test executable should exist"))
+            .args(["--exact", SCROLL_PIN_TEST])
+            .env(SCROLL_PIN_GTK_CHILD, "1")
+            .status()
+            .expect("isolated GTK scroll pin test should start");
+    assert!(status.success(), "isolated GTK scroll pin test failed");
 }

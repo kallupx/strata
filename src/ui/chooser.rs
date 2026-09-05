@@ -31,18 +31,22 @@ use crate::{
     },
     services::{
         DirectoryChange, DirectoryEvent, DirectoryRequest, FileSource, LoadHandle,
-        LocationValidationError,
+        LocationValidationError, MetadataRequest,
     },
 };
 
 use super::{
-    browser::{BrowserView, column_menu_option, entry_supports_quick_preview},
-    controls::{form_check_button, form_entry, form_label},
+    blur::BlurBin,
+    browser::{BrowserView, dismiss_modal_layer, entry_supports_quick_preview, modal_layer},
+    controls::{
+        ModalTone, form_check_button, form_entry, form_label, menu_option, message_dialog_layout,
+    },
     preview::PreviewDrawer,
     theme::ThemeManager,
     window::{
-        SidebarView, build_appearance_menu, build_sidebar, home_directory,
-        is_sidebar_focus_shortcut, vim_focus_direction,
+        MIN_SIDEBAR_WIDTH, SIDEBAR_WIDTH, SidebarView, build_appearance_menu, build_sidebar,
+        home_directory, install_modal_focus_trap, is_sidebar_focus_shortcut, vim_focus_direction,
+        visible_modal_layer,
     },
 };
 
@@ -76,6 +80,30 @@ impl FileSource for ChooserFileSource {
             ));
         }
         LocalFileSource.validate_location(location)
+    }
+
+    fn validate_location_async(
+        &self,
+        location: Location,
+        emit: Rc<dyn Fn(Result<(), LocationValidationError>)>,
+    ) -> LoadHandle {
+        if location.native_path().is_none() {
+            emit(self.validate_location(&location));
+            return LoadHandle::new(|| {});
+        }
+        LocalFileSource.validate_location_async(location, emit)
+    }
+
+    fn supports_metadata_fill(&self, location: &Location) -> bool {
+        location.native_path().is_some() && LocalFileSource.supports_metadata_fill(location)
+    }
+
+    fn fill_metadata(
+        &self,
+        request: MetadataRequest,
+        emit: Rc<dyn Fn(DirectoryEvent)>,
+    ) -> LoadHandle {
+        LocalFileSource.fill_metadata(request, emit)
     }
 
     fn enumerate(&self, request: DirectoryRequest, emit: Rc<dyn Fn(DirectoryEvent)>) -> LoadHandle {
@@ -196,32 +224,57 @@ impl ChooserDropdown {
             .position(gtk::PositionType::Bottom)
             .build();
         popover.add_css_class("column-popover");
+        let current_label = gtk::Label::new(Some(current));
+        current_label.set_xalign(0.0);
+        current_label.set_hexpand(true);
+        current_label.set_max_width_chars(36);
+        current_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         let button = gtk::MenuButton::builder()
-            .label(current)
+            .child(&current_label)
+            .always_show_arrow(true)
             .popover(&popover)
             .build();
+        button.set_tooltip_text(Some(current));
         button.add_css_class("form-control");
+        button.add_css_class("chooser-dropdown");
         button.set_halign(gtk::Align::Start);
 
         let selected = Rc::new(Cell::new(selected));
         let changed = Rc::new(RefCell::new(None::<SelectionChanged>));
         let checks = Rc::new(RefCell::new(Vec::<gtk::Image>::new()));
         for (index, label) in labels.iter().enumerate() {
-            let (option, check) = column_menu_option(label, index == selected.get());
+            let (option, check) = menu_option(label, index == selected.get());
+            if let Some(label_widget) = option
+                .child()
+                .and_then(|row| row.first_child())
+                .and_downcast::<gtk::Label>()
+            {
+                label_widget.set_max_width_chars(48);
+                label_widget.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                label_widget.set_tooltip_text(Some(label));
+            }
             checks.borrow_mut().push(check);
             let selected = selected.clone();
             let changed = changed.clone();
             let checks = checks.clone();
-            let button = button.clone();
-            let popover = popover.clone();
+            let button = button.downgrade();
+            let current_label = current_label.downgrade();
+            let popover = popover.downgrade();
             let label = (*label).to_owned();
             option.connect_clicked(move |_| {
                 selected.set(index);
-                button.set_label(&label);
+                if let Some(current_label) = current_label.upgrade() {
+                    current_label.set_label(&label);
+                }
+                if let Some(button) = button.upgrade() {
+                    button.set_tooltip_text(Some(&label));
+                }
                 for (check_index, check) in checks.borrow().iter().enumerate() {
                     check.set_visible(check_index == index);
                 }
-                popover.popdown();
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
                 if let Some(changed) = changed.borrow().as_ref() {
                     changed(index);
                 }
@@ -288,6 +341,7 @@ struct ChooserState {
     read_only: Option<gtk::CheckButton>,
     error: gtk::Label,
     destination_check: Cell<bool>,
+    accept_button: gtk::Button,
     completion: RefCell<Option<Completion>>,
 }
 
@@ -318,6 +372,9 @@ impl ChooserState {
     fn show_error(&self, message: &str) {
         self.error.set_label(message);
         self.error.set_visible(true);
+        if let Some(details) = self.error.ancestor(gtk::ScrolledWindow::static_type()) {
+            details.set_visible(true);
+        }
     }
 
     fn active_folder(&self) -> Result<PathBuf, &'static str> {
@@ -368,6 +425,12 @@ impl ChooserState {
     }
 
     fn accept(self: &Rc<Self>) {
+        if self.completion.borrow().is_none()
+            || self.destination_check.get()
+            || visible_modal_layer(&self.window).is_some()
+        {
+            return;
+        }
         self.error.set_visible(false);
         match &self.request.kind {
             ChooserKind::Open {
@@ -438,6 +501,7 @@ impl ChooserState {
         if self.destination_check.replace(true) {
             return;
         }
+        self.accept_button.set_sensitive(false);
         let weak = Rc::downgrade(self);
         let _task = glib::MainContext::default().spawn_local(async move {
             let result = check_destinations(&folder, &names).await;
@@ -445,6 +509,10 @@ impl ChooserState {
                 return;
             };
             state.destination_check.set(false);
+            state.accept_button.set_sensitive(true);
+            if state.completion.borrow().is_none() {
+                return;
+            }
             let destinations = match result {
                 Ok(destinations) => destinations,
                 Err(message) => {
@@ -457,27 +525,73 @@ impl ChooserState {
                 return;
             }
 
-            let plural = destinations.paths.len() > 1;
-            let dialog = gtk::AlertDialog::builder()
-                .modal(true)
-                .message(if plural {
-                    "Replace existing files?"
-                } else {
-                    "Replace existing file?"
-                })
-                .detail(if plural {
+            state.confirm_overwrite(destinations.paths);
+        });
+    }
+
+    fn confirm_overwrite(self: &Rc<Self>, paths: Vec<PathBuf>) {
+        let Some(overlay) = self.window.child().and_downcast::<gtk::Overlay>() else {
+            return;
+        };
+        let root = overlay.child().and_downcast::<BlurBin>();
+        if let Some(root) = root.as_ref() {
+            root.set_blurred(true);
+        }
+        let names = paths
+            .iter()
+            .take(3)
+            .filter_map(|path| path.file_name())
+            .map(|name| name.to_string_lossy().chars().take(80).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let layout = message_dialog_layout(
+            crate::assets::icons::COPY,
+            if paths.len() > 1 {
+                "Replace existing files?"
+            } else {
+                "Replace existing file?"
+            },
+            &names,
+            "Replace",
+            ModalTone::Danger,
+        );
+        layout
+            .body
+            .append(&super::controls::message_dialog_description(
+                if paths.len() > 1 {
                     "One or more destination files already exist. Continuing may overwrite them."
                 } else {
-                    "A destination file already exists. Continuing may overwrite it."
-                })
-                .buttons(["Cancel", "Replace"])
-                .cancel_button(0)
-                .default_button(1)
-                .build();
-            if dialog.choose_future(Some(&state.window)).await == Ok(1) {
-                state.complete_paths(destinations.paths, None);
+                    "The destination file already exists. Continuing may overwrite it."
+                },
+            ));
+        let layer = modal_layer(&layout.content, &overlay, root.clone(), None);
+        overlay.add_overlay(&layer);
+        for button in [&layout.cancel, &layout.close] {
+            let layer = layer.clone();
+            let overlay = overlay.clone();
+            let root = root.clone();
+            button.connect_clicked(move |_| dismiss_modal_layer(&layer, &overlay, root.as_ref()));
+        }
+        let weak = Rc::downgrade(self);
+        let confirmed_layer = layer.clone();
+        layout.confirm.connect_clicked(move |_| {
+            dismiss_modal_layer(&confirmed_layer, &overlay, root.as_ref());
+            if let Some(state) = weak.upgrade() {
+                state.complete_paths(paths.clone(), None);
             }
         });
+        let escape = gtk::EventControllerKey::new();
+        let cancel = layout.cancel.clone();
+        escape.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                cancel.emit_clicked();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        layer.add_controller(escape);
+        layout.cancel.grab_focus();
     }
 
     fn activate_file(self: &Rc<Self>, location: &Location) {
@@ -536,11 +650,19 @@ pub(crate) fn present_chooser(
     let theme = ThemeManager::shared();
     view.set_view_mode(theme.browser_mode());
     view.set_density(theme.browser_density());
+    view.set_group_by_type(theme.group_by_type());
+    view.set_auto_refresh_interval(theme.auto_refresh_interval());
     view.set_peek_enabled(false);
     view.set_single_click_previews(false);
     view.set_operation_provider(Rc::new(LocalOperationProvider));
     let browser = view.browser();
-    let preview = PreviewDrawer::new(Rc::new(LocalPreviewProvider), false);
+    let preview_preferences = theme.clone();
+    let preview = PreviewDrawer::new(
+        Rc::new(LocalPreviewProvider::new(Rc::new(move || {
+            preview_preferences.media_preview_backend()
+        }))),
+        false,
+    );
 
     let window = gtk::Window::builder()
         .title(&request.title)
@@ -549,7 +671,7 @@ pub(crate) fn present_chooser(
         .modal(request.modal)
         .build();
     let header = gtk::HeaderBar::new();
-    header.set_show_title_buttons(true);
+    header.set_show_title_buttons(false);
     let sidebar_toggle = gtk::ToggleButton::builder()
         .active(true)
         .tooltip_text("Toggle sidebar (Ctrl+B)")
@@ -561,17 +683,37 @@ pub(crate) fn present_chooser(
     sidebar_toggle.add_css_class("sidebar-toggle");
     let location = view.location_widget();
     location.set_hexpand(true);
-    let appearance = build_appearance_menu(&view, &browser, theme);
+    let appearance = build_appearance_menu(&view, &browser, theme.clone());
     let header_content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     header_content.set_hexpand(true);
     header_content.append(&sidebar_toggle);
     header_content.append(&location);
-    header_content.append(&appearance);
+    let close = gtk::Button::builder()
+        .tooltip_text("Cancel file selection (Esc)")
+        .build();
+    close.set_child(Some(&crate::assets::primary_icon(
+        crate::assets::icons::X,
+        20,
+    )));
+    close.add_css_class("header-action");
+    let closing_window = window.downgrade();
+    close.connect_clicked(move |_| {
+        if let Some(window) = closing_window.upgrade() {
+            window.close();
+        }
+    });
+    let header_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    header_actions.add_css_class("header-actions");
+    header_actions.append(&appearance);
+    header_actions.append(&close);
+    header_content.append(&header_actions);
     header.set_title_widget(Some(&header_content));
 
-    let sidebar = build_sidebar(view.clone(), true);
+    let sidebar = build_sidebar(view.clone(), theme, true);
     let content = gtk::Paned::new(gtk::Orientation::Horizontal);
-    content.set_position(208);
+    content.set_wide_handle(false);
+    content.set_position(SIDEBAR_WIDTH);
+    sidebar.widget.set_size_request(MIN_SIDEBAR_WIDTH, -1);
     content.set_shrink_start_child(false);
     content.set_resize_start_child(false);
     content.set_start_child(Some(&sidebar.widget));
@@ -663,7 +805,14 @@ pub(crate) fn present_chooser(
     };
 
     let choices = build_choices(&request.choices, &details);
-    let read_only = matches!(&request.kind, ChooserKind::Open { .. }).then(|| {
+    let read_only = matches!(
+        &request.kind,
+        ChooserKind::Open {
+            directory: false,
+            ..
+        }
+    )
+    .then(|| {
         let check = form_check_button("Open files read-only");
         details.append(&check);
         check
@@ -700,13 +849,31 @@ pub(crate) fn present_chooser(
     actions.append(&spacer);
     actions.append(&cancel);
     actions.append(&accept);
-    details.append(&actions);
+    let details_scroll = gtk::ScrolledWindow::builder()
+        .child(&details)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(220)
+        .build();
+    details_scroll.set_visible(
+        filename.is_some()
+            || !filters.is_empty()
+            || !choices.is_empty()
+            || read_only.is_some()
+            || matches!(&request.kind, ChooserKind::SaveFiles { .. }),
+    );
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.append(&header);
     root.append(&preview_split);
-    root.append(&details);
-    window.set_child(Some(&root));
+    root.append(&details_scroll);
+    root.append(&actions);
+    let blurred_root = BlurBin::new(&root);
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&blurred_root));
+    window.set_child(Some(&overlay));
+    install_modal_focus_trap(&window);
     window.set_default_widget(Some(&accept));
 
     let state = Rc::new(ChooserState {
@@ -720,6 +887,7 @@ pub(crate) fn present_chooser(
         read_only,
         error,
         destination_check: Cell::new(false),
+        accept_button: accept.clone(),
         completion: RefCell::new(Some(Box::new(completion))),
     });
 
@@ -750,15 +918,15 @@ pub(crate) fn present_chooser(
     let preview_for_selection = preview.clone();
     let weak_browser = Rc::downgrade(&browser);
     browser.observe(move |event| match event {
-        BrowserEvent::OpenRequested { location } => state_for_observer.activate_file(&location),
-        BrowserEvent::PreviewRequested { entry } => preview_for_selection.show(entry),
+        BrowserEvent::OpenRequested { location } => state_for_observer.activate_file(location),
+        BrowserEvent::PreviewRequested { entry } => preview_for_selection.show(entry.clone()),
         BrowserEvent::FocusChanged {
             depth,
             position: Some(position),
         } if preview_for_selection.is_open() => {
             if let Some(entry) = weak_browser
                 .upgrade()
-                .and_then(|browser| browser.entry_at(depth, position))
+                .and_then(|browser| browser.entry_at(*depth, *position))
                 .and_then(|entry| chooser_preview_target(Some(entry)))
             {
                 preview_for_selection.show(entry);
@@ -806,7 +974,7 @@ pub(crate) fn present_chooser(
 
     gtk::prelude::WidgetExt::realize(&window);
     apply_external_parent(&window, state.request.parent.as_ref());
-    view.navigate(&state.request.initial_directory);
+    browser.navigate(Location::local(&state.request.initial_directory));
     window.present();
 }
 
@@ -904,6 +1072,9 @@ fn labeled_row(label: &str, child: Option<&gtk::Widget>) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     let label = form_label(label);
     label.set_width_chars(12);
+    label.set_max_width_chars(16);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_tooltip_text(Some(&label.text()));
     row.append(&label);
     if let Some(child) = child {
         row.append(child);
@@ -941,21 +1112,35 @@ fn install_shortcuts(
     let sidebar_widget = sidebar.widget.clone();
     let sidebar_toggle = sidebar_toggle.clone();
     let preview = preview.clone();
-    let dialog_parent = window.clone();
     let focus_before_sidebar = Rc::new(RefCell::new(None::<gtk::Widget>));
     keys.connect_key_pressed(move |_, key, _, modifiers| {
         let Some(state) = weak.upgrade() else {
             return glib::Propagation::Proceed;
         };
+        if let Some(layer) = visible_modal_layer(&state.window) {
+            let focused = gtk::prelude::RootExt::focus(&state.window);
+            if !focused.is_some_and(|focus| focus == layer || focus.is_ancestor(&layer)) {
+                layer.grab_focus();
+            }
+            return glib::Propagation::Proceed;
+        }
         let browser = state.view.browser();
         let control = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         let alt = modifiers.contains(gtk::gdk::ModifierType::ALT_MASK);
         let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
-        let focused = gtk::prelude::RootExt::focus(&dialog_parent);
+        let focused = gtk::prelude::RootExt::focus(&state.window);
         let sidebar_has_focus = focused.as_ref().is_some_and(|focused| {
             focused == &sidebar_widget || focused.is_ancestor(&sidebar_widget)
         });
         if key == gtk::gdk::Key::Escape {
+            if let Some(popover) = focused
+                .as_ref()
+                .and_then(|widget| widget.ancestor(gtk::Popover::static_type()))
+                .and_downcast::<gtk::Popover>()
+            {
+                popover.popdown();
+                return glib::Propagation::Stop;
+            }
             if state.dismiss_dropdown() {
                 return glib::Propagation::Stop;
             }
@@ -1039,7 +1224,7 @@ fn install_shortcuts(
         if control
             && !shift
             && key == gtk::gdk::Key::a
-            && !state.view.filter_has_focus()
+            && state.view.item_view_has_focus()
             && matches!(
                 &state.request.kind,
                 ChooserKind::Open { multiple: true, .. }
@@ -1048,9 +1233,27 @@ fn install_shortcuts(
             state.view.select_all();
             return glib::Propagation::Stop;
         }
-        if control && matches!(key, gtk::gdk::Key::h | gtk::gdk::Key::H) {
+        if key == gtk::gdk::Key::F5
+            || (control && !alt && matches!(key, gtk::gdk::Key::r | gtk::gdk::Key::R))
+        {
+            if let Some(depth) = browser.active_depth() {
+                browser.retry_column(depth);
+            }
+            return glib::Propagation::Stop;
+        }
+        if control
+            && !shift
+            && !alt
+            && matches!(
+                key,
+                gtk::gdk::Key::h | gtk::gdk::Key::H | gtk::gdk::Key::period
+            )
+        {
             browser.toggle_hidden();
             return glib::Propagation::Stop;
+        }
+        if control {
+            return glib::Propagation::Proceed;
         }
         let column_popover = focused
             .as_ref()

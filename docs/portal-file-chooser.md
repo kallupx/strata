@@ -2,7 +2,9 @@
 
 Strata can serve the XDG Desktop Portal FileChooser interface for portal-aware applications. Native file pickers and applications that do not use the portal are unchanged.
 
-The first release is deliberately limited to local files and folders. X11 parent-window integration is best-effort, so the chooser may appear as a standalone modal window; Wayland applications can provide a parent handle directly.
+The chooser is deliberately limited to local files and folders. It uses the main app's sidebar, Columns/Grid/Explorer views, type grouping, filters, metadata, previews, and themed controls. Overwrite confirmation uses the same in-window modal as the app.
+
+Wayland applications can provide an exported parent handle. X11 parent handles are not attached; these requests appear as standalone windows.
 
 ## Per-user installation
 
@@ -80,6 +82,47 @@ gdbus call --session \
 The second command should report `uint32 4`. Then open or save a file from a portal-aware application. Only local locations appear in this initial picker; entering a remote URI shows an unsupported-location error.
 
 Portal backend selection happens before a request is sent. Keeping the existing backend after `strata;` lets the frontend choose it when Strata's `.portal` metadata is absent. It does not provide live failover if an already-selected Strata backend crashes during a request.
+
+## Local test tools
+
+### Test a build without changing your desktop portal
+
+From the repository root, build Strata and run the dedicated client (requires Python with PyGObject/Gio and `dbus-daemon`):
+
+```bash
+cargo build
+python3 scripts/portal-test.py single --binary target/debug/strata
+python3 scripts/portal-test.py multiple --binary target/debug/strata --view grid --group-by-type
+python3 scripts/portal-test.py directory --binary target/debug/strata --view columns
+python3 scripts/portal-test.py filters --binary target/debug/strata
+python3 scripts/portal-test.py save --binary target/debug/strata --choices
+python3 scripts/portal-test.py savefiles --binary target/debug/strata --choices
+```
+
+`--binary` starts a private session bus and backend with disposable settings, cache, and sample files. It never installs portal metadata, changes your preferences, or restarts your desktop services. Closing the chooser prints the actual D-Bus response (`0` for success, `1` for cancellation) and cleans up the private backend. The client returns destinations but does not write to them.
+
+Use `--folder /absolute/path` for your own files, `--theme classic-light` for a light theme, or `--cancel-after 1` to exercise `Request.Close`. Omit `--binary` to call an already-running Strata backend on your session bus. This client tests the backend directly, not portal frontend routing.
+
+Check these interactions:
+
+- Single-selection requests remain single-selection with Ctrl/Shift clicks, including grouped Grid sections. Multiple-selection requests return all selected files.
+- Ctrl+L edits the location; Ctrl+F opens the browser filter; F5 refreshes; Ctrl+H or Ctrl+. toggles hidden files. Remote locations show an error.
+- Space opens/closes a preview. Escape dismisses a filter/menu/preview before cancelling the chooser.
+- Ctrl+Shift+N or **New Folder** creates a directory inline. In folder requests, Ctrl+Enter accepts the current folder when the file view has focus.
+- The SaveFile fixture suggests an existing filename. **Save** opens a themed overwrite confirmation; cancelling it leaves the chooser open. **Replace** returns the destination.
+- File filters and application choices preserve the selected values in the response. Ctrl+A in the filename entry selects the text, not browser files.
+
+### Recreated browser test page
+
+The five-case page from the original PR is checked in at [`scripts/portal-test.html`](../scripts/portal-test.html):
+
+```bash
+python3 -m http.server 8765 --bind 127.0.0.1 --directory scripts
+```
+
+Open `http://localhost:8765/portal-test.html` in a portal-aware Chromium browser **after enabling Strata as the preferred FileChooser**. It exercises single open, multiple open, directory selection, image/text filters, and saving `strata-portal-demo.txt`. The SaveFile button explicitly writes a short test file to the destination you choose. Each row reports success, cancellation, or an error; the page shows the returned filenames.
+
+The browser must expose the File System Access API, and its Linux file picker must use the portal. If a different chooser appears, check browser portal support and the configured frontend backend preference. Browsers do not expose the portal's `SaveFiles` or application-defined choices; use the dedicated client for those cases.
 
 ## Uninstall
 

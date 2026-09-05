@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+mod selection;
+
 use std::{ffi::OsString, path::Path};
 
 use ashpd::desktop::file_chooser::FileFilter;
@@ -13,6 +15,8 @@ fn entry(name: &str, kind: EntryKind) -> FileEntry {
         native_name: OsString::from(name),
         display_name: name.to_owned(),
         kind,
+        is_hidden: false,
+        mode: MetadataValue::Unknown,
         size: MetadataValue::Unknown,
         modified_unix_seconds: MetadataValue::Unknown,
     }
@@ -42,6 +46,14 @@ fn native_filters_match_globs_and_mime_types_without_hiding_directories() {
         &filter,
         &entry("folder.zip", EntryKind::Directory)
     ));
+    let hidden = entry("archive.zip", EntryKind::File);
+    assert!(
+        matches!(filter_directory_change(Some(&filter), DirectoryChange::Upsert(hidden.clone())), DirectoryChange::Remove(location) if location == hidden.location)
+    );
+    let previous = Location::local("/tmp/previous.txt");
+    assert!(
+        matches!(filter_directory_change(Some(&filter), DirectoryChange::Move { from: previous.clone(), entry: hidden }), DirectoryChange::Remove(location) if location == previous)
+    );
 }
 
 #[test]
@@ -79,6 +91,74 @@ fn chooser_watches_local_directories() {
     let watch = source.watch(Location::local(root.path()), true, Rc::new(|_| {}));
 
     assert!(watch.is_some());
+}
+
+#[test]
+fn chooser_fills_metadata_for_the_current_browser_views() {
+    use crate::services::{MetadataOutcome, RequestId};
+    use std::time::Duration;
+
+    let _serial = crate::test_support::ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .expect("main context test lock");
+    let context = glib::MainContext::default();
+    let _owner = context.acquire().expect("exclusive metadata main context");
+    let root = tempfile::tempdir().expect("fixture directory");
+    let path = root.path().join("notes.txt");
+    std::fs::write(&path, b"notes").expect("metadata fixture");
+    let source = ChooserFileSource::new();
+    assert!(source.supports_metadata_fill(&Location::local(root.path())));
+    assert!(!source.supports_metadata_fill(&Location::uri("smb://server/share")));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let received = events.clone();
+    let _load = source.fill_metadata(
+        MetadataRequest {
+            id: RequestId(1),
+            entries: vec![Location::local(&path)],
+            full: false,
+            time_budget: Duration::from_secs(2),
+        },
+        Rc::new(move |event| received.borrow_mut().push(event)),
+    );
+    context.block_on(async {
+        glib::future_with_timeout(Duration::from_secs(5), async {
+            while !events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, DirectoryEvent::MetadataFinished { .. }))
+            {
+                glib::timeout_future(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("metadata fill completes within the deadline");
+    });
+    let events = events.borrow();
+    assert!(events.iter().any(|event| matches!(event, DirectoryEvent::MetadataFilled { updates, .. } if updates.iter().any(|update| update.size == MetadataValue::Known(5)))));
+    assert!(matches!(
+        events.last(),
+        Some(DirectoryEvent::MetadataFinished {
+            outcome: MetadataOutcome::Complete,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn chooser_async_validation_rejects_remote_locations() {
+    let source = ChooserFileSource::new();
+    let result = Rc::new(RefCell::new(None));
+    let received = result.clone();
+    let _load = source.validate_location_async(
+        Location::uri("smb://server/share"),
+        Rc::new(move |value| {
+            received.replace(Some(value));
+        }),
+    );
+    assert!(matches!(
+        result.take(),
+        Some(Err(LocationValidationError::UnsupportedScheme(_)))
+    ));
 }
 
 #[test]

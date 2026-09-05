@@ -7,7 +7,10 @@ use std::{
     sync::atomic::Ordering,
 };
 
-use ashpd::desktop::file_chooser::{Choice, FileFilter, OpenFileOptions};
+use ashpd::desktop::{
+    HandleToken,
+    file_chooser::{Choice, FileFilter, OpenFileOptions},
+};
 
 use super::*;
 use crate::model::{EntryKind, FileEntry, MetadataValue};
@@ -26,6 +29,8 @@ fn entry(path: &Path, directory: bool) -> FileEntry {
         } else {
             EntryKind::File
         },
+        is_hidden: false,
+        mode: MetadataValue::Unknown,
         size: MetadataValue::Unknown,
         modified_unix_seconds: MetadataValue::Unknown,
     }

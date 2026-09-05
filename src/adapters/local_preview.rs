@@ -6,18 +6,28 @@ use gtk::{gio, glib, prelude::*};
 
 use crate::{
     model::Location,
-    sandbox::{Cancellation, ParseOperation},
+    sandbox::{Cancellation, MediaPreviewBackend, ParseOperation},
     services::{
         LoadHandle, Preview, PreviewContent, PreviewEvent, PreviewProvider, PreviewRequest,
-        content_family, has_plain_text_extension,
+        content_family, has_plain_text_extension, is_non_executable_extensionless_dotfile,
     },
 };
 
-#[derive(Default)]
-pub struct LocalPreviewProvider;
+pub struct LocalPreviewProvider {
+    media_preview_backend: Rc<dyn Fn() -> MediaPreviewBackend>,
+}
+
+impl LocalPreviewProvider {
+    pub(crate) fn new(media_preview_backend: Rc<dyn Fn() -> MediaPreviewBackend>) -> Self {
+        Self {
+            media_preview_backend,
+        }
+    }
+}
 
 impl PreviewProvider for LocalPreviewProvider {
     fn load(&self, request: PreviewRequest, emit: Rc<dyn Fn(PreviewEvent)>) -> LoadHandle {
+        let media_preview_backend = (self.media_preview_backend)();
         let request_id = request.id;
         let entry = request.entry.clone();
         let cancellation = Cancellation::default();
@@ -26,7 +36,7 @@ impl PreviewProvider for LocalPreviewProvider {
             let file = file_for_location(&entry.location);
             let info = match file
                 .query_info_future(
-                    "standard::content-type",
+                    "standard::content-type,unix::mode",
                     gio::FileQueryInfoFlags::NONE,
                     glib::Priority::DEFAULT,
                 )
@@ -46,10 +56,14 @@ impl PreviewProvider for LocalPreviewProvider {
                 .content_type()
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "application/octet-stream".to_owned());
+            let unix_mode = info
+                .has_attribute(gio::FILE_ATTRIBUTE_UNIX_MODE)
+                .then(|| info.attribute_uint32(gio::FILE_ATTRIBUTE_UNIX_MODE));
             let mut content = content_family(&content_type);
             if matches!(content, PreviewContent::Unsupported)
                 && (gio::content_type_is_a(&content_type, "text/plain")
-                    || has_plain_text_extension(&entry.native_name))
+                    || has_plain_text_extension(&entry.native_name)
+                    || is_non_executable_extensionless_dotfile(&entry.native_name, unix_mode))
             {
                 content = PreviewContent::Text {
                     content: String::new(),
@@ -78,7 +92,13 @@ impl PreviewProvider for LocalPreviewProvider {
                 let value = request.pdf_page;
                 let cancellation = cancellation_for_task.clone();
                 content = match gio::spawn_blocking(move || {
-                    crate::sandbox::parse(&path, operation, value, &cancellation)
+                    crate::sandbox::parse(
+                        &path,
+                        operation,
+                        value,
+                        media_preview_backend,
+                        &cancellation,
+                    )
                 })
                 .await
                 {

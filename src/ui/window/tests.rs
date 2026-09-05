@@ -1,13 +1,51 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::path::Path;
+use std::{cell::Cell, path::Path};
+
+use crate::services::{BuildKind, ReleaseMetadata};
 
 use super::{
-    MouseHistoryAction, PinStatus, is_open_terminal_shortcut, is_sidebar_focus_shortcut,
-    is_smb_location, is_standard_place_location, mouse_history_action, parse_pinned_places,
-    pin_status, remove_pinned_place, reorder_places, serialize_pinned_places,
-    should_show_standard_place, vim_focus_direction,
+    MediaRelease, MouseHistoryAction, PinStatus, STANDARD_PLACE_IDS, begin_media_release,
+    is_open_terminal_shortcut, is_sidebar_focus_shortcut, is_smb_location,
+    is_standard_place_location, is_toggle_hidden_shortcut, is_undo_shortcut, media_release_label,
+    mount_release_action, mouse_history_action, page_direction, parse_pinned_drag_source,
+    parse_pinned_places, pin_status, remove_pinned_place, reorder_pinned_places, reorder_places,
+    resolve_place_order, serialize_pinned_places, should_show_standard_place, sidebar_update_label,
+    standard_place, type_to_search_query, vim_focus_direction, volume_release_action,
 };
+
+fn release(version: &str, kind: BuildKind) -> ReleaseMetadata {
+    ReleaseMetadata {
+        version: version.to_owned(),
+        url: "https://example.test/release".to_owned(),
+        notes: String::new(),
+        note_blocks: Vec::new(),
+        kind,
+        tag: format!("v{version}"),
+        published_at: None,
+        commit: None,
+    }
+}
+
+#[test]
+fn sidebar_update_label_stays_plain_for_a_stable_release() {
+    assert_eq!(
+        sidebar_update_label(&release("0.6.0", BuildKind::Stable)),
+        "v0.6.0 available"
+    );
+}
+
+#[test]
+fn sidebar_update_label_names_the_build_kind_for_a_prerelease() {
+    assert_eq!(
+        sidebar_update_label(&release("0.6.0-rc.1", BuildKind::Rc)),
+        "v0.6.0-rc.1 (Release candidate) available"
+    );
+    assert_eq!(
+        sidebar_update_label(&release("0.6.0-nightly.20260901", BuildKind::Nightly)),
+        "v0.6.0-nightly.20260901 (Nightly) available"
+    );
+}
 
 #[test]
 fn mouse_history_buttons_map_to_navigation_actions() {
@@ -39,6 +77,55 @@ fn open_terminal_shortcut_requires_only_control() {
 }
 
 #[test]
+fn undo_shortcut_requires_control_without_shift_or_alt() {
+    let control = gtk::gdk::ModifierType::CONTROL_MASK;
+    let shift = gtk::gdk::ModifierType::SHIFT_MASK;
+    let alt = gtk::gdk::ModifierType::ALT_MASK;
+
+    assert!(is_undo_shortcut(gtk::gdk::Key::z, control));
+    assert!(is_undo_shortcut(gtk::gdk::Key::Z, control));
+    assert!(!is_undo_shortcut(
+        gtk::gdk::Key::z,
+        gtk::gdk::ModifierType::empty()
+    ));
+    assert!(!is_undo_shortcut(gtk::gdk::Key::z, control | shift));
+    assert!(!is_undo_shortcut(gtk::gdk::Key::z, control | alt));
+}
+
+#[test]
+fn page_keys_map_to_a_scroll_direction() {
+    assert_eq!(page_direction(gtk::gdk::Key::Page_Up), Some(-1));
+    assert_eq!(page_direction(gtk::gdk::Key::KP_Page_Up), Some(-1));
+    assert_eq!(page_direction(gtk::gdk::Key::Page_Down), Some(1));
+    assert_eq!(page_direction(gtk::gdk::Key::KP_Page_Down), Some(1));
+    assert_eq!(page_direction(gtk::gdk::Key::Home), None);
+}
+
+#[test]
+fn toggle_hidden_shortcut_accepts_h_or_period_with_only_control() {
+    let control = gtk::gdk::ModifierType::CONTROL_MASK;
+    let shift = gtk::gdk::ModifierType::SHIFT_MASK;
+    let alt = gtk::gdk::ModifierType::ALT_MASK;
+
+    assert!(is_toggle_hidden_shortcut(gtk::gdk::Key::h, control));
+    assert!(is_toggle_hidden_shortcut(gtk::gdk::Key::H, control));
+    assert!(is_toggle_hidden_shortcut(gtk::gdk::Key::period, control));
+    assert!(!is_toggle_hidden_shortcut(
+        gtk::gdk::Key::h,
+        gtk::gdk::ModifierType::empty()
+    ));
+    assert!(!is_toggle_hidden_shortcut(
+        gtk::gdk::Key::h,
+        control | shift
+    ));
+    assert!(!is_toggle_hidden_shortcut(gtk::gdk::Key::h, control | alt));
+    assert!(!is_toggle_hidden_shortcut(
+        gtk::gdk::Key::period,
+        control | shift
+    ));
+}
+
+#[test]
 fn sidebar_focus_shortcut_requires_control_and_shift() {
     let control = gtk::gdk::ModifierType::CONTROL_MASK;
     let shift = gtk::gdk::ModifierType::SHIFT_MASK;
@@ -46,6 +133,34 @@ fn sidebar_focus_shortcut_requires_control_and_shift() {
     assert!(is_sidebar_focus_shortcut(gtk::gdk::Key::b, control | shift));
     assert!(is_sidebar_focus_shortcut(gtk::gdk::Key::B, control | shift));
     assert!(!is_sidebar_focus_shortcut(gtk::gdk::Key::b, control));
+}
+
+#[test]
+fn type_to_search_accepts_printable_keys_without_command_modifiers() {
+    assert_eq!(
+        type_to_search_query(gtk::gdk::Key::a, gtk::gdk::ModifierType::empty()),
+        Some('a')
+    );
+    assert_eq!(
+        type_to_search_query(gtk::gdk::Key::A, gtk::gdk::ModifierType::SHIFT_MASK),
+        Some('A')
+    );
+    assert_eq!(
+        type_to_search_query(gtk::gdk::Key::space, gtk::gdk::ModifierType::empty()),
+        Some(' ')
+    );
+}
+
+#[test]
+fn type_to_search_ignores_shortcuts_and_non_printable_keys() {
+    assert_eq!(
+        type_to_search_query(gtk::gdk::Key::k, gtk::gdk::ModifierType::CONTROL_MASK),
+        None
+    );
+    assert_eq!(
+        type_to_search_query(gtk::gdk::Key::F5, gtk::gdk::ModifierType::empty()),
+        None
+    );
 }
 
 #[test]
@@ -100,6 +215,124 @@ fn invalid_place_reorders_leave_the_order_unchanged() {
     assert!(!reorder_places(&mut places, "desktop", "missing", false));
     assert!(!reorder_places(&mut places, "desktop", "desktop", false));
     assert_eq!(places, original);
+}
+
+fn persisted_order(ids: &[&str]) -> Vec<String> {
+    ids.iter().map(|id| (*id).to_owned()).collect()
+}
+
+#[test]
+fn every_reorderable_place_id_is_a_known_standard_place() {
+    for id in STANDARD_PLACE_IDS {
+        assert!(
+            standard_place(id).is_some(),
+            "{id} must be a standard place"
+        );
+    }
+}
+
+#[test]
+fn a_persisted_place_order_is_restored_exactly() {
+    let order = resolve_place_order(&persisted_order(&["videos", "downloads", "desktop"]));
+    assert_eq!(
+        order,
+        vec!["videos", "downloads", "desktop", "documents", "pictures"]
+    );
+}
+
+#[test]
+fn unknown_persisted_place_ids_are_dropped() {
+    let order = resolve_place_order(&persisted_order(&["desktop", "archive", "videos"]));
+    assert_eq!(
+        order,
+        vec!["desktop", "videos", "documents", "downloads", "pictures"]
+    );
+}
+
+#[test]
+fn missing_places_are_appended_in_default_order() {
+    let order = resolve_place_order(&persisted_order(&["pictures"]));
+    assert_eq!(
+        order,
+        vec!["pictures", "desktop", "documents", "downloads", "videos"]
+    );
+}
+
+#[test]
+fn duplicate_persisted_place_ids_are_deduplicated() {
+    let order = resolve_place_order(&persisted_order(&["desktop", "desktop", "videos"]));
+    assert_eq!(
+        order,
+        vec!["desktop", "videos", "documents", "downloads", "pictures"]
+    );
+}
+
+fn pinned(paths: &[&str]) -> Vec<(crate::model::Location, String)> {
+    paths
+        .iter()
+        .map(|path| {
+            (
+                crate::model::Location::local(format!("/home/user/{path}")),
+                (*path).to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn pinned_names(places: &[(crate::model::Location, String)]) -> Vec<&str> {
+    places.iter().map(|(_, name)| name.as_str()).collect()
+}
+
+#[test]
+fn pinned_places_can_move_before_an_earlier_place() {
+    let mut places = pinned(&["Projects", "Notes", "Archive"]);
+
+    assert!(reorder_pinned_places(&mut places, 2, 0, false));
+    assert_eq!(pinned_names(&places), ["Archive", "Projects", "Notes"]);
+}
+
+#[test]
+fn pinned_places_can_move_after_a_later_place() {
+    let mut places = pinned(&["Projects", "Notes", "Archive"]);
+
+    assert!(reorder_pinned_places(&mut places, 0, 2, true));
+    assert_eq!(pinned_names(&places), ["Notes", "Archive", "Projects"]);
+}
+
+#[test]
+fn pinned_reorders_that_keep_the_position_are_ignored() {
+    let original = pinned(&["Projects", "Notes", "Archive"]);
+    let mut places = original.clone();
+
+    assert!(!reorder_pinned_places(&mut places, 1, 1, false));
+    assert!(!reorder_pinned_places(&mut places, 1, 0, true));
+    assert!(!reorder_pinned_places(&mut places, 1, 2, false));
+    assert_eq!(places, original);
+}
+
+#[test]
+fn out_of_range_pinned_reorders_leave_the_order_unchanged() {
+    let original = pinned(&["Projects", "Notes"]);
+    let mut places = original.clone();
+
+    assert!(!reorder_pinned_places(&mut places, 5, 0, false));
+    assert!(!reorder_pinned_places(&mut places, 0, 5, true));
+    assert_eq!(places, original);
+}
+
+#[test]
+fn pinned_reorders_leave_the_other_places_untouched() {
+    let mut places = pinned(&["Documents", "Projects", "Notes"]);
+
+    assert!(reorder_pinned_places(&mut places, 2, 1, false));
+    assert_eq!(pinned_names(&places), ["Documents", "Notes", "Projects"]);
+}
+
+#[test]
+fn only_pinned_drag_payloads_resolve_to_a_pinned_place() {
+    assert_eq!(parse_pinned_drag_source("pinned:3"), Some(3));
+    assert_eq!(parse_pinned_drag_source("documents"), None);
+    assert_eq!(parse_pinned_drag_source("pinned:documents"), None);
 }
 
 #[test]
@@ -246,4 +479,117 @@ fn desktop_is_hidden_when_it_points_to_home() {
         home
     ));
     assert!(should_show_standard_place("documents", home, home));
+}
+
+#[test]
+fn sidebar_sync_runs_only_for_location_changes() {
+    use super::SidebarState;
+    use crate::app::BrowserEvent;
+    use crate::model::Location;
+
+    assert!(SidebarState::event_changes_active_place(
+        &BrowserEvent::Reset
+    ));
+    assert!(SidebarState::event_changes_active_place(
+        &BrowserEvent::ColumnAdded {
+            depth: 1,
+            location: Location::local("/fixture/sub"),
+        }
+    ));
+    assert!(SidebarState::event_changes_active_place(
+        &BrowserEvent::ColumnsTruncated { len: 1 }
+    ));
+    assert!(SidebarState::event_changes_active_place(
+        &BrowserEvent::FocusChanged {
+            depth: 0,
+            position: Some(2),
+        }
+    ));
+    assert!(!SidebarState::event_changes_active_place(
+        &BrowserEvent::EntriesInserted {
+            depth: 0,
+            insertions: Vec::new(),
+        }
+    ));
+    assert!(!SidebarState::event_changes_active_place(
+        &BrowserEvent::MetadataFilled {
+            depth: 0,
+            updates: Vec::new(),
+        }
+    ));
+    assert!(!SidebarState::event_changes_active_place(
+        &BrowserEvent::SortingStarted { depth: 0 }
+    ));
+    assert!(!SidebarState::event_changes_active_place(
+        &BrowserEvent::SortingFinished { depth: 0 }
+    ));
+    assert!(!SidebarState::event_changes_active_place(
+        &BrowserEvent::LoadFinished {
+            depth: 0,
+            truncated: false,
+        }
+    ));
+    assert!(!SidebarState::event_changes_active_place(
+        &BrowserEvent::TransferCompleted
+    ));
+}
+
+#[test]
+fn volume_release_prefers_eject_and_hides_fixed_disks() {
+    assert_eq!(
+        volume_release_action(true, false, false),
+        Some(MediaRelease::EjectVolume)
+    );
+    assert_eq!(
+        volume_release_action(true, true, true),
+        Some(MediaRelease::EjectVolume)
+    );
+    assert_eq!(
+        volume_release_action(false, true, false),
+        Some(MediaRelease::EjectMount)
+    );
+    assert_eq!(
+        volume_release_action(false, true, true),
+        Some(MediaRelease::EjectMount)
+    );
+    assert_eq!(
+        volume_release_action(false, false, true),
+        Some(MediaRelease::UnmountMount)
+    );
+    assert_eq!(volume_release_action(false, false, false), None);
+}
+
+#[test]
+fn mount_release_prefers_eject_and_hides_fixed_disks() {
+    assert_eq!(
+        mount_release_action(true, false),
+        Some(MediaRelease::EjectMount)
+    );
+    assert_eq!(
+        mount_release_action(true, true),
+        Some(MediaRelease::EjectMount)
+    );
+    assert_eq!(
+        mount_release_action(false, true),
+        Some(MediaRelease::UnmountMount)
+    );
+    assert_eq!(mount_release_action(false, false), None);
+}
+
+#[test]
+fn media_release_labels_match_nautilus_wording() {
+    assert_eq!(media_release_label(MediaRelease::EjectVolume), "Eject");
+    assert_eq!(media_release_label(MediaRelease::EjectMount), "Eject");
+    assert_eq!(media_release_label(MediaRelease::UnmountMount), "Unmount");
+}
+
+#[test]
+fn media_release_guard_rejects_repeated_actions_until_completion() {
+    let in_flight = Cell::new(false);
+
+    assert!(begin_media_release(&in_flight));
+    assert!(!begin_media_release(&in_flight));
+
+    in_flight.set(false);
+    assert!(begin_media_release(&in_flight));
 }

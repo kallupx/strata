@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/logos/strata-tokyo-night.svg" alt="Strata logo" width="160">
+
 # Strata
 
 **Navigate every layer.** A fast, keyboard-first file manager for modern Linux desktops.
@@ -11,7 +13,7 @@
 
 <picture>
   <source media="(prefers-reduced-motion: no-preference)" srcset="docs/assets/strata-demo.gif">
-  <img src="docs/assets/strata-columns.png" alt="Strata showing Miller-column navigation, fuzzy search, general settings, and theme selection" width="1280">
+  <img src="docs/assets/strata-columns.png" alt="Strata browsing files and showing settings, themes, Icons view, and folder creation" width="1280">
 </picture>
 
 <sub>The animation respects reduced-motion preferences. View the [static preview](docs/assets/strata-columns.png).</sub>
@@ -24,6 +26,7 @@ Strata combines spatial Miller-column navigation with familiar Grid and Explorer
 
 - [Features](#features)
 - [Installation](#installation)
+  - [Interactive installation](#interactive-installation)
   - [AI-assisted installation](#ai-assisted-installation)
   - [Manual installation](#manual-installation)
 - [Usage and desktop integration](#usage-and-desktop-integration)
@@ -34,6 +37,7 @@ Strata combines spatial Miller-column navigation with familiar Grid and Explorer
   - [Follow Omarchy Quattro](#follow-omarchy-quattro)
   - [Bundled themes](#bundled-themes)
   - [Custom themes](#custom-themes)
+- [Release channels](#release-channels)
 - [Under the hood](#under-the-hood)
 - [Technical specifications](#technical-specifications)
 - [Development and documentation](#development-and-documentation)
@@ -55,9 +59,46 @@ Strata combines spatial Miller-column navigation with familiar Grid and Explorer
 
 ## Installation
 
-Strata currently publishes release archives rather than distribution packages. Arch Linux and Omarchy are the primary supported environments; current binaries require **glibc 2.39 or newer** and the runtime libraries listed below.
+Arch Linux and Omarchy are the primary supported environments. Current binaries require **glibc 2.39 or newer** and the runtime libraries listed below.
+
+### Interactive installation
+
+The interactive installer detects the Linux architecture, glibc version, Arch
+Linux, and Omarchy 3 or 4. It installs the latest verified stable release and
+offers optional desktop-menu, default-folder-handler, "Open file location", SMB,
+broader image/RAW, and Omarchy keybind integration:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lgse/strata/main/install.sh | bash
+```
+
+The installer shows every privileged package operation before asking to run it.
+It verifies both the published SHA-256 digest and GitHub Actions provenance before
+installing anything from the release archive. The binary is installed per-user at
+`~/.local/bin/strata`.
+
+For an unattended Arch or Omarchy installation, pass `--non-interactive`. This
+installs required dependencies and the binary without prompting; optional
+integrations remain disabled unless explicitly selected:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lgse/strata/main/install.sh \
+  | bash -s -- --non-interactive \
+      --with-smb \
+      --with-raw \
+      --with-desktop-entry \
+      --with-folder-association \
+      --with-omarchy-keybinds
+```
+
+Each `--with-*` flag implies `--non-interactive`, and folder association implies
+the desktop entry and `--with-file-manager`. Use `--with-file-manager` by itself
+to enable only "Open file location" integration. Non-interactive package
+installation requires passwordless sudo or cached credentials. Run `./install.sh --help` for the full option list.
 
 ### AI-assisted installation
+
+Use this option to have a coding agent install and verify the latest release archive.
 
 Give this prompt to a coding agent with terminal access:
 
@@ -82,12 +123,20 @@ Then:
 - Extract it and install `strata` to ~/.local/bin/strata without overwriting an
   unrelated file. Ensure ~/.local/bin is on PATH.
 - Ask whether I want a per-user desktop entry and inode/directory association;
-  if yes, use application ID io.github.lgse.Strata and refresh the desktop database.
+  if yes, install the archive's io.github.lgse.Strata.desktop and io.github.lgse.Strata.svg
+  under ~/.local/share, pointing Exec at the installed binary, then refresh the
+  desktop database and icon cache.
+- Separately ask whether Strata should handle "Open file location" requests. If
+  yes, verify no other per-user service provides org.freedesktop.FileManager1,
+  then install the archive's io.github.lgse.Strata.FileManager1.service under
+  ~/.local/share/dbus-1/services with Exec pointing at the installed binary.
 - Launch `strata`, report its installed version/source release, and verify the
   desktop association if one was requested. Do not weaken the preview sandbox.
 ```
 
 ### Manual installation
+
+Install the release archive directly if you prefer to perform each step yourself.
 
 #### 1. Check the architecture and install dependencies
 
@@ -106,8 +155,8 @@ On Arch Linux or Omarchy:
 ```bash
 sudo pacman -S --needed bubblewrap ffmpeg ffmpegthumbnailer fontconfig \
   gst-libav gst-plugins-good gtk4 gtksourceview5 poppler-glib
-# Optional SMB support:
-sudo pacman -S --needed gvfs-smb
+# Optional SMB and broader camera RAW support:
+sudo pacman -S --needed gvfs-smb imagemagick libraw dcraw
 ```
 
 GTK **4.12 or newer** and glibc **2.39 or newer** are required. Other glibc-based distributions may work when they provide equivalent runtime libraries, but their package names and binary compatibility vary. Systems with an older glibc must [build Strata from source](#development-and-documentation).
@@ -134,14 +183,21 @@ strata
 
 If `command -v` fails, add `$HOME/.local/bin` to your shell's `PATH`. Every archive contains `SOURCE_COMMIT`, identifying the exact source revision used by GitHub Actions.
 
+#### Debug a release crash
+
+Download the matching `strata-<version>-<target>.debug` asset from the same release and place it beside the installed `strata` binary, keeping its filename unchanged. Then run `coredumpctl debug strata`; GDB will load its Rust function names and source lines.
+
 #### 3. Update or uninstall
 
-Use **Settings → Updates** for verified in-app updates, or repeat the download, verification, and `install` steps for a newer release. To remove a per-user installation:
+For a manual installation, use **Settings → Updates** for verified in-app updates, or repeat the download, verification, and `install` steps for a newer release. An in-app update also refreshes an already installed desktop entry and application icon from the new archive; it never creates desktop metadata that was not installed before. Package-managed installations are updated only by their system package manager. To remove a per-user installation:
 
 ```bash
 rm -f ~/.local/bin/strata \
-  ~/.local/share/applications/io.github.lgse.Strata.desktop
+  ~/.local/share/applications/io.github.lgse.Strata.desktop \
+  ~/.local/share/dbus-1/services/io.github.lgse.Strata.FileManager1.service \
+  ~/.local/share/icons/hicolor/scalable/apps/io.github.lgse.Strata.svg
 update-desktop-database ~/.local/share/applications 2>/dev/null || true
+gtk-update-icon-cache -qtf ~/.local/share/icons/hicolor 2>/dev/null || true
 ```
 
 User preferences and custom themes remain under the XDG configuration directories so an uninstall does not destroy personal settings.
@@ -155,32 +211,64 @@ strata                 # home directory
 strata ~/Documents     # a specific directory
 ```
 
-Useful shortcuts include <kbd>Ctrl</kbd>+<kbd>K</kbd> for recursive search, <kbd>Ctrl</kbd>+<kbd>L</kbd> for a path or URI, <kbd>Ctrl</kbd>+<kbd>F</kbd> to filter the current pane, <kbd>Space</kbd> for preview, <kbd>F2</kbd> to rename, and <kbd>Alt</kbd>+arrow keys for history and parent navigation.
+Useful shortcuts include <kbd>Ctrl</kbd>+<kbd>K</kbd> for recursive search, <kbd>Ctrl</kbd>+<kbd>L</kbd> for a path or URI, <kbd>Ctrl</kbd>+<kbd>F</kbd> to filter the current pane, <kbd>Ctrl</kbd>+<kbd>Z</kbd> to undo the latest move or move to Trash, <kbd>Space</kbd> for preview, <kbd>F2</kbd> to rename, and <kbd>Alt</kbd>+arrow keys for history and parent navigation.
 
 ### Desktop entry
 
-Create a per-user launcher and optionally make Strata the default directory handler:
+Every release archive ships `io.github.lgse.Strata.desktop` and the Strata application icon `io.github.lgse.Strata.svg`. Install both to give Strata a per-user launcher with its own icon in launchers, docks, task switchers, and window overviews, and optionally make Strata the default directory handler:
 
 ```bash
-mkdir -p ~/.local/share/applications
-cat > ~/.local/share/applications/io.github.lgse.Strata.desktop <<EOF
-[Desktop Entry]
-Name=Strata
-Comment=Navigate every layer
-Exec=$HOME/.local/bin/strata %U
-Icon=system-file-manager
-Terminal=false
-Type=Application
-Categories=Utility;FileManager;
-MimeType=inode/directory;
-StartupNotify=true
-EOF
+cd ~/Downloads/"${archive%.tar.gz}"
+install -Dm644 io.github.lgse.Strata.svg \
+  ~/.local/share/icons/hicolor/scalable/apps/io.github.lgse.Strata.svg
+install -d ~/.local/share/applications
+sed "s|^Exec=strata |Exec=$HOME/.local/bin/strata |" io.github.lgse.Strata.desktop \
+  > ~/.local/share/applications/io.github.lgse.Strata.desktop
 update-desktop-database ~/.local/share/applications
+gtk-update-icon-cache -qtf ~/.local/share/icons/hicolor 2>/dev/null || true
 xdg-mime default io.github.lgse.Strata.desktop inode/directory
 xdg-mime query default inode/directory
 ```
 
-The final command should print `io.github.lgse.Strata.desktop`.
+The final command should print `io.github.lgse.Strata.desktop`. The desktop entry's filename matches the `io.github.lgse.Strata` application ID that Strata's windows report, so desktop shells match a running window to this entry and draw its `Icon` value. Log out and back in if a shell caches launcher icons.
+
+When building from source, `make install-local` installs the binary, icon, and desktop entry in the same locations, and `make uninstall-local` removes them.
+
+### "Open file location" from other applications
+
+Browsers and GTK/GNOME applications reveal a file by calling the `org.freedesktop.FileManager1` D-Bus interface instead of consulting the `inode/directory` association. The interactive installer offers this separately; for unattended installation, pass `--with-file-manager`. Folder association enables it automatically.
+
+For a source installation, enable Strata as the per-user activatable provider explicitly:
+
+```bash
+make install-file-manager
+```
+
+For an AUR package, copy its inactive service template into your per-user service directory:
+
+```bash
+install -Dm644 /usr/share/strata/io.github.lgse.Strata.FileManager1.service \
+  ~/.local/share/dbus-1/services/io.github.lgse.Strata.FileManager1.service
+```
+
+For a release archive installation, install the included service manually instead:
+
+```bash
+cd ~/Downloads/"${archive%.tar.gz}"
+install -d ~/.local/share/dbus-1/services
+sed "s|^Exec=/usr/bin/strata |Exec=$HOME/.local/bin/strata |" \
+  io.github.lgse.Strata.FileManager1.service \
+  > ~/.local/share/dbus-1/services/io.github.lgse.Strata.FileManager1.service
+```
+
+A per-user provider takes precedence over system providers shipped by other file managers. Before enabling Strata manually, remove any other per-user service whose `Name` is `org.freedesktop.FileManager1`; two providers for the same name in one service directory are chosen arbitrarily. If another file manager already owns the bus name, exit it before testing. Use `make uninstall-file-manager` for a source installation, or remove the per-user service file, to disable Strata again.
+
+Strata then answers `ShowFolders`, `ShowItems`, and `ShowItemProperties`, opening the directory that holds the named items with those items selected:
+
+```bash
+busctl --user call org.freedesktop.FileManager1 /org/freedesktop/FileManager1 \
+  org.freedesktop.FileManager1 ShowItems ass 1 "file://$HOME/Downloads" ""
+```
 
 ### Make Strata the Omarchy file manager
 
@@ -246,6 +334,16 @@ Select **Add a theme**, enter a name, and choose the semantic colors for the bac
 
 Custom themes are stored as shareable TOML files in `~/.config/strata/themes/`. See [Themes](docs/themes.md) for the schema, file location, and Omarchy color mapping.
 
+## Release channels
+
+Strata defaults to the **Stable** channel: only final tagged releases are ever offered, and a Stable install never receives, sees, or is notified about a prerelease.
+
+To try upcoming changes early, choose a channel in **Settings → Updates**. **Preview** receives curated alpha, beta, and release-candidate builds but excludes nightlies. **Nightly** receives every recognised prerelease, including daily development builds. The update dialog and release notes always identify the exact build kind.
+
+When a prerelease installation selects **Stable**, the Updates card immediately offers the newest stable release as the channel target—even when that requires a semantic downgrade—and labels the action **Return to stable**. Preview and Nightly selections use the same card for ordinary forward updates, so channel changes never create a separate competing rollback card.
+
+See [Releasing](docs/releasing.md) for the tag grammar these channels rely on and, for maintainers, how a release candidate is cut and promoted.
+
 ## Under the hood
 
 ### Why search stays fast
@@ -273,7 +371,7 @@ Plain-text and source previews are different: they stay in process because they 
 | UI and runtime | Rust 2024, GTK 4.12+, GIO/GLib, Cairo, GtkSourceView 5, Poppler GLib, GDK Pixbuf, GStreamer, and Fontconfig |
 | Filesystems | Native Linux paths (including non-UTF-8 names) and GIO/GVfs locations; remote protocol availability depends on installed GVfs backends |
 | Preview boundary | Bubblewrap is mandatory for native parser-backed previews; helpers have no network and fail closed. Plain text is read in process with a 1 MiB cap. |
-| Optional preview tools | `ffmpegthumbnailer`/`ffmpeg` for video; ImageMagick and LibRaw-compatible `dcraw_emu`/`dcraw` expand camera RAW support |
+| Optional preview tools | `ffmpegthumbnailer`/`ffmpeg` for video; ImageMagick, classic `dcraw`, and LibRaw `simple_dcraw` expand camera RAW support |
 | Hardware acceleration | Media-only VA-API or Vulkan attempts with software VP8/WebM fallback; GPU and codec support depend on host drivers/plugins |
 | Scale targets | Virtualized browser models and bounded asynchronous updates are tested with deterministic directories up to 100,000 entries |
 | Packaging | Dynamically linked release archive with SHA-256 digest, GitHub build-provenance attestation, and `SOURCE_COMMIT` |
@@ -296,6 +394,7 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Dee
 - [Performance baseline](docs/performance-baseline.md)
 - [Themes and Omarchy integration](docs/themes.md)
 - [Unsafe code policy](docs/unsafe-code.md)
+- [Releasing](docs/releasing.md)
 
 ## Contributors
 

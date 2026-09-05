@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+mod dbus;
+
 #[cfg(test)]
 mod tests;
 
@@ -17,14 +19,9 @@ use std::{
 };
 
 use ashpd::{
-    FilePath, MaybeAppID, PortalError, Uri, WindowIdentifierType,
-    async_trait::async_trait,
-    backend::{Builder, file_chooser::FileChooserImpl, request::RequestImpl},
-    desktop::{
-        HandleToken,
-        file_chooser::{
-            Choice, FileFilter, OpenFileOptions, SaveFileOptions, SaveFilesOptions, SelectedFiles,
-        },
+    FilePath, PortalError, Uri, WindowIdentifierType,
+    desktop::file_chooser::{
+        Choice, FileFilter, OpenFileOptions, SaveFileOptions, SaveFilesOptions, SelectedFiles,
     },
 };
 use futures_channel::oneshot;
@@ -76,7 +73,7 @@ struct RequestTracker {
 
 impl RequestTracker {
     fn begin(self: &Arc<Self>, token: String) -> ashpd::backend::Result<TrackedRequest> {
-        if token.len() > MAX_FILENAME_BYTES {
+        if token.len() > MAX_STRING_BYTES {
             return Err(PortalError::InvalidArgument(
                 "file chooser request token is too long".into(),
             ));
@@ -145,7 +142,7 @@ struct FileChooserBackend {
 impl FileChooserBackend {
     async fn choose(
         &self,
-        tracked: TrackedRequest,
+        tracked: &TrackedRequest,
         request: ChooserRequest,
     ) -> ashpd::backend::Result<SelectedFiles> {
         let token = request.token.clone();
@@ -154,7 +151,6 @@ impl FileChooserBackend {
         glib::MainContext::default().invoke(move || {
             crate::ui::present_chooser(request, cancelled, move |result| {
                 let _result = send.send(result);
-                drop(tracked);
             });
         });
         receive.await.unwrap_or_else(|_| {
@@ -165,85 +161,36 @@ impl FileChooserBackend {
     }
 }
 
-#[async_trait]
-impl RequestImpl for FileChooserBackend {
-    async fn close(&self, token: HandleToken) {
-        let token = token.to_string();
-        self.requests.cancel(&token);
-        glib::MainContext::default().invoke(move || crate::ui::cancel_chooser(&token));
-    }
-}
-
-#[async_trait]
-impl FileChooserImpl for FileChooserBackend {
-    async fn open_file(
-        &self,
-        token: HandleToken,
-        _app_id: Option<MaybeAppID>,
-        parent: Option<WindowIdentifierType>,
-        title: &str,
-        options: OpenFileOptions,
-    ) -> ashpd::backend::Result<SelectedFiles> {
-        let token = token.to_string();
-        let tracked = self.requests.begin(token.clone())?;
-        let request = open_request(token, parent, title, options).await?;
-        self.choose(tracked, request).await
-    }
-
-    async fn save_file(
-        &self,
-        token: HandleToken,
-        _app_id: Option<MaybeAppID>,
-        parent: Option<WindowIdentifierType>,
-        title: &str,
-        options: SaveFileOptions,
-    ) -> ashpd::backend::Result<SelectedFiles> {
-        let token = token.to_string();
-        let tracked = self.requests.begin(token.clone())?;
-        let request = save_file_request(token, parent, title, options).await?;
-        self.choose(tracked, request).await
-    }
-
-    async fn save_files(
-        &self,
-        token: HandleToken,
-        _app_id: Option<MaybeAppID>,
-        parent: Option<WindowIdentifierType>,
-        title: &str,
-        options: SaveFilesOptions,
-    ) -> ashpd::backend::Result<SelectedFiles> {
-        let token = token.to_string();
-        let tracked = self.requests.begin(token.clone())?;
-        let request = save_files_request(token, parent, title, options).await?;
-        self.choose(tracked, request).await
-    }
-}
-
 pub(crate) fn run() -> glib::ExitCode {
+    // Keep worker-thread invocations queued until GTK is ready on this thread.
+    let context = glib::MainContext::default();
+    let _owner = context.acquire().expect("portal main context is available");
     let main_loop = glib::MainLoop::new(None, false);
     let service_loop = main_loop.clone();
     let service_failed = Arc::new(AtomicBool::new(false));
     let failed = service_failed.clone();
     std::thread::spawn(move || {
-        let result = (|| {
-            let pool = futures_executor::ThreadPool::new()
-                .map_err(|error| PortalError::Failed(error.to_string()))?;
-            let lost_loop = service_loop.clone();
-            let service = Builder::new(BACKEND_NAME)?
-                .with_spawn(pool)
-                .with_name_lost(move || {
-                    let lost_loop = lost_loop.clone();
-                    glib::MainContext::default().invoke(move || lost_loop.quit());
-                })
-                .file_chooser(FileChooserBackend::default())
-                .build();
-            async_io::block_on(service)
-        })();
+        let result: Result<(), zbus::Error> = async_io::block_on(async {
+            use futures_lite::StreamExt as _;
+
+            let connection = zbus::connection::Builder::session()?
+                .serve_at(
+                    "/org/freedesktop/portal/desktop",
+                    dbus::FileChooserInterface::new(),
+                )?
+                .name(BACKEND_NAME)?
+                .build()
+                .await?;
+            let proxy = zbus::fdo::DBusProxy::new(&connection).await?;
+            let mut lost = proxy.receive_name_lost().await?;
+            let _signal = lost.next().await;
+            Ok(())
+        });
         if let Err(error) = result {
             failed.store(true, Ordering::SeqCst);
             eprintln!("Strata portal backend failed: {error}");
-            glib::MainContext::default().invoke(move || service_loop.quit());
         }
+        glib::MainContext::default().invoke(move || service_loop.quit());
     });
 
     if let Err(error) = gtk::init() {
