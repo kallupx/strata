@@ -12,7 +12,8 @@ After, captured using disposable sample files on a private D-Bus session:
 - `grid.png`: multiple selection across type groups in Grid.
 - `save-light.png`: Filter, Encoding, and Compress files on one compact row in Classic Light.
 - `savefiles-columns.png`: FileChooser v4 SaveFiles with Columns and choices.
-- `opt-in.png`, `opt-in-light.png`: the one-time, consent-only offer in Azure Glow and Classic Light.
+- `opt-in.png`, `opt-in-light.png`: the one-time, consent-only offer in Azure Glow and Classic Light, with matching paragraph insets.
+- `setup-success.png`, `setup-success-light.png`: the success state replaces the explanation with a theme-colored Lucide circle-check above the result.
 - `settings-integration.png`: permanent enable/restore access in Settings → General.
 
 The opt-in captures use isolated XDG directories and a private bus; service restart/reload commands were stubbed during installation/removal testing, so the installed desktop portal was never replaced.

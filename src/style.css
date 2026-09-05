@@ -698,6 +698,11 @@ headerbar menubutton.header-action > button:focus-visible {
   padding: 7px 9px;
 }
 
+.portal-setup-dialog .form-message:not(.error) {
+  padding: 0;
+  color: @theme_text;
+}
+
 .form-message.error,
 .authentication-error {
   background: alpha(@theme_danger, 0.1);

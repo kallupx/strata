@@ -11,6 +11,9 @@ use super::{
 };
 use crate::{assets::icons, portal_setup};
 
+#[cfg(test)]
+mod tests;
+
 thread_local! {
     static OFFER_SCHEDULED: Cell<bool> = const { Cell::new(false) };
     static SETUP_RUNNING: Cell<bool> = const { Cell::new(false) };
@@ -86,6 +89,8 @@ struct Dialog {
     cancel: glib::WeakRef<gtk::Button>,
     close: glib::WeakRef<gtk::Button>,
     status: glib::WeakRef<gtk::Label>,
+    description: glib::WeakRef<gtk::Label>,
+    success: glib::WeakRef<gtk::Image>,
     loading: glib::WeakRef<gtk::Spinner>,
     busy: Rc<Cell<bool>>,
     enable: Cell<Option<bool>>,
@@ -117,15 +122,34 @@ impl Dialog {
 
     fn message(&self, message: &str, error: bool) {
         if let Some(status) = self.status.upgrade() {
-            status.set_text(&super::controls::wrap_dialog_text(
-                message,
-                super::controls::MESSAGE_DIALOG_WIDTH_CHARS,
-            ));
+            status.set_text(message);
             if error {
                 status.add_css_class("error");
             } else {
                 status.remove_css_class("error");
             }
+        }
+    }
+
+    fn complete(&self, message: &str) {
+        self.finished.set(true);
+        self.message(message, false);
+        if let Some(description) = self.description.upgrade() {
+            description.set_visible(false);
+        }
+        if let Some(success) = self.success.upgrade() {
+            success.set_visible(true);
+        }
+        if let Some(status) = self.status.upgrade() {
+            status.set_xalign(0.5);
+            status.set_justify(gtk::Justification::Center);
+        }
+        if let Some(confirm) = self.confirm.upgrade() {
+            confirm.set_label("Done");
+            confirm.grab_focus();
+        }
+        if let Some(cancel) = self.cancel.upgrade() {
+            cancel.set_visible(false);
         }
     }
 
@@ -223,17 +247,7 @@ impl Dialog {
             SETUP_RUNNING.set(false);
             dialog.set_busy(false);
             match result {
-                Ok(Ok(message)) => {
-                    dialog.finished.set(true);
-                    dialog.message(&message, false);
-                    if let Some(confirm) = dialog.confirm.upgrade() {
-                        confirm.set_label("Done");
-                        confirm.grab_focus();
-                    }
-                    if let Some(cancel) = dialog.cancel.upgrade() {
-                        cancel.set_visible(false);
-                    }
-                }
+                Ok(Ok(message)) => dialog.complete(&message),
                 Ok(Err(error)) => dialog.message(&error, true),
                 Err(error) => {
                     dialog.message(&format!("File chooser setup failed: {error:?}"), true)
@@ -244,9 +258,13 @@ impl Dialog {
 }
 
 fn show_dialog(parent: &gtk::Window, offer: bool) {
-    let Some(overlay) = parent.child().and_downcast::<gtk::Overlay>() else {
-        return;
-    };
+    if let Some(dialog) = build_dialog(parent, offer) {
+        dialog.load();
+    }
+}
+
+fn build_dialog(parent: &gtk::Window, offer: bool) -> Option<Rc<Dialog>> {
+    let overlay = parent.child().and_downcast::<gtk::Overlay>()?;
     let root = overlay.child().and_downcast::<BlurBin>();
     let layout: ModalLayout = message_dialog_layout(
         icons::FOLDER,
@@ -271,6 +289,10 @@ fn show_dialog(parent: &gtk::Window, offer: bool) {
     description.set_max_width_chars(super::controls::MESSAGE_DIALOG_WIDTH_CHARS as i32);
     description.add_css_class("settings-option-description");
     layout.body.append(&description);
+    let success = crate::assets::primary_icon(icons::CIRCLE_CHECK, 48);
+    success.set_halign(gtk::Align::Center);
+    success.set_visible(false);
+    layout.body.append(&success);
     let status = gtk::Label::new(Some("Checking your current chooser…"));
     status.set_xalign(0.0);
     status.set_wrap(true);
@@ -294,6 +316,8 @@ fn show_dialog(parent: &gtk::Window, offer: bool) {
         cancel: layout.cancel.downgrade(),
         close: layout.close.downgrade(),
         status: status.downgrade(),
+        description: description.downgrade(),
+        success: success.downgrade(),
         loading: layout.loading.downgrade(),
         busy,
         enable: Cell::new(None),
@@ -320,5 +344,5 @@ fn show_dialog(parent: &gtk::Window, offer: bool) {
         root.set_blurred(true);
     }
     overlay.add_overlay(&layer);
-    dialog.load();
+    Some(dialog)
 }
