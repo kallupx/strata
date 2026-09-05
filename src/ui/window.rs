@@ -889,13 +889,16 @@ fn install_keyboard_navigation(
         if sidebar_has_focus
             && !control
             && !alt
-            && let Some(direction) = vim_focus_direction(key)
+            && let Some(direction) =
+                vim_focus_direction(key).or_else(|| super::focus_navigation::arrow_direction(key))
         {
             if direction == gtk::DirectionType::Right {
                 focus_before_sidebar.borrow_mut().take();
                 browser.focus_active();
-            } else {
-                sidebar_widget.child_focus(direction);
+            } else if !sidebar_widget.child_focus(direction) && direction == gtk::DirectionType::Up
+            {
+                sidebar_toggle.grab_focus();
+                dialog_parent.set_focus_visible(true);
             }
             return glib::Propagation::Stop;
         }
@@ -907,6 +910,19 @@ fn install_keyboard_navigation(
             return glib::Propagation::Stop;
         }
         if key == gtk::gdk::Key::Delete && !view.filter_has_focus() && view.confirm_delete(shift) {
+            return glib::Propagation::Stop;
+        }
+        if key == gtk::gdk::Key::Left
+            && !control
+            && !alt
+            && !shift
+            && sidebar_toggle.is_active()
+            && view.item_view_has_focus()
+            && view.item_at_sidebar_edge()
+        {
+            focus_before_sidebar.replace(focused.clone());
+            sidebar_state.focus_active_place();
+            dialog_parent.set_focus_visible(true);
             return glib::Propagation::Stop;
         }
         if !control && !alt && !view.item_view_has_focus() && !header_left_boundary {

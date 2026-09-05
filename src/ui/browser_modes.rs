@@ -983,6 +983,50 @@ impl ModeViews {
         None
     }
 
+    pub fn item_at_left_edge(&self) -> bool {
+        let Some(focused) = self.stack.root().and_then(|root| root.focus()) else {
+            return false;
+        };
+        let panes = self.visible_panes();
+        let Some(pane) = panes.first() else {
+            return false;
+        };
+        let Some(section) = pane
+            .item_sections()
+            .into_iter()
+            .find(|section| widget_has_focus(&section.view, Some(&focused)))
+        else {
+            return false;
+        };
+        if self.mode == BrowserMode::Explorer {
+            return true;
+        }
+        let bounds = section
+            .bound_items
+            .borrow()
+            .iter()
+            .filter_map(|bound| {
+                if bound.item.upgrade()?.position() == gtk::INVALID_LIST_POSITION {
+                    return None;
+                }
+                let widget = bound
+                    .widget
+                    .upgrade()
+                    .filter(|widget| widget.is_mapped() && widget.width() > 0)?;
+                let has_focus = widget == focused
+                    || widget.is_ancestor(&focused)
+                    || focused.is_ancestor(&widget);
+                Some((has_focus, widget.compute_bounds(&section.view)?))
+            })
+            .collect::<Vec<_>>();
+        let Some((_, current)) = bounds.iter().find(|(has_focus, _)| *has_focus) else {
+            return false;
+        };
+        !bounds
+            .iter()
+            .any(|(_, bounds)| bounds.x() < current.x() - 1.0)
+    }
+
     pub fn visual_order(&self, depth: usize) -> Vec<usize> {
         let Some(pane) = self
             .visible_panes()

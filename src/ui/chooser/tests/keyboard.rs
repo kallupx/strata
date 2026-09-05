@@ -80,6 +80,41 @@ fn collections(widget: &gtk::Widget) -> Vec<gtk::Widget> {
     result
 }
 
+fn sidebar_round_trip(state: &ChooserState) {
+    let before = selected(state);
+    key("Left");
+    assert!(
+        !state.view.item_view_has_focus(),
+        "Left from the outer file edge reaches the sidebar"
+    );
+    key("Up");
+    assert!(
+        focused(state).has_css_class("sidebar-toggle"),
+        "Up from Home reaches the top-bar toggle"
+    );
+    key("Right");
+    assert!(
+        focused(state)
+            .ancestor(gtk::HeaderBar::static_type())
+            .is_some(),
+        "Right continues across the top bar"
+    );
+    key("Left");
+    assert!(focused(state).has_css_class("sidebar-toggle"));
+    key("Down");
+    assert!(!focused(state).has_css_class("sidebar-toggle"));
+    key("Right");
+    assert!(
+        state.view.item_view_has_focus(),
+        "Right restores file focus"
+    );
+    assert_eq!(
+        selected(state),
+        before,
+        "focus transitions preserve file selection"
+    );
+}
+
 fn save_modal(mode: BrowserMode, root: &Path) {
     let request = ChooserRequest {
         token: format!("save-keyboard-{mode:?}"),
@@ -286,6 +321,7 @@ fn keyboard_only_controls_and_file_navigation_work_in_every_chooser_view() {
             browser.select(0, 0);
             browser.focus_active();
             settle();
+            sidebar_round_trip(&state);
             if mode == BrowserMode::Grid {
                 key("Right");
                 assert_eq!(
@@ -293,6 +329,32 @@ fn keyboard_only_controls_and_file_navigation_work_in_every_chooser_view() {
                     "01.txt",
                     "Grid Right moves a cell, not into a folder"
                 );
+                key("Left");
+                assert!(
+                    state.view.item_view_has_focus(),
+                    "Left inside a Grid row stays in the grid"
+                );
+                assert_eq!(selected(&state), "00.txt");
+                key("shift+Left");
+                assert!(
+                    state.view.item_view_has_focus(),
+                    "Shift+Left never moves focus to the sidebar"
+                );
+                browser.select(0, 0);
+                browser.focus_active();
+                settle();
+                key("Down");
+                sidebar_round_trip(&state);
+                key("ctrl+b");
+                key("Left");
+                assert!(
+                    state.view.item_view_has_focus(),
+                    "Left cannot focus a hidden sidebar"
+                );
+                key("ctrl+b");
+                browser.select(0, 1);
+                browser.focus_active();
+                settle();
                 let grid = focused(&state)
                     .ancestor(gtk::GridView::static_type())
                     .and_downcast::<gtk::GridView>()
@@ -311,6 +373,7 @@ fn keyboard_only_controls_and_file_navigation_work_in_every_chooser_view() {
             } else {
                 key("Down");
                 assert_eq!(selected(&state), "01.txt");
+                sidebar_round_trip(&state);
             }
             let anchor = selected(&state);
             key("shift+Down");

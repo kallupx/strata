@@ -1347,8 +1347,10 @@ fn install_shortcuts(
             if direction == gtk::DirectionType::Right {
                 focus_before_sidebar.borrow_mut().take();
                 browser.focus_active();
-            } else {
-                sidebar_widget.child_focus(direction);
+            } else if !sidebar_widget.child_focus(direction) && direction == gtk::DirectionType::Up
+            {
+                sidebar_toggle.grab_focus();
+                state.window.set_focus_visible(true);
             }
             return glib::Propagation::Stop;
         }
@@ -1381,6 +1383,19 @@ fn install_shortcuts(
                 }
             }
             return glib::Propagation::Proceed;
+        }
+        if key == gtk::gdk::Key::Left
+            && !control
+            && !alt
+            && !shift
+            && sidebar_toggle.is_active()
+            && state.view.item_view_has_focus()
+            && state.view.item_at_sidebar_edge()
+        {
+            focus_before_sidebar.replace(focused.clone());
+            sidebar_state.focus_active_place();
+            state.window.set_focus_visible(true);
+            return glib::Propagation::Stop;
         }
         if key == gtk::gdk::Key::space && !control && !alt {
             preview.toggle(chooser_preview_target(browser.focused_entry()));

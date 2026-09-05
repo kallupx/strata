@@ -102,8 +102,11 @@ On a desktop that does not manage the frontend as a systemd user unit, log out a
   dropdown; its arrows and Enter select an option.
 - Text fields keep their cursor keys and Ctrl+A. Ctrl+L edits the location;
   Ctrl+F opens the pane filter; Ctrl+Shift+N creates a folder.
-- Ctrl+Shift+B focuses the sidebar; Right returns to files. Space on a file toggles
-  preview. Ctrl+Enter accepts a selected folder in a folder-selection request.
+- Left from the outer file-list edge or a leftmost Grid cell focuses the visible
+  sidebar. Ctrl+Shift+B also focuses it; Right returns to files without changing
+  selection. Up from Home reaches the sidebar toggle in the top bar.
+- Space on a file toggles preview. Ctrl+Enter accepts a selected folder in a
+  folder-selection request.
 - Escape dismisses the innermost menu, inline edit, filter, preview, or confirmation
   before cancelling the request. Confirmation dialogs initially focus Cancel.
 

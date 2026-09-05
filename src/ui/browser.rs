@@ -758,6 +758,14 @@ impl BrowserView {
         }
     }
 
+    pub fn item_at_sidebar_edge(&self) -> bool {
+        if self.view_mode() == BrowserMode::Columns {
+            self.first_column_has_focus()
+        } else {
+            self.state.mode_views.borrow().item_at_left_edge()
+        }
+    }
+
     pub fn first_column_has_focus(&self) -> bool {
         self.view_mode() == BrowserMode::Columns && self.state.focused_column_depth() == Some(0)
     }
