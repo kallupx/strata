@@ -20,7 +20,19 @@ window {
 }
 
 .chooser-dropdown {
-  min-width: 170px;
+  min-width: 140px;
+}
+
+.chooser-dropdown.form-control > button {
+  min-height: 24px;
+  padding: 2px 8px;
+}
+
+.chooser-options > flowboxchild {
+  background: transparent;
+  color: @theme_text;
+  padding: 0;
+  margin: 0;
 }
 
 button:focus-visible,

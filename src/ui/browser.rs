@@ -517,6 +517,12 @@ impl BrowserView {
             columns.last().map(|column| column.marquee.clone())
         });
 
+        if !interactive {
+            state
+                .mode_views
+                .borrow()
+                .set_new_folder_state(Rc::downgrade(&state));
+        }
         if interactive {
             let weak_state = Rc::downgrade(&state);
             state.mode_views.borrow().set_transfer_handler(Rc::new(
@@ -4580,6 +4586,9 @@ impl ViewState {
         empty_trash.set_visible(is_trash);
         empty_trash.set_sensitive(false);
         header_actions.append(&empty_trash);
+        if !self.interactive {
+            header_actions.append(&pane_new_folder_button(Rc::downgrade(self), depth));
+        }
         header_actions.append(&pane_refresh_button(&self.browser, depth));
         header_actions.append(&column_sort_direction_toggle(&self.browser, depth));
         header_actions.append(&column_sort_menu(&self.browser, depth));
@@ -8200,6 +8209,27 @@ fn context_menu_toggle_option(
     button.add_css_class("folder-context-option");
     button.set_child(Some(&row));
     (button, icon, title)
+}
+
+pub(super) fn pane_new_folder_button(state: std::rc::Weak<ViewState>, depth: usize) -> gtk::Button {
+    let button = gtk::Button::builder()
+        .tooltip_text("New Folder (Ctrl+Shift+N)")
+        .build();
+    button.set_child(Some(&crate::assets::primary_icon(
+        crate::assets::icons::FOLDER_PLUS,
+        16,
+    )));
+    button.add_css_class("column-header-action");
+    button.add_css_class("chooser-new-folder");
+    button.update_property(&[gtk::accessible::Property::Label("New Folder")]);
+    button.connect_clicked(move |_| {
+        if let Some(state) = state.upgrade()
+            && let Some(location) = state.browser.location_at(depth)
+        {
+            state.begin_new_entry(depth, location, true);
+        }
+    });
+    button
 }
 
 pub(super) fn pane_refresh_button(browser: &Rc<Browser>, depth: usize) -> gtk::Button {

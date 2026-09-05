@@ -26,6 +26,20 @@ fn selection_models(widget: &gtk::Widget) -> Vec<gtk::SelectionModel> {
     models
 }
 
+fn new_folder_button(widget: &gtk::Widget) -> Option<gtk::Button> {
+    if widget.is_mapped() && widget.has_css_class("chooser-new-folder") {
+        return widget.clone().downcast().ok();
+    }
+    let mut child = widget.first_child();
+    while let Some(widget) = child {
+        if let Some(button) = new_folder_button(&widget) {
+            return Some(button);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
 #[test]
 #[ignore = "requires a GTK display and isolated XDG directories; run this test alone"]
 fn every_view_enforces_single_selection_including_type_groups() {
@@ -83,6 +97,22 @@ fn every_view_enforces_single_selection_including_type_groups() {
                 expected,
                 "{mode:?}, multiple={multiple}"
             );
+            let new_folder =
+                new_folder_button(&view.widget()).expect("chooser toolbar folder action");
+            assert!(new_folder.has_css_class("column-header-action"));
+            new_folder.emit_clicked();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !view.new_entry_is_active() {
+                while context.pending() {
+                    context.iteration(false);
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{mode:?} toolbar opens the inline folder entry"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(view.cancel_new_entry());
             window.destroy();
             browser.clear_observer();
         }

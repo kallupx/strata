@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+mod layout;
 mod selection;
 
 use std::{ffi::OsString, path::Path};

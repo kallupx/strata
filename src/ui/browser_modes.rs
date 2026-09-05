@@ -275,6 +275,7 @@ pub struct ModeViews {
     transfer_handler: TransferHandlerSlot,
     cut_locations: Rc<RefCell<HashSet<Location>>>,
     context_state: RefCell<Option<Weak<super::browser::ViewState>>>,
+    new_folder_state: RefCell<Option<Weak<super::browser::ViewState>>>,
     active_rename: Rc<RefCell<Option<ActiveModeRename>>>,
     active_new_entry: Rc<RefCell<Option<ActiveModeNewEntry>>>,
     mode: BrowserMode,
@@ -345,6 +346,7 @@ impl ModeViews {
             transfer_handler: Rc::new(RefCell::new(None)),
             cut_locations: Rc::new(RefCell::new(HashSet::new())),
             context_state: RefCell::new(None),
+            new_folder_state: RefCell::new(None),
             active_rename: Rc::new(RefCell::new(None)),
             active_new_entry: Rc::new(RefCell::new(None)),
             mode: BrowserMode::Columns,
@@ -669,6 +671,10 @@ impl ModeViews {
 
     pub fn set_transfer_handler(&self, handler: TransferHandler) {
         self.transfer_handler.replace(Some(handler));
+    }
+
+    pub fn set_new_folder_state(&self, state: Weak<super::browser::ViewState>) {
+        self.new_folder_state.replace(Some(state));
     }
 
     pub fn set_context_state(&self, state: Weak<super::browser::ViewState>) {
@@ -1023,6 +1029,7 @@ impl ModeViews {
             self.cut_locations.clone(),
             GridOptions {
                 state: self.context_state.borrow().clone(),
+                new_folder_state: self.new_folder_state.borrow().clone(),
                 thumbnail_size: self.grid_thumbnail_size.clone(),
                 active_new_entry: self.active_new_entry.clone(),
                 group_by_type: self.group_by_type,
@@ -1058,6 +1065,7 @@ impl ModeViews {
             self.cut_locations.clone(),
             ExplorerOptions {
                 state: self.context_state.borrow().clone(),
+                new_folder_state: self.new_folder_state.borrow().clone(),
                 active_new_entry: self.active_new_entry.clone(),
                 group_by_type: self.group_by_type,
             },
@@ -1081,12 +1089,14 @@ fn widget_has_focus(widget: &impl IsA<gtk::Widget>, focused: Option<&gtk::Widget
 #[derive(Clone)]
 struct ExplorerOptions {
     state: Option<Weak<super::browser::ViewState>>,
+    new_folder_state: Option<Weak<super::browser::ViewState>>,
     active_new_entry: Rc<RefCell<Option<ActiveModeNewEntry>>>,
     group_by_type: bool,
 }
 
 struct GridOptions {
     state: Option<Weak<super::browser::ViewState>>,
+    new_folder_state: Option<Weak<super::browser::ViewState>>,
     thumbnail_size: Rc<Cell<i32>>,
     active_new_entry: Rc<RefCell<Option<ActiveModeNewEntry>>>,
     group_by_type: bool,
@@ -1425,6 +1435,11 @@ fn build_grid_pane(
     title: &str,
 ) -> Pane {
     let controls = grid_controls(&browser, depth, options.thumbnail_size.get());
+    if let Some(state) = options.new_folder_state {
+        controls
+            .actions
+            .prepend(&super::browser::pane_new_folder_button(state, depth));
+    }
     let (shell, header, content, model, stack, status, spinner, truncated_hint) = pane_base(
         title,
         "grid-pane",
@@ -2451,6 +2466,12 @@ fn build_explorer_pane(
     empty_trash.set_visible(is_trash);
     empty_trash.set_sensitive(false);
     actions.append(&empty_trash);
+    if let Some(state) = options.new_folder_state.as_ref() {
+        actions.append(&super::browser::pane_new_folder_button(
+            state.clone(),
+            depth,
+        ));
+    }
     actions.append(&super::browser::pane_refresh_button(&browser, depth));
     let (filter_entry, filter_revealer, filter_button) =
         filter_controls("Filter explorer (Ctrl+F)");

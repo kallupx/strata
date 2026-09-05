@@ -227,7 +227,7 @@ impl ChooserDropdown {
         let current_label = gtk::Label::new(Some(current));
         current_label.set_xalign(0.0);
         current_label.set_hexpand(true);
-        current_label.set_max_width_chars(36);
+        current_label.set_max_width_chars(24);
         current_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         let button = gtk::MenuButton::builder()
             .child(&current_label)
@@ -776,6 +776,8 @@ pub(crate) fn present_chooser(
         ChooserKind::Open { .. } => None,
     };
 
+    let options = chooser_options();
+    details.append(&options);
     let filter_dropdown = if filters.is_empty() {
         None
     } else {
@@ -785,7 +787,7 @@ pub(crate) fn present_chooser(
             .collect::<Vec<_>>();
         let dropdown = ChooserDropdown::new(&labels, selected_filter.unwrap_or(0));
         let row = labeled_row("Filter", Some(dropdown.button.upcast_ref()));
-        details.append(&row);
+        append_option(&options, &row);
         let filters_for_change = filters.clone();
         let source_for_change = source.clone();
         let browser_for_change = browser.clone();
@@ -804,7 +806,7 @@ pub(crate) fn present_chooser(
         Some(dropdown)
     };
 
-    let choices = build_choices(&request.choices, &details);
+    let choices = build_choices(&request.choices, &options);
     let read_only = matches!(
         &request.kind,
         ChooserKind::Open {
@@ -814,9 +816,10 @@ pub(crate) fn present_chooser(
     )
     .then(|| {
         let check = form_check_button("Open files read-only");
-        details.append(&check);
+        append_option(&options, &check);
         check
     });
+    options.set_visible(options.first_child().is_some());
 
     let error = gtk::Label::new(None);
     error.add_css_class("form-message");
@@ -826,8 +829,6 @@ pub(crate) fn present_chooser(
     error.set_visible(false);
     details.append(&error);
 
-    let new_folder = gtk::Button::with_label("New Folder");
-    new_folder.add_css_class("action-dialog-cancel");
     let cancel = gtk::Button::with_label("Cancel");
     cancel.add_css_class("action-dialog-cancel");
     let accept = gtk::Button::with_mnemonic(&request.accept_label);
@@ -843,7 +844,6 @@ pub(crate) fn present_chooser(
     }
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.add_css_class("chooser-actions");
-    actions.append(&new_folder);
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
     actions.append(&spacer);
@@ -903,8 +903,6 @@ pub(crate) fn present_chooser(
             state.cancel();
         }
     });
-    let new_folder_view = view.clone();
-    new_folder.connect_clicked(move |_| new_folder_view.create_new_folder());
     if let Some(filename) = filename {
         let weak = Rc::downgrade(&state);
         filename.connect_activate(move |_| {
@@ -1032,7 +1030,32 @@ fn normalize_portal_filters(
     (filters, selected)
 }
 
-fn build_choices(choices: &[Choice], parent: &gtk::Box) -> Vec<ChoiceControl> {
+fn chooser_options() -> gtk::FlowBox {
+    let options = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .homogeneous(false)
+        .min_children_per_line(1)
+        .max_children_per_line(32)
+        .column_spacing(16)
+        .row_spacing(6)
+        .halign(gtk::Align::Start)
+        .focusable(false)
+        .build();
+    options.add_css_class("chooser-options");
+    options
+}
+
+fn append_option(parent: &gtk::FlowBox, widget: &impl IsA<gtk::Widget>) {
+    let child = gtk::FlowBoxChild::builder()
+        .child(widget)
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Center)
+        .focusable(false)
+        .build();
+    parent.append(&child);
+}
+
+fn build_choices(choices: &[Choice], parent: &gtk::FlowBox) -> Vec<ChoiceControl> {
     choices
         .iter()
         .map(|choice| {
@@ -1040,7 +1063,7 @@ fn build_choices(choices: &[Choice], parent: &gtk::Box) -> Vec<ChoiceControl> {
             if pairs.is_empty() {
                 let check = form_check_button(choice.label());
                 check.set_active(choice.initial_selection() == "true");
-                parent.append(&check);
+                append_option(parent, &check);
                 ChoiceControl::Boolean {
                     id: choice.id().to_owned(),
                     check,
@@ -1057,7 +1080,7 @@ fn build_choices(choices: &[Choice], parent: &gtk::Box) -> Vec<ChoiceControl> {
                     .unwrap_or(0);
                 let dropdown = ChooserDropdown::new(&labels, selected);
                 let row = labeled_row(choice.label(), Some(dropdown.button.upcast_ref()));
-                parent.append(&row);
+                append_option(parent, &row);
                 ChoiceControl::Select {
                     id: choice.id().to_owned(),
                     values,
@@ -1071,7 +1094,6 @@ fn build_choices(choices: &[Choice], parent: &gtk::Box) -> Vec<ChoiceControl> {
 fn labeled_row(label: &str, child: Option<&gtk::Widget>) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     let label = form_label(label);
-    label.set_width_chars(12);
     label.set_max_width_chars(16);
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     label.set_tooltip_text(Some(&label.text()));
