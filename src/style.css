@@ -45,6 +45,14 @@ paned > separator:focus-visible {
   outline-offset: -2px;
 }
 
+.chooser-options > flowboxchild:focus,
+.chooser-options > flowboxchild:focus-visible,
+.chooser-options > flowboxchild:focus-within {
+  outline: none;
+  box-shadow: none;
+  border: none;
+}
+
 headerbar {
   background: @theme_surface;
   border-bottom: 1px solid alpha(@theme_border, 0.6);

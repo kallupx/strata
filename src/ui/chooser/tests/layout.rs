@@ -3,8 +3,29 @@
 use super::*;
 use std::time::{Duration, Instant};
 
+fn pixels(window: &gtk::Window, widget: &gtk::Widget) -> Vec<u8> {
+    let snapshot = gtk::Snapshot::new();
+    gtk::WidgetPaintable::new(Some(widget)).snapshot(
+        &snapshot,
+        widget.width() as f64,
+        widget.height() as f64,
+    );
+    let texture = window.renderer().expect("renderer").render_texture(
+        snapshot.to_node().expect("render node"),
+        Some(&gtk::graphene::Rect::new(
+            0.0,
+            0.0,
+            widget.width() as f32,
+            widget.height() as f32,
+        )),
+    );
+    let mut pixels = vec![0; widget.width() as usize * widget.height() as usize * 4];
+    texture.download(&mut pixels, widget.width() as usize * 4);
+    pixels
+}
+
 #[test]
-#[ignore = "requires a GTK display and isolated XDG directories; run this test alone"]
+#[ignore = "requires X11, xdotool, and isolated XDG directories; run this test alone"]
 fn options_share_a_compact_row_and_wrap_in_narrow_windows() {
     gtk::init().expect("GTK display");
     crate::ui::prepare_portal_ui();
@@ -28,11 +49,13 @@ fn options_share_a_compact_row_and_wrap_in_narrow_windows() {
             &options,
         );
         let window = gtk::Window::builder()
+            .title("Strata keyboard regression")
             .default_width(width)
             .default_height(160)
             .child(&options)
             .build();
         window.present();
+        super::keyboard::focus_window();
         let first = options.first_child().expect("filter group");
         let second = first.next_sibling().expect("encoding group");
         let third = second.next_sibling().expect("compression group");
@@ -70,6 +93,64 @@ fn options_share_a_compact_row_and_wrap_in_narrow_windows() {
             assert!(
                 !child.is_focusable(),
                 "Tab targets controls, not layout wrappers"
+            );
+        }
+        let ChoiceControl::Select {
+            dropdown: encoding, ..
+        } = &choices[0]
+        else {
+            panic!("encoding select")
+        };
+        let ChoiceControl::Boolean { check, .. } = &choices[1] else {
+            panic!("compression check")
+        };
+        window.set_focus_visible(true);
+        for (wrapper, dropdown) in [(&first, &filter), (&second, encoding)] {
+            check.grab_focus();
+            super::keyboard::settle();
+            let before = pixels(&window, options.upcast_ref());
+            gtk::prelude::GtkWindowExt::set_focus(&window, None::<&gtk::Widget>);
+            for _ in 0..8 {
+                if gtk::prelude::RootExt::focus(&window)
+                    .is_some_and(|focus| focus.is_ancestor(&dropdown.button))
+                {
+                    break;
+                }
+                super::keyboard::key("Tab");
+            }
+            assert!(
+                gtk::prelude::RootExt::focus(&window)
+                    .is_some_and(|focus| focus.is_ancestor(&dropdown.button))
+            );
+            super::keyboard::settle();
+            let after = pixels(&window, options.upcast_ref());
+            let bounds = dropdown
+                .button
+                .compute_bounds(wrapper)
+                .expect("select bounds");
+            let label_width = (bounds.x() / 2.0) as usize;
+            assert!(label_width > 0);
+            let group = wrapper.compute_bounds(&options).expect("group bounds");
+            let stride = options.width() as usize * 4;
+            for y in group.y() as usize..(group.y() + group.height()) as usize {
+                let start = y * stride + group.x() as usize * 4;
+                assert_eq!(
+                    &before[start..start + label_width * 4],
+                    &after[start..start + label_width * 4],
+                    "focus does not decorate the layout wrapper or label",
+                );
+            }
+            let select = dropdown
+                .button
+                .compute_bounds(&options)
+                .expect("select bounds");
+            assert!(
+                (select.y() as usize..(select.y() + select.height()) as usize).any(|y| {
+                    let start = y * stride + select.x() as usize * 4;
+                    let end = start + select.width() as usize * 4;
+                    before[start..end] != after[start..end]
+                }),
+                "the select retains its own visible focus indicator"
             );
         }
         window.destroy();

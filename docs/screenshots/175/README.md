@@ -13,6 +13,7 @@ After, captured using disposable sample files on a private D-Bus session:
 - `context-menu-before.png`, `context-menu.png`, `context-menu-light.png`: right-click behavior before and after adding the chooser-only Rename/Properties menu.
 - `folder-context-menu.png`, `chooser-rename.png`, `chooser-properties.png`: empty-space New Folder, inline rename, and shared themed Properties in the chooser.
 - `save-light.png`: Filter, Encoding, and Compress files on one compact row in Classic Light.
+- `option-focus-before.png`, `option-focus.png`, `option-focus-light.png`, `filter-focus.png`: keyboard focus before/after removing the extra layout-wrapper ring; the select controls retain their own focus indicators.
 - `savefiles-columns.png`: FileChooser v4 SaveFiles with Columns and choices.
 - `opt-in.png`, `opt-in-light.png`: the one-time, consent-only offer in Azure Glow and Classic Light, with matching paragraph insets.
 - `setup-success.png`, `setup-success-light.png`: the success state replaces the explanation with a theme-colored Lucide circle-check above the result.
