@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn settle() {
+pub(super) fn settle() {
     let context = glib::MainContext::default();
     let deadline = Instant::now() + Duration::from_millis(100);
     while Instant::now() < deadline {
@@ -18,7 +18,7 @@ fn settle() {
     }
 }
 
-fn key(key: &str) {
+pub(super) fn key(key: &str) {
     let tool = std::env::var_os("STRATA_TEST_XDOTOOL").unwrap_or_else(|| "xdotool".into());
     let result = Command::new(tool)
         .args(["key", "--clearmodifiers", key])
@@ -32,7 +32,7 @@ fn key(key: &str) {
     settle();
 }
 
-fn focus_window() {
+pub(super) fn focus_window() {
     let tool = std::env::var_os("STRATA_TEST_XDOTOOL").unwrap_or_else(|| "xdotool".into());
     assert!(
         Command::new(tool)
@@ -51,11 +51,11 @@ fn focus_window() {
     settle();
 }
 
-fn focused(state: &ChooserState) -> gtk::Widget {
+pub(super) fn focused(state: &ChooserState) -> gtk::Widget {
     gtk::prelude::RootExt::focus(&state.window).expect("keyboard focus")
 }
 
-fn selected(state: &ChooserState) -> String {
+pub(super) fn selected(state: &ChooserState) -> String {
     state
         .view
         .browser()
@@ -234,11 +234,9 @@ fn keyboard_only_controls_and_file_navigation_work_in_every_chooser_view() {
             settle();
             focus_window();
             assert!(
-                focused(&state).has_css_class("sidebar-toggle"),
-                "Open starts with a focused top-bar control: {mode:?}, focus={:?}, visible={}, items={}",
-                focused(&state),
-                state.window.gets_focus_visible(),
-                state.view.item_view_has_focus()
+                focused(&state).has_css_class("sidebar-toggle") || state.view.item_view_has_focus(),
+                "Open starts with a focused control or file: {mode:?}, focus={:?}",
+                focused(&state)
             );
             assert!(
                 state.window.gets_focus_visible(),

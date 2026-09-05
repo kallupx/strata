@@ -488,6 +488,7 @@ impl ModeViews {
             list.scroll_to(0, gtk::ListScrollFlags::FOCUS, None);
         }
         glib::idle_add_local_once(move || {
+            // Recycled ordinary cells also contain a hidden rename field at position zero.
             let field = bound_items.borrow().iter().find_map(|bound| {
                 let item = bound.item.upgrade()?;
                 if item.position() != 0 {
@@ -497,6 +498,7 @@ impl ModeViews {
                 descendant_with_class(&widget, "inline-rename")?
                     .downcast::<gtk::Entry>()
                     .ok()
+                    .filter(gtk::prelude::WidgetExt::is_visible)
             });
             let Some(field) = field else {
                 placeholder.splice(0, placeholder.n_items(), &[]);
@@ -1166,6 +1168,9 @@ impl ModeViews {
     }
 
     pub fn focus_visible_pane(&self, depth: usize) {
+        if self.rename_is_active() || self.new_entry_is_active() {
+            return;
+        }
         let Some(pane) = self
             .visible_panes()
             .into_iter()
@@ -1190,6 +1195,16 @@ impl ModeViews {
         );
         view.grab_focus();
         glib::idle_add_local_once(move || {
+            if view
+                .root()
+                .and_then(|root| root.focus())
+                .is_some_and(|focused| {
+                    super::focus_navigation::editable(&focused)
+                        || super::focus_navigation::in_popover(&focused)
+                })
+            {
+                return;
+            }
             view.grab_focus();
             if let Some(position) = position {
                 scroll_collection_to(&view, position);

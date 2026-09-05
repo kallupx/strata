@@ -517,6 +517,10 @@ impl BrowserView {
             columns.last().map(|column| column.marquee.clone())
         });
 
+        state
+            .mode_views
+            .borrow()
+            .set_context_state(Rc::downgrade(&state));
         if !interactive {
             state
                 .mode_views
@@ -532,10 +536,6 @@ impl BrowserView {
                     }
                 },
             ));
-            state
-                .mode_views
-                .borrow()
-                .set_context_state(Rc::downgrade(&state));
         }
 
         // The observer owns the view state while its window is alive. The window clears
@@ -3214,8 +3214,12 @@ impl ViewState {
         layout.actions.add_css_class("properties-actions");
         let open = properties_action(crate::assets::icons::EXTERNAL_LINK, "Open");
         let rename = properties_action(crate::assets::icons::PENCIL, "Rename");
-        rename.set_sensitive(entry.is_some());
+        rename.set_sensitive(
+            entry.is_some() && (self.interactive || self.browser.selected_entries().len() == 1),
+        );
+        open.set_visible(self.interactive);
         let pin = properties_action(crate::assets::icons::PIN, "Pin");
+        pin.set_visible(self.interactive);
         let pin_handler = self.pin_handler.borrow().clone();
         pin.set_sensitive(
             is_directory
@@ -5526,6 +5530,8 @@ impl ViewState {
         let presentation = LoadPresentation::new(&scroll, Some(retry));
         if self.interactive {
             install_directory_drop_target(self, &presentation.stack, location.clone());
+        }
+        {
             install_folder_context_menu(
                 self,
                 presentation.stack.upcast_ref(),
@@ -5551,7 +5557,7 @@ impl ViewState {
                 (row == picked).then_some(item.position())
             })
         });
-        if self.interactive {
+        {
             let map_for_context = map.clone();
             let source_position =
                 Rc::new(move |position| map_for_context.source_position(position));
@@ -6539,6 +6545,10 @@ pub(super) fn install_folder_context_menu(
     depth: usize,
     location: Location,
 ) {
+    if !state.interactive {
+        chooser_context::install_folder(state, parent, is_item_target, depth, location);
+        return;
+    }
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.add_css_class("folder-context-menu");
     let (popover, scroll) = context_menu_popover(&content);
@@ -6734,6 +6744,18 @@ pub(super) fn install_item_context_menu(
     clear_other_selections: Rc<dyn Fn()>,
     depth: usize,
 ) {
+    if !state.interactive {
+        chooser_context::install_item(
+            state,
+            widget,
+            selection,
+            pick_position,
+            source_position,
+            clear_other_selections,
+            depth,
+        );
+        return;
+    }
     let in_trash = state
         .browser
         .location_at(depth)
@@ -10564,6 +10586,8 @@ fn show_delete_error_dialog(parent: &impl IsA<gtk::Widget>, detail: &str, on_ret
     layer.add_controller(escape);
     cancel.grab_focus();
 }
+
+mod chooser_context;
 
 #[cfg(test)]
 mod tests;

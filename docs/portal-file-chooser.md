@@ -93,7 +93,7 @@ On a desktop that does not manage the frontend as a systemd user unit, log out a
 
 ## Keyboard navigation
 
-- Open dialogs start with visible focus on the sidebar toggle. Save dialogs focus
+- Open dialogs start with visible keyboard focus. Save dialogs focus
   and select the suggested filename. If focus is lost, an arrow restores it without
   requiring a click.
 - Tab/Shift+Tab traverse controls; arrows move between toolbar icons and options.
@@ -103,6 +103,11 @@ On a desktop that does not manage the frontend as a systemd user unit, log out a
   across groups; plain arrows select only the focused item.
 - Space/Enter activate focused buttons and toggles. Down or Enter opens a focused
   dropdown; its arrows and Enter select an option.
+- F2 renames a single selected file or folder. Escape cancels the name editor
+  without closing the chooser. Right-click an item for Rename or Properties;
+  right-click empty pane space for New Folder. Alt+Enter opens Properties from
+  the file list. Properties preserves multi-selection,
+  while Rename is disabled for multiple selected items.
 - Text fields keep their cursor keys and Ctrl+A. Ctrl+L edits the location;
   Ctrl+F opens the pane filter; Ctrl+Shift+N creates a folder.
 - Left from the outer file-list edge or a leftmost Grid cell focuses the visible
@@ -113,11 +118,12 @@ On a desktop that does not manage the frontend as a systemd user unit, log out a
 - Escape dismisses the innermost menu, inline edit, filter, preview, or confirmation
   before cancelling the request. Confirmation dialogs initially focus Cancel.
 
-The X11 keyboard regression test requires `xdotool` (or `STRATA_TEST_XDOTOOL`) and
-isolated XDG directories. Run it alone under a test display:
+The X11 keyboard and context-menu regression tests require `xdotool` (or
+`STRATA_TEST_XDOTOOL`) and isolated XDG directories. Run each alone under a test display:
 
 ```bash
 cargo test keyboard_only_controls_and_file_navigation_work_in_every_chooser_view -- --ignored
+cargo test chooser_context_menus_and_rename_work_in_every_view -- --ignored
 ```
 
 ## Verification

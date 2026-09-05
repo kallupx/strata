@@ -1213,7 +1213,7 @@ fn install_shortcuts(
             if state.dismiss_dropdown() {
                 return glib::Propagation::Stop;
             }
-            if state.view.cancel_new_entry() {
+            if state.view.cancel_new_entry() || state.view.cancel_rename() {
                 return glib::Propagation::Stop;
             }
             if state.view.dismiss_focused_filter() {
@@ -1230,7 +1230,32 @@ fn install_shortcuts(
             state.cancel();
             return glib::Propagation::Stop;
         }
-        if state.view.new_entry_is_active() {
+        if key == gtk::gdk::Key::F2
+            && !control
+            && !alt
+            && !shift
+            && !modifiers.contains(gtk::gdk::ModifierType::SUPER_MASK)
+            && browser.selected_entries().len() == 1
+            && !focused.as_ref().is_some_and(|widget| {
+                super::focus_navigation::editable(widget)
+                    || super::focus_navigation::in_popover(widget)
+            })
+            && state.view.begin_rename()
+        {
+            return glib::Propagation::Stop;
+        }
+        if alt
+            && !control
+            && !shift
+            && matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
+            && state.view.item_view_has_focus()
+            && !state.view.new_entry_is_active()
+            && !state.view.rename_is_active()
+            && state.view.show_focused_properties()
+        {
+            return glib::Propagation::Stop;
+        }
+        if state.view.new_entry_is_active() || state.view.rename_is_active() {
             return glib::Propagation::Proceed;
         }
         if control
