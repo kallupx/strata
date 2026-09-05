@@ -122,7 +122,18 @@ impl Dialog {
 
     fn message(&self, message: &str, error: bool) {
         if let Some(status) = self.status.upgrade() {
-            status.set_text(message);
+            status.set_text(
+                &message
+                    .lines()
+                    .map(|line| {
+                        super::controls::wrap_dialog_text(
+                            line,
+                            super::controls::MESSAGE_DIALOG_WIDTH_CHARS,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
             if error {
                 status.add_css_class("error");
             } else {
@@ -281,9 +292,10 @@ fn build_dialog(parent: &gtk::Window, offer: bool) -> Option<Rc<Dialog>> {
     layout
         .cancel
         .set_label(if offer { "Not now" } else { "Cancel" });
-    let description = gtk::Label::new(Some(
+    let description = gtk::Label::new(Some(&super::controls::wrap_dialog_text(
         "Only apps using the desktop FileChooser portal are affected. Requires xdg-desktop-portal. Changing this setting restarts the portal service; close any open file dialogs first. Your default file manager and other portals are unchanged.",
-    ));
+        super::controls::MESSAGE_DIALOG_WIDTH_CHARS,
+    )));
     description.set_xalign(0.0);
     description.set_wrap(true);
     description.set_max_width_chars(super::controls::MESSAGE_DIALOG_WIDTH_CHARS as i32);

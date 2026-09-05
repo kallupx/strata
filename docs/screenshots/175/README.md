@@ -15,6 +15,7 @@ After, captured using disposable sample files on a private D-Bus session:
 - `opt-in.png`, `opt-in-light.png`: the one-time, consent-only offer in Azure Glow and Classic Light, with matching paragraph insets.
 - `setup-success.png`, `setup-success-light.png`: the success state replaces the explanation with a theme-colored Lucide circle-check above the result.
 - `settings-integration.png`: permanent enable/restore access in Settings → General.
+- `settings-restore-before.png`, `settings-restore.png`, `settings-restore-light.png`: the configured integration dialog before and after applying the shared message-width wrapping, including Classic Light.
 
 The opt-in captures use isolated XDG directories and a private bus; service restart/reload commands were stubbed during installation/removal testing, so the installed desktop portal was never replaced.
 

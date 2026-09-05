@@ -28,6 +28,14 @@ fn setup_copy_aligns_and_success_replaces_the_explanation() {
     gtk::init().expect("GTK display");
     gio::resources_register_include!("strata.gresource").expect("bundled icons");
     crate::ui::prepare_portal_ui();
+    let display = gtk::gdk::Display::default().expect("display");
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(".portal-setup-dialog { font-size: 16px; }");
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+    );
     for offer in [true, false] {
         let overlay = gtk::Overlay::new();
         let window = gtk::Window::builder()
@@ -51,17 +59,43 @@ fn setup_copy_aligns_and_success_replaces_the_explanation() {
         );
         assert!(description.is_mapped());
         assert!(!success.is_visible());
+        let content = status.parent().expect("body").parent().expect("dialog");
+        assert!(
+            content.width() <= 760,
+            "initial offer stays compact: {}",
+            content.width()
+        );
+        dialog
+            .confirm
+            .upgrade()
+            .expect("confirm")
+            .set_label("Restore previous chooser");
+        dialog.message("Strata is currently configured as your preferred file chooser. Restoring removes this integration and preserves unrelated configuration edits.", false);
+        settle();
+        assert!(
+            content.width() <= 760,
+            "configured Settings dialog stays compact: {}",
+            content.width()
+        );
         dialog.message("Setup failed; your previous chooser is unchanged.", true);
         assert!(status.has_css_class("error"));
+        settle();
+        assert!(content.width() <= 760);
         assert!(description.is_visible());
         assert!(!success.is_visible());
 
-        dialog.complete(
-            "Installed Strata as the per-user file chooser.\nConfiguration: /example/portals.conf",
-        );
+        dialog.complete(&format!(
+            "Installed Strata as the per-user file chooser.\nConfiguration: /example/{}/portals.conf",
+            "long-config-directory/".repeat(8),
+        ));
         settle();
         assert!(!description.is_visible());
         assert!(success.is_mapped());
+        assert!(
+            content.width() <= 760,
+            "long configuration paths wrap: {}",
+            content.width()
+        );
         let icon = success.paintable().expect("bundled success icon");
         crate::assets::set_primary_icon_color("#aabbcc");
         assert_ne!(success.paintable().expect("recolored success icon"), icon);
@@ -81,4 +115,5 @@ fn setup_copy_aligns_and_success_replaces_the_explanation() {
         assert!(dialog.finished.get());
         window.destroy();
     }
+    gtk::style_context_remove_provider_for_display(&display, &provider);
 }
