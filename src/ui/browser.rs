@@ -37,7 +37,7 @@ mod events;
 mod inline_edit;
 mod location;
 mod pane_header;
-mod paths;
+pub(in crate::ui) mod paths;
 mod peek;
 mod presentation;
 mod progress;

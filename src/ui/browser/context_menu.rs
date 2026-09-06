@@ -698,13 +698,14 @@ pub(in crate::ui) fn install_item_context_menu(
         for button in [&cut, &cut_multiple, &move_to, &move_multiple] {
             button.set_visible(removable);
         }
-        rename.set_visible(!is_trash_location(&entry.location));
+        let rename_visible = !is_trash_location(&entry.location);
+        rename.set_visible(rename_visible);
         let can_compress = entries
             .iter()
             .all(|entry| entry.location.native_path().is_some());
         compress.set_visible(can_compress);
         compress_multiple.set_visible(can_compress);
-        archive_separator.set_visible(rename.is_visible() || can_compress);
+        archive_separator.set_visible(rename_visible || can_compress);
         multiple_archive_separator.set_visible(can_compress);
         preview.set_visible(crate::ui::preview::entry_supports_quick_preview(&entry));
         print.set_visible(entry_supports_printing(&entry));
@@ -920,6 +921,10 @@ fn context_menu_toggle_option(
 /// to visible, since offering Trash and letting the operation fail is the
 /// existing, safer fallback (issue #179) rather than ever hiding the only
 /// delete option this menu has.
+///
+/// Callers additionally hide the option for a child inside a trashed folder,
+/// which GVfs cannot remove on its own; that entry deliberately offers no
+/// delete or restore action at all.
 fn move_to_trash_is_visible(in_trash: bool, can_trash: Option<bool>) -> bool {
     in_trash || can_trash.unwrap_or(true)
 }

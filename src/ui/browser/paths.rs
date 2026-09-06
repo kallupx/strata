@@ -45,7 +45,7 @@ pub(in crate::ui) fn is_trash_root(location: &Location) -> bool {
     location.uri_value() == Some("trash:///")
 }
 
-pub(super) fn is_trash_location(location: &Location) -> bool {
+pub(in crate::ui) fn is_trash_location(location: &Location) -> bool {
     location
         .uri_value()
         .is_some_and(|uri| uri.starts_with("trash:"))

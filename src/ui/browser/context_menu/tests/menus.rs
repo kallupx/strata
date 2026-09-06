@@ -203,9 +203,9 @@ fn capture_menu(menu: &gtk::Popover, name: &str) {
 }
 
 #[test]
-fn trash_menus_and_keyboard_actions_follow_supported_operations_in_every_mode() {
+fn menus_and_keyboard_actions_follow_supported_operations_in_every_mode() {
     crate::test_support::gtk_test(
-        "ui::browser::context_menu::tests::trash::trash_menus_and_keyboard_actions_follow_supported_operations_in_every_mode",
+        "ui::browser::context_menu::tests::menus::menus_and_keyboard_actions_follow_supported_operations_in_every_mode",
         || {
             let provider = gtk::CssProvider::new();
             provider.load_from_string(include_str!("../../../../style.css"));
@@ -310,7 +310,6 @@ fn trash_menus_and_keyboard_actions_follow_supported_operations_in_every_mode() 
                     }
                     menu.popdown();
                     wait_until(|| menu.parent().is_none());
-                    // Right-click a different unselected item to return to a single-item menu.
                     view.browser().select(0, 0);
                     let menu = open_menu(&view, Some("picture.png"));
                     if in_trash {
@@ -366,6 +365,56 @@ fn trash_menus_and_keyboard_actions_follow_supported_operations_in_every_mode() 
                     window.destroy();
                 }
             }
+            assert_remote_menu_separates_rename_from_properties();
         },
     );
+}
+
+/// Separators are configured before the popover is shown, so their visibility has
+/// to come from the same booleans that gate the buttons: reading it back off a
+/// button whose ancestors are still hidden always answers "invisible". Only a
+/// location without a native path shows the difference, since Rename and
+/// Compress are otherwise hidden together.
+fn assert_remote_menu_separates_rename_from_properties() {
+    let view = BrowserView::new(Rc::new(MenuSource), PeekBehavior::default());
+    let window = gtk::Window::builder()
+        .child(&view.widget())
+        .default_width(1000)
+        .default_height(850)
+        .build();
+    window.present();
+    view.browser()
+        .navigate(Location::uri("sftp://example.test/remote"));
+    wait_until(|| label(&view.widget(), "notes.txt").is_some());
+
+    let menu = open_menu(&view, Some("notes.txt"));
+    assert_actions(&menu, &["Rename", "Properties"], &["Compress…"]);
+    wait_until(|| menu.width() > 0 && label(menu.upcast_ref(), "Rename").is_some());
+    let rename = vertical_offset(&menu, &label(menu.upcast_ref(), "Rename").expect("rename"));
+    let properties = vertical_offset(
+        &menu,
+        &label(menu.upcast_ref(), "Properties").expect("properties"),
+    );
+    assert!(
+        descendants(menu.upcast_ref())
+            .iter()
+            .filter(|widget| widget.is::<gtk::Separator>() && widget.is_mapped())
+            .any(|separator| {
+                let offset = vertical_offset(&menu, separator);
+                offset > rename && offset < properties
+            }),
+        "rename must stay separated from the properties group"
+    );
+
+    menu.popdown();
+    wait_until(|| menu.parent().is_none());
+    view.browser().clear_observer();
+    window.destroy();
+}
+
+fn vertical_offset(menu: &gtk::Popover, widget: &gtk::Widget) -> f32 {
+    widget
+        .compute_point(menu, &gtk::graphene::Point::new(0.0, 0.0))
+        .expect("menu coordinates")
+        .y()
 }

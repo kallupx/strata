@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 mod actions;
+mod menus;
 
 use super::*;
 use crate::model::{FileEntry, Location};
@@ -103,5 +104,3 @@ fn permanently_delete_hides_inside_trash_regardless_of_can_delete() {
     assert!(!permanently_delete_is_visible(true, Some(true)));
     assert!(!permanently_delete_is_visible(true, None));
 }
-
-mod trash;
