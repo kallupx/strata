@@ -928,8 +928,7 @@ impl BrowserView {
         if entries.is_empty() {
             return false;
         }
-        self.state.cut_entries(&entries);
-        true
+        self.state.cut_entries(&entries)
     }
 
     pub fn copy_path(&self) -> bool {
@@ -1348,7 +1347,11 @@ impl ViewState {
                 }
                 true
             });
-            let active = destination == Some(depth);
+            let active = destination == Some(depth)
+                && self
+                    .browser
+                    .location_at(depth)
+                    .is_some_and(|location| !is_trash_location(&location));
             if active {
                 column.shell.add_css_class("destination-column");
             } else {
@@ -1385,6 +1388,7 @@ fn paste_destination(selected: &[FileEntry], column: Option<Location>) -> Option
         [folder] if folder.is_directory() => Some(folder.location.clone()),
         _ => column,
     }
+    .filter(|location| !is_trash_location(location))
 }
 
 /// Keyboard-triggered folder creation must ignore the pointer so a resting mouse

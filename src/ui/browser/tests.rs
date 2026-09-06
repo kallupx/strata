@@ -72,6 +72,17 @@ fn paste_prefers_only_a_single_selected_directory() {
     );
     assert_eq!(paste_destination(&[], Some(column.clone())), Some(column));
     assert_eq!(paste_destination(&[], None), None);
+    for location in [Location::uri("trash:///"), Location::uri("trash:///folder")] {
+        assert_eq!(paste_destination(&[], Some(location.clone())), None);
+        let folder = FileEntry {
+            location,
+            ..entry("folder", crate::model::EntryKind::Directory)
+        };
+        assert_eq!(
+            paste_destination(&[folder], Some(Location::local("/fixture"))),
+            None
+        );
+    }
 }
 
 #[test]

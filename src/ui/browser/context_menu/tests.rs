@@ -103,3 +103,5 @@ fn permanently_delete_hides_inside_trash_regardless_of_can_delete() {
     assert!(!permanently_delete_is_visible(true, Some(true)));
     assert!(!permanently_delete_is_visible(true, None));
 }
+
+mod trash;
