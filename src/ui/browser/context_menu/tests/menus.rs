@@ -189,15 +189,20 @@ fn capture_menu(menu: &gtk::Popover, name: &str) {
     let output = std::path::PathBuf::from(output);
     std::fs::create_dir_all(&output).expect("visual evidence directory");
     wait_until(|| menu.width() > 0 && menu.height() > 0);
-    let snapshot = gtk::Snapshot::new();
-    gtk::WidgetPaintable::new(Some(menu)).snapshot(
-        &snapshot,
-        f64::from(menu.width()),
-        f64::from(menu.height()),
-    );
+    let node = RefCell::new(None);
+    wait_until(|| {
+        let snapshot = gtk::Snapshot::new();
+        gtk::WidgetPaintable::new(Some(menu)).snapshot(
+            &snapshot,
+            f64::from(menu.width()),
+            f64::from(menu.height()),
+        );
+        node.replace(snapshot.to_node());
+        node.borrow().is_some()
+    });
     menu.renderer()
         .expect("menu renderer")
-        .render_texture(snapshot.to_node().expect("menu render node"), None)
+        .render_texture(node.into_inner().expect("menu render node"), None)
         .save_to_png(output.join(format!("{name}.png")))
         .expect("save menu evidence");
 }
@@ -370,11 +375,8 @@ fn menus_and_keyboard_actions_follow_supported_operations_in_every_mode() {
     );
 }
 
-/// Separators are configured before the popover is shown, so their visibility has
-/// to come from the same booleans that gate the buttons: reading it back off a
-/// button whose ancestors are still hidden always answers "invisible". Only a
-/// location without a native path shows the difference, since Rename and
-/// Compress are otherwise hidden together.
+// Before popup, is_visible() includes hidden ancestors; a remote URI exposes
+// the regression because Rename is available without Compress.
 fn assert_remote_menu_separates_rename_from_properties() {
     let view = BrowserView::new(Rc::new(MenuSource), PeekBehavior::default());
     let window = gtk::Window::builder()
