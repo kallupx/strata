@@ -911,20 +911,9 @@ fn context_menu_toggle_option(
     (button, icon, title)
 }
 
-/// Whether the "Move to Trash" context-menu option should be shown (issue #284).
-///
-/// Always visible while already browsing Trash, where it's really "Permanently
-/// delete" under a shared label -- `can_trash` describes an ordinary location's
-/// Trash support and has no bearing there. Otherwise, visible unless the
-/// location's `access::can-trash` check came back a definite `Some(false)`;
-/// `None` (not yet resolved, or the check itself couldn't be answered) defaults
-/// to visible, since offering Trash and letting the operation fail is the
-/// existing, safer fallback (issue #179) rather than ever hiding the only
-/// delete option this menu has.
-///
-/// Callers additionally hide the option for a child inside a trashed folder,
-/// which GVfs cannot remove on its own; that entry deliberately offers no
-/// delete or restore action at all.
+/// In Trash this shared action deletes permanently, so `can_trash` is irrelevant.
+/// Unknown capabilities retain the delete fallback (#179); callers exclude
+/// nested Trash children, which GVfs cannot remove independently.
 fn move_to_trash_is_visible(in_trash: bool, can_trash: Option<bool>) -> bool {
     in_trash || can_trash.unwrap_or(true)
 }
