@@ -20,7 +20,7 @@ use crate::ui::{
         paths::is_trash_location,
     },
     browser_modes::BrowserMode,
-    modal::{slide_in_down, slide_out},
+    modal::slide_in_down,
 };
 use crate::{model::FileEntry, services::SearchItem};
 use gtk::{glib, prelude::*};
@@ -189,7 +189,6 @@ pub(super) fn column_rows(
                 if !crate::ui::pointer::hits_item_content(prepare_row.upcast_ref(), x, y) {
                     return None;
                 }
-                prepare_row.remove_css_class("slide-out");
                 let state = weak_state_for_drag.upgrade()?;
                 let dragged_item = dragged_item.upgrade()?;
                 let source_position = map_for_drag.source_position(dragged_item.position())?;
@@ -217,7 +216,6 @@ pub(super) fn column_rows(
             drag.connect_drag_end(move |_, _, _| {
                 if let Some(row) = dragged_row.upgrade() {
                     row.remove_css_class("dragging");
-                    slide_out(&row);
                 }
             });
             row.add_controller(drag);
