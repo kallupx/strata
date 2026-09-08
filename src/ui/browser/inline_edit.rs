@@ -243,7 +243,8 @@ impl ViewState {
         let Some(filtered_position) = column.map.view_position(source_position) else {
             return false;
         };
-        // A bound virtual row can still be offscreen and unallocated on GTK 4.14.
+        // GTK 4.14 can bind an inserted row without allocating it after the first
+        // scroll request. Let the creation tick reveal it before requiring a field.
         super::prepare_collection_inline_edit(column.list.upcast_ref(), filtered_position);
         let row = column.bound_rows.borrow().iter().find_map(|bound| {
             let item = bound.item.upgrade()?;
