@@ -1,0 +1,30 @@
+{
+  "fake.zip": {
+    "bytes": 39,
+    "sha256": "69fb4b25ed1b999adacabf65e5a0e80c734150dff0b975c8974a24efda13eae7"
+  },
+  "invalid.tar.gz": {
+    "bytes": 39,
+    "sha256": "69fb4b25ed1b999adacabf65e5a0e80c734150dff0b975c8974a24efda13eae7"
+  },
+  "invalid.tar": {
+    "bytes": 39,
+    "sha256": "69fb4b25ed1b999adacabf65e5a0e80c734150dff0b975c8974a24efda13eae7"
+  },
+  "fake.7z": {
+    "bytes": 39,
+    "sha256": "69fb4b25ed1b999adacabf65e5a0e80c734150dff0b975c8974a24efda13eae7"
+  },
+  "truncated.zip": {
+    "bytes": 40,
+    "sha256": "5b8a659e35dd875715c463de7a6e2d08a5f47f3083c24c7d8d5887c571bf6a4c"
+  },
+  "truncated.tar": {
+    "bytes": 100,
+    "sha256": "5be4c2f2637c248fcc4f481639980599207687d4f93f691d370939e44f5a0795"
+  },
+  "truncated.tar.gz": {
+    "bytes": 20,
+    "sha256": "c25cec165ccde0aca138b7999ff4924ee236f92f18d43afdb2cf83bc246db127"
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "variables": {
+    "HOME": "/tmp/strata-e2e-home-pp2r3s73/home",
+    "XDG_CONFIG_HOME": "/tmp/strata-e2e-home-pp2r3s73/config",
+    "XDG_DATA_HOME": "/tmp/strata-e2e-home-pp2r3s73/data",
+    "XDG_CACHE_HOME": "/tmp/strata-e2e-home-pp2r3s73/cache",
+    "XDG_STATE_HOME": "/tmp/strata-e2e-home-pp2r3s73/state",
+    "XDG_DATA_DIRS": "/usr/local/share:/usr/share",
+    "XDG_CURRENT_DESKTOP": "GNOME",
+    "LC_ALL": "C.UTF-8",
+    "LANG": "C.UTF-8",
+    "LANGUAGE": "",
+    "TZ": "UTC",
+    "GDK_BACKEND": "x11",
+    "GSK_RENDERER": "cairo",
+    "GDK_SCALE": "1",
+    "GDK_DPI_SCALE": "1",
+    "GTK_A11Y": "atspi",
+    "NO_AT_BRIDGE": "0",
+    "GTK_THEME": "Adwaita",
+    "GTK_USE_PORTAL": "0",
+    "GTK_OVERLAY_SCROLLING": "0",
+    "LIBGL_ALWAYS_SOFTWARE": "1",
+    "GALLIUM_DRIVER": "llvmpipe",
+    "GIO_USE_VFS": "local",
+    "GIO_USE_VOLUME_MONITOR": "unix",
+    "GSETTINGS_BACKEND": "memory",
+    "RUST_BACKTRACE": "1"
+  },
+  "display": {
+    "DISPLAY": ":91",
+    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/tmp/strata-e2e-5svhwe3x/bus",
+    "AT_SPI_BUS_ADDRESS": "unix:path=/tmp/strata-e2e-5svhwe3x/at-spi/bus_91",
+    "XDG_RUNTIME_DIR": "/tmp/strata-e2e-5svhwe3x"
+  },
+  "window": "Bounds(x=0, y=0, width=1200, height=760)",
+  "compositor": "xcompmgr 1.1.10 -n",
+  "compositor_pid": 1170952,
+  "capture": "import -silent -screen -window 8388613",
+  "binary": "/home/kaperala/Code/strata-agent-434/target/issue-434/binaries/after-capture/strata"
+}
