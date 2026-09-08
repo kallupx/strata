@@ -1997,6 +1997,10 @@ impl Browser {
         }
     }
 
+    pub fn request_preview(&self, entry: FileEntry) {
+        self.emit(BrowserEvent::PreviewRequested { entry });
+    }
+
     pub fn open_location(&self, location: Location) {
         self.emit(BrowserEvent::OpenRequested { location });
     }
