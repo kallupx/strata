@@ -409,6 +409,7 @@ class Strata:
             ),
             f"the menu item {label!r}",
         )
+        self.settle(item)
         self.pointer.click(item)
         self.wait_for_menu_closed()
 
