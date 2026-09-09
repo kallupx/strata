@@ -26,6 +26,7 @@ def _entry_name(row):
 
 
 def _visible_entries(strata, viewport):
+    viewport = viewport.screen_bounds()
     visible = []
     for row in strata.entries():
         bounds = _entry_bounds(row)
@@ -83,7 +84,7 @@ def test_scrolling_extends_marquee_without_losing_earlier_files(strata, mode, sc
         if scrolling == "edge":
             end = (end[0], viewport_bounds.y + viewport_bounds.height - 40)
             strata.pointer.move_to(*end)
-        strata.settle(_visible_entries(container, viewport)[0])
+        strata.settle(_visible_entries(strata, viewport)[0])
 
         def visible_band_is_selected():
             rows = []
