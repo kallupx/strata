@@ -131,10 +131,11 @@ pub(super) fn extract_zip_from_archive(
                 .enclosed_name()
                 .ok_or_else(|| format!("Refusing unsafe ZIP path: {name}"))?;
             let declared_size = entry.size();
-            let content = if entry.is_dir() {
+            let directory = entry.is_dir();
+            let mut reader = ArchiveReader(&mut entry);
+            let content = if directory {
                 MemberContent::Directory
             } else {
-                let mut reader = ArchiveReader(&mut entry);
                 MemberContent::File(&mut reader, Some(declared_size))
             };
             next_index = index + 1;
@@ -189,10 +190,10 @@ pub(super) fn extract_tar(
             }
             let declared_size = entry.size();
             let name = name.to_string_lossy().into_owned();
+            let mut reader = ArchiveReader(&mut entry);
             let content = if directory {
                 MemberContent::Directory
             } else {
-                let mut reader = ArchiveReader(&mut entry);
                 MemberContent::File(&mut reader, Some(declared_size))
             };
             session.extract_member(&name, content)?;

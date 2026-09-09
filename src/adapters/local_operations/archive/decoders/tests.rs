@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use super::super::fixtures::{
-    always_cancelled, completed_extract, extract_zip, never_cancelled, write_7z, write_7z_entries,
-    write_compression_fixture, write_tar, write_tar_entries, write_zip,
+    always_cancelled, completed_extract, extract_zip, never_cancelled, patch_zip_uncompressed_size,
+    write_7z, write_7z_entries, write_compression_fixture, write_tar, write_tar_entries, write_zip,
 };
 use super::{
     ArchiveError, ArchiveOutcome, extract_7z_from_reader, extract_tar, extract_zip_from_archive,
