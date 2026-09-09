@@ -1,6 +1,4 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Stable recursive results and location-based actions on every result surface."""
-
 import pytest
 from PIL import Image
 

@@ -332,7 +332,6 @@ fn update_rows(state: &State, items: Vec<SearchItem>, root: &Path, recursive: bo
     );
     // GTK sorts in place, keeping rows rooted, selected, and their thumbnail work alive.
     state.list.invalidate_sort();
-    // Retain identity on reorder; removal chooses the next slot, or the new last row.
     let next = selected_path
         .and_then(|path| items.iter().position(|item| &item.path == path))
         .or_else(|| {
