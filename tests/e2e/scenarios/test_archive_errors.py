@@ -1,6 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
-"""Archive failures use the existing error dialog and release progress."""
-
+# SPDX-License-Identifier: MIT
 import zipfile
 
 import pytest
