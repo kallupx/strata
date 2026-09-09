@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 use std::{
     cmp::Reverse,
@@ -50,6 +50,15 @@ pub struct SearchItem {
 }
 
 impl SearchItem {
+    #[cfg(test)]
+    pub(crate) fn for_test(path: PathBuf, is_directory: bool) -> Self {
+        Self::new(
+            path.clone(),
+            path.parent().unwrap_or(Path::new("/")),
+            is_directory,
+        )
+    }
+
     fn new(path: PathBuf, root: &Path, is_directory: bool) -> Self {
         let name = path
             .file_name()

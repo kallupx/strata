@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 use crate::model::{FileEntry, Location};
 use crate::ui::browser::ViewState;
@@ -36,6 +36,7 @@ const COLUMN_TRANSITION: Duration = Duration::from_millis(220);
 pub(super) struct BoundRow {
     pub(super) item: glib::WeakRef<gtk::ListItem>,
     pub(super) row: glib::WeakRef<gtk::Box>,
+    pub(super) rename_label: glib::WeakRef<gtk::Label>,
 }
 
 struct PendingPointerActivation {
@@ -74,6 +75,7 @@ pub(super) struct ColumnView {
     pub(super) selection: gtk::MultiSelection,
     pub(super) syncing_selection: Rc<Cell<bool>>,
     pub(super) list: gtk::ListView,
+    pub(super) listing_scroll: gtk::ScrolledWindow,
     pub(super) marquee: crate::ui::marquee::Marquee,
     pub(super) bound_rows: Rc<RefCell<Vec<BoundRow>>>,
     pub(super) entry_count: Rc<Cell<usize>>,
@@ -703,18 +705,20 @@ impl ViewState {
             if query.is_empty() {
                 search_gen_for_changed.set(search_gen_for_changed.get().saturating_add(1));
                 search_handle_for_changed.borrow_mut().take();
+                // Keep the hidden-file filter installed while swapping back to the directory
+                // model; GTK's synchronous model notifications otherwise leave a stale row.
+                apply_filter_query(
+                    &filtered_model_for_search,
+                    &filter,
+                    &filter_query,
+                    text.to_lowercase(),
+                );
                 deactivate_recursive_search(
                     &search_active_for_changed,
                     &search_results_for_changed,
                     &search_model_for_changed,
                     &filtered_model_for_search,
                     &model_for_search,
-                );
-                apply_filter_query(
-                    &filtered_model_for_search,
-                    &filter,
-                    &filter_query,
-                    text.to_lowercase(),
                 );
                 return;
             }
@@ -926,12 +930,8 @@ impl ViewState {
         let returning_to_column = Rc::new(Cell::new(false));
         let returning_for_clear = returning_to_column.clone();
         let search_active_for_clear = recursive_search_active.clone();
-        let marquee = crate::ui::marquee::install(crate::ui::marquee::MarqueeSetup {
-            view: list.clone().upcast(),
-            surface: presentation.stack.clone().upcast(),
-            scroll: scroll.clone(),
-            overlay: self.overlay.clone(),
-            targets: Rc::new(RefCell::new(vec![crate::ui::marquee::MarqueeTarget {
+        let marquee_targets: Rc<RefCell<Vec<crate::ui::marquee::MarqueeTarget>>> =
+            Rc::new(RefCell::new(vec![crate::ui::marquee::MarqueeTarget {
                 selection: selection.clone(),
                 visit_items: Rc::new(move |visit| {
                     rows_for_marquee.borrow_mut().retain(|bound| {
@@ -943,8 +943,14 @@ impl ViewState {
                         true
                     });
                 }),
-            }])),
-            is_item: Rc::new(crate::ui::pointer::hits_item_content),
+            }]));
+        let marquee = crate::ui::marquee::install(crate::ui::marquee::MarqueeSetup {
+            view: list.clone().upcast(),
+            surface: presentation.stack.clone().upcast(),
+            scroll: scroll.clone(),
+            overlay: self.overlay.clone(),
+            targets: marquee_targets.clone(),
+            is_item: crate::ui::marquee::item_bounds_predicate(marquee_targets),
             clear_selection: Rc::new(move || {
                 if let Some(state) = weak_for_clear.upgrade() {
                     state.clear_column_selections();
@@ -1128,6 +1134,7 @@ impl ViewState {
             selection,
             syncing_selection,
             list,
+            listing_scroll: scroll,
             marquee,
             bound_rows,
             entry_count,
@@ -1210,7 +1217,7 @@ impl ViewState {
         click
     }
 
-    fn reveal_column(self: &Rc<Self>, shell: gtk::Box) {
+    pub(super) fn reveal_column(self: &Rc<Self>, shell: gtk::Box) {
         let animation_id = self.horizontal_scroll_generation.get().saturating_add(1);
         self.horizontal_scroll_generation.set(animation_id);
         let weak = Rc::downgrade(self);

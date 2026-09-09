@@ -1,10 +1,10 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 use super::chooser_context;
 use crate::adapters::gio_file_for_location;
 use crate::model::{FileEntry, Location};
 use crate::services::ArchiveFormat;
-use crate::ui::browser::clipboard::{copy_locations, locations_equal};
+use crate::ui::browser::clipboard::{copy_locations, copy_names, locations_equal};
 use crate::ui::browser::customization::show_customize_modal;
 use crate::ui::browser::desktop::{can_open_terminal, launch_terminal};
 use crate::ui::browser::entry::{entry_icon, entry_supports_printing};
@@ -18,24 +18,41 @@ use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-const CONTEXT_MENU_EDGE_MARGIN: i32 = 24;
+const CONTEXT_MENU_EDGE_MARGIN: i32 = 16;
 
 fn context_menu_placement(anchor_height: i32, click_y: f64) -> (gtk::PositionType, i32) {
     let click_y = click_y.round() as i32;
     let above = click_y.clamp(0, anchor_height);
     let below = anchor_height.saturating_sub(above);
-    let (position, available_height) = if below >= above {
-        (gtk::PositionType::Bottom, below)
+    let position = if below >= above {
+        gtk::PositionType::Bottom
     } else {
-        (gtk::PositionType::Top, above)
+        gtk::PositionType::Top
     };
 
     (
         position,
-        available_height
-            .saturating_sub(CONTEXT_MENU_EDGE_MARGIN)
+        anchor_height
+            .saturating_sub(CONTEXT_MENU_EDGE_MARGIN * 2)
             .max(1),
     )
+}
+
+// GTK popovers do not shift their anchor to use space across the click point.
+fn shifted_anchor_y(
+    position: gtk::PositionType,
+    anchor_height: i32,
+    click_y: i32,
+    content_height: i32,
+) -> i32 {
+    let near_edge = CONTEXT_MENU_EDGE_MARGIN;
+    let far_edge = anchor_height.saturating_sub(CONTEXT_MENU_EDGE_MARGIN);
+    match position {
+        gtk::PositionType::Bottom => {
+            click_y.min(far_edge.saturating_sub(content_height).max(near_edge))
+        }
+        _ => click_y.max(near_edge.saturating_add(content_height).min(far_edge)),
+    }
 }
 
 pub(super) fn context_menu_popover(
@@ -71,7 +88,7 @@ pub(super) fn bind_column_context_owner(
         {
             // Unmapping can focus the window's first control (for example Home).
             // Restore before another key is dispatched, not from a later idle callback.
-            if state.browser.active_depth() == Some(depth) {
+            if state.browser.active_depth() == Some(depth) && !column_search_active(&state, depth) {
                 state.browser.focus_active();
             }
             let generation = state.context_menu_generation.get();
@@ -89,6 +106,14 @@ pub(super) fn bind_column_context_owner(
     });
 }
 
+fn column_search_active(state: &ViewState, depth: usize) -> bool {
+    state
+        .columns
+        .borrow()
+        .get(depth)
+        .is_some_and(|column| column.search_handle.borrow().is_some())
+}
+
 pub(super) fn focus_context_column(state: &Rc<ViewState>, depth: usize) {
     if state.mode_views.borrow().mode() != crate::ui::browser_modes::BrowserMode::Columns {
         return;
@@ -99,7 +124,9 @@ pub(super) fn focus_context_column(state: &Rc<ViewState>, depth: usize) {
     state.context_menu_column.set(Some(depth));
     state.browser.set_active_column(depth);
     // GTK restores pre-popup focus on dismissal; make that the menu's own column.
-    state.browser.focus_active();
+    if !column_search_active(state, depth) {
+        state.browser.focus_active();
+    }
     state.pointer_navigation();
 }
 
@@ -123,9 +150,12 @@ pub(super) fn show_context_popover(
         context_menu_placement(overlay.height(), f64::from(point.y()));
     popover.set_position(position);
     scroll.set_max_content_height(max_content_height);
+    let click_y = point.y().round() as i32;
+    let (_, content_height, _, _) = scroll.measure(gtk::Orientation::Vertical, -1);
+    let anchor_y = shifted_anchor_y(position, overlay.height(), click_y, content_height.max(1));
     popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
         point.x().round() as i32,
-        point.y().round() as i32,
+        anchor_y,
         1,
         1,
     )));
@@ -342,6 +372,9 @@ pub(in crate::ui) type ContextPickPosition = Rc<dyn Fn(&gtk::Widget) -> Option<u
 
 pub(in crate::ui) type ContextSourcePosition = Rc<dyn Fn(u32) -> Option<usize>>;
 
+pub(in crate::ui) type ContextTarget = (Option<usize>, FileEntry);
+pub(in crate::ui) type ContextResolver = Rc<dyn Fn(&gtk::Widget) -> Option<ContextTarget>>;
+
 const ITEM_CONTEXT_SUMMARY_MAX_CHARS: i32 = 60;
 
 pub(in crate::ui) fn install_item_context_menu(
@@ -353,16 +386,43 @@ pub(in crate::ui) fn install_item_context_menu(
     clear_other_selections: Rc<dyn Fn()>,
     depth: usize,
 ) {
+    let weak = Rc::downgrade(state);
+    let selection = selection.clone();
+    let resolve = Rc::new(move |picked: &gtk::Widget| {
+        let position = pick_position(picked)?;
+        let state = weak.upgrade()?;
+        let columns = state.columns.borrow();
+        let search = columns.get(depth).filter(|column| {
+            state.mode_views.borrow().mode() == BrowserMode::Columns
+                && column.search_handle.borrow().is_some()
+        });
+        let target = if let Some(column) = search {
+            (
+                None,
+                super::search_result_entry(column.search_results.borrow().get(position as usize)?),
+            )
+        } else {
+            let source = source_position(position)?;
+            (Some(source), state.browser.entry_at(depth, source)?)
+        };
+        drop(columns);
+        if !selection.is_selected(position) {
+            clear_other_selections();
+            selection.select_item(position, true);
+        }
+        Some(target)
+    });
+    install_resolved_item_context_menu(state, widget, resolve, depth);
+}
+
+pub(in crate::ui) fn install_resolved_item_context_menu(
+    state: &Rc<ViewState>,
+    widget: &gtk::Widget,
+    resolve: ContextResolver,
+    depth: usize,
+) {
     if !state.interactive {
-        chooser_context::install_item(
-            state,
-            widget,
-            selection,
-            pick_position,
-            source_position,
-            clear_other_selections,
-            depth,
-        );
+        chooser_context::install_item(state, widget, resolve, depth);
         return;
     }
     let in_trash = state
@@ -402,6 +462,7 @@ pub(in crate::ui) fn install_item_context_menu(
     let pin = item_context_option(crate::assets::icons::PIN, "Pin to sidebar", "P");
     let copy = item_context_option(crate::assets::icons::COPY, "Copy", "Ctrl+C");
     let copy_path = item_context_option(crate::assets::icons::COPY, "Copy path", "Y");
+    let copy_name = item_context_option(crate::assets::icons::COPY, "Copy name", "");
     let move_to = item_context_option(crate::assets::icons::FOLDER, "Move to…", "");
     let copy_to = item_context_option(crate::assets::icons::COPY, "Copy to…", "");
     let rename = item_context_option(crate::assets::icons::PENCIL, "Rename", "F2 / Ctrl+R");
@@ -442,6 +503,7 @@ pub(in crate::ui) fn install_item_context_menu(
     single.append(&cut);
     single.append(&copy);
     single.append(&copy_path);
+    single.append(&copy_name);
     single.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     single.append(&move_to);
     single.append(&copy_to);
@@ -466,6 +528,7 @@ pub(in crate::ui) fn install_item_context_menu(
     restore_multiple.set_visible(in_trash);
     let copy_multiple = item_context_option(crate::assets::icons::COPY, "Copy", "Ctrl+C");
     let copy_paths = item_context_option(crate::assets::icons::COPY, "Copy paths", "Y");
+    let copy_names_button = item_context_option(crate::assets::icons::COPY, "Copy names", "");
     let move_multiple = item_context_option(crate::assets::icons::FOLDER, "Move to…", "");
     let copy_to_multiple = item_context_option(crate::assets::icons::COPY, "Copy to…", "");
     let cut_multiple = item_context_option(crate::assets::icons::SCISSORS, "Cut", "Ctrl+X");
@@ -490,6 +553,7 @@ pub(in crate::ui) fn install_item_context_menu(
     multiple.append(&cut_multiple);
     multiple.append(&copy_multiple);
     multiple.append(&copy_paths);
+    multiple.append(&copy_names_button);
     multiple.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     multiple.append(&move_multiple);
     multiple.append(&copy_to_multiple);
@@ -507,7 +571,7 @@ pub(in crate::ui) fn install_item_context_menu(
     popover.add_css_class("folder-context-popover");
     bind_column_context_owner(state, &popover, depth);
 
-    let target = Rc::new(RefCell::new(None::<(usize, FileEntry)>));
+    let target = Rc::new(RefCell::new(None::<ContextTarget>));
     let open_with_selection = Rc::new(RefCell::new(None::<OpenWithSelection>));
     let open_with_generation = Rc::new(Cell::new(0_u64));
     let generation_for_close = open_with_generation.clone();
@@ -522,14 +586,20 @@ pub(in crate::ui) fn install_item_context_menu(
         if let Some(popover) = open_popover.upgrade() {
             popover.popdown();
         }
-        let Some((position, _)) = open_target.borrow().clone() else {
+        let Some((position, entry)) = open_target.borrow().clone() else {
             return;
         };
         if let Some(state) = weak.upgrade() {
-            if state.mode_views.borrow().mode() == BrowserMode::Columns {
-                state.browser.activate(depth, position);
+            if let Some(position) = current_context_position(&state, depth, position, &entry) {
+                if state.mode_views.borrow().mode() == BrowserMode::Columns {
+                    state.browser.activate(depth, position);
+                } else {
+                    state.browser.activate_in_place(depth, position);
+                }
+            } else if entry.is_directory() {
+                state.browser.navigate(entry.location);
             } else {
-                state.browser.activate_in_place(depth, position);
+                state.browser.open_location(entry.location);
             }
         }
     });
@@ -631,7 +701,7 @@ pub(in crate::ui) fn install_item_context_menu(
         if let Some(state) = weak.upgrade()
             && !entry.is_directory()
         {
-            state.browser.preview(depth, position);
+            preview_context_entry(&state, depth, position, entry);
         }
     });
     let weak = Rc::downgrade(state);
@@ -697,20 +767,33 @@ pub(in crate::ui) fn install_item_context_menu(
         }
     });
     let weak = Rc::downgrade(state);
+    let copy_name_target = target.clone();
+    let copy_name_popover = popover.downgrade();
+    copy_name.connect_clicked(move |_| {
+        if let Some(popover) = copy_name_popover.upgrade() {
+            popover.popdown();
+        }
+        let Some((_, entry)) = copy_name_target.borrow().clone() else {
+            return;
+        };
+        if weak.upgrade().is_some() {
+            copy_names(&[entry]);
+        }
+    });
+    let weak = Rc::downgrade(state);
     let rename_target = target.clone();
     let rename_popover = popover.downgrade();
     rename.connect_clicked(move |_| {
         if let Some(popover) = rename_popover.upgrade() {
             popover.popdown();
         }
-        let Some((position, _)) = rename_target.borrow().clone() else {
+        let Some((position, entry)) = rename_target.borrow().clone() else {
             return;
         };
         let weak = weak.clone();
         glib::idle_add_local_once(move || {
             if let Some(state) = weak.upgrade() {
-                state.browser.select(depth, position);
-                state.begin_rename();
+                rename_context_entry(&state, depth, position, entry);
             }
         });
     });
@@ -782,6 +865,17 @@ pub(in crate::ui) fn install_item_context_menu(
         }
     });
     let weak = Rc::downgrade(state);
+    let names_target = target.clone();
+    let names_popover = popover.downgrade();
+    copy_names_button.connect_clicked(move |_| {
+        if let Some(popover) = names_popover.upgrade() {
+            popover.popdown();
+        }
+        if let Some(state) = weak.upgrade() {
+            copy_names(&context_entries(&state, &names_target));
+        }
+    });
+    let weak = Rc::downgrade(state);
     let customize_target = target.clone();
     let customize_popover = popover.downgrade();
     customize.connect_clicked(move |_| {
@@ -805,12 +899,26 @@ pub(in crate::ui) fn install_item_context_menu(
         );
     });
 
+    let context_view = widget.downgrade();
+    popover.connect_show(move |_| {
+        if let Some(view) = context_view.upgrade() {
+            view.add_css_class("context-selection");
+        }
+    });
+    let context_view = widget.downgrade();
+    popover.connect_closed(move |_| {
+        if let Some(view) = context_view.upgrade() {
+            view.remove_css_class("context-selection");
+        }
+    });
+
     let click = gtk::GestureClick::new();
     click.set_button(3);
+    // Claim secondary clicks before ListView's row gestures consume them.
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
     let weak_state = Rc::downgrade(state);
     let popover_for_reveal = popover.clone();
     let scroll_for_reveal = scroll.clone();
-    let selection = selection.clone();
     click.connect_pressed(move |gesture, _, x, y| {
         let Some(picked) = gesture
             .widget()
@@ -818,25 +926,15 @@ pub(in crate::ui) fn install_item_context_menu(
         else {
             return;
         };
-        let Some(filtered_position) = pick_position(&picked) else {
-            return;
-        };
-        let Some(resolved_position) = source_position(filtered_position) else {
-            return;
-        };
         let Some(state) = weak_state.upgrade() else {
             return;
         };
-        let Some(entry) = state.browser.entry_at(depth, resolved_position) else {
+        let Some((position, entry)) = resolve(&picked) else {
             return;
         };
         gesture.set_state(gtk::EventSequenceState::Claimed);
         state.browser.set_active_column(depth);
-        if !selection.is_selected(filtered_position) {
-            clear_other_selections();
-            selection.select_item(filtered_position, true);
-        }
-        target.replace(Some((resolved_position, entry.clone())));
+        target.replace(Some((position, entry.clone())));
         let entries = context_entries(&state, &target);
         let open_with_entries = entries.clone();
         open_with.set_visible(open_with_entries.len() == 1);
@@ -924,6 +1022,119 @@ pub(in crate::ui) fn install_item_context_menu(
     widget.add_controller(click);
 }
 
+fn current_context_position(
+    state: &ViewState,
+    depth: usize,
+    position: Option<usize>,
+    entry: &FileEntry,
+) -> Option<usize> {
+    position.filter(|position| {
+        state
+            .browser
+            .entry_at(depth, *position)
+            .is_some_and(|current| current.location == entry.location)
+    })
+}
+
+pub(super) fn preview_context_entry(
+    state: &Rc<ViewState>,
+    depth: usize,
+    position: Option<usize>,
+    entry: FileEntry,
+) {
+    if let Some(position) = current_context_position(state, depth, position, &entry) {
+        state.browser.preview(depth, position);
+    } else {
+        state.browser.request_preview(entry);
+    }
+}
+
+pub(super) fn rename_context_entry(
+    state: &Rc<ViewState>,
+    depth: usize,
+    position: Option<usize>,
+    entry: FileEntry,
+) {
+    if let Some(position) = current_context_position(state, depth, position, &entry) {
+        state.browser.select(depth, position);
+        let weak = Rc::downgrade(state);
+        // Selection queues collection focus; enter the editor after it settles.
+        glib::idle_add_local_once(move || {
+            if let Some(state) = weak.upgrade() {
+                state.begin_rename();
+            }
+        });
+        return;
+    }
+    use crate::ui::{
+        controls::{form_entry, modal_layout},
+        modal::{ModalHost, dismiss_modal_layer, modal_layer, submit_on_enter},
+    };
+    let Some(host) = ModalHost::blurred_for(&state.overlay) else {
+        return;
+    };
+    let layout = modal_layout(
+        crate::assets::icons::PENCIL,
+        "Rename",
+        &compact_display_path(&entry.location),
+        "Rename",
+    );
+    let field = form_entry();
+    field.set_text(&entry.display_name);
+    super::super::accessibility::set_label(&field, "Name");
+    layout.body.append(&field);
+    let confirm = layout.confirm.downgrade();
+    field.connect_changed(move |field| {
+        if let Some(confirm) = confirm.upgrade() {
+            confirm.set_sensitive(super::update_basename_validation(field));
+        }
+    });
+    let layer = modal_layer(
+        &layout.content,
+        &host.overlay,
+        host.blurred_root.clone(),
+        None,
+    );
+    let weak_layer = layer.downgrade();
+    let dismiss = Rc::new(move || {
+        if let Some(layer) = weak_layer.upgrade() {
+            dismiss_modal_layer(&layer, &host.overlay, host.blurred_root.as_ref());
+        }
+    });
+    for button in [&layout.cancel, &layout.close] {
+        let dismiss = dismiss.clone();
+        button.connect_clicked(move |_| dismiss());
+    }
+    let escape = gtk::EventControllerKey::new();
+    let dismiss_for_escape = dismiss.clone();
+    escape.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            dismiss_for_escape();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    layer.add_controller(escape);
+    submit_on_enter(&layout.body, &layout.confirm);
+    let weak = Rc::downgrade(state);
+    let field_for_submit = field.clone();
+    layout.confirm.connect_clicked(move |_| {
+        if super::update_basename_validation(&field_for_submit) {
+            let name = field_for_submit.text().to_string();
+            dismiss();
+            if let Some(state) = weak.upgrade() {
+                super::queue_rename(&state.browser, entry.clone(), name);
+            }
+        }
+    });
+    if let Some(overlay) = crate::ui::modal::window_overlay(&state.overlay) {
+        overlay.add_overlay(&layer);
+    }
+    field.grab_focus();
+    field.select_region(0, -1);
+}
+
 fn selected_items_summary(entries: &[FileEntry]) -> String {
     let mut names = entries
         .iter()
@@ -942,10 +1153,10 @@ fn selected_items_summary(entries: &[FileEntry]) -> String {
     names
 }
 
-fn context_entries(
-    state: &ViewState,
-    target: &RefCell<Option<(usize, FileEntry)>>,
-) -> Vec<FileEntry> {
+fn context_entries(state: &ViewState, target: &RefCell<Option<ContextTarget>>) -> Vec<FileEntry> {
+    if let Some((None, entry)) = target.borrow().as_ref() {
+        return vec![entry.clone()];
+    }
     state.sync_mode_selection();
     let entries = state.browser.selected_entries();
     let target = target.borrow();
@@ -966,7 +1177,7 @@ fn connect_selection_action(
     button: &gtk::Button,
     popover: &gtk::Popover,
     state: &Rc<ViewState>,
-    target: &Rc<RefCell<Option<(usize, FileEntry)>>>,
+    target: &Rc<RefCell<Option<ContextTarget>>>,
     run: impl Fn(&Rc<ViewState>, Vec<FileEntry>) + 'static,
 ) {
     let weak = Rc::downgrade(state);
@@ -987,7 +1198,7 @@ fn connect_context_extract(
     button: &gtk::Button,
     popover: &gtk::Popover,
     state: &Rc<ViewState>,
-    target: &Rc<RefCell<Option<(usize, FileEntry)>>>,
+    target: &Rc<RefCell<Option<ContextTarget>>>,
     pick_destination: bool,
 ) {
     let weak = Rc::downgrade(state);

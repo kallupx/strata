@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 //! Browser composition and public commands. Feature modules share this view's state and the
 //! application controller; they must not create independent navigation or operation state.
@@ -10,7 +10,7 @@ use crate::ui::browser::clipboard::{copy_locations, register_cut_view};
 use crate::ui::browser::collection::cancel_source;
 use crate::ui::browser::columns::{COLUMN_WIDTH, ColumnView};
 use crate::ui::browser::desktop::selected_terminal_location;
-use crate::ui::browser::inline_edit::{ActiveRename, PendingEntryRename};
+use crate::ui::browser::inline_edit::{ActiveRename, PendingEntryRename, PendingRename};
 use crate::ui::browser::location::{MountCredentials, is_breadcrumb_button_target};
 use crate::ui::browser::paths::{can_pin_entry, is_trash_location};
 use crate::ui::browser::peek::{PeekAnchor, PeekView};
@@ -46,25 +46,29 @@ mod properties;
 mod transfer;
 mod trash;
 
+pub(in crate::ui) use crate::ui::browser::clipboard::drag_icon_with_count;
 pub(super) use crate::ui::browser::clipboard::file_drag_content;
-pub(crate) use crate::ui::browser::clipboard::{file_drop_action, locations_from_file_list_value};
+pub(crate) use crate::ui::browser::clipboard::{
+    drag_actions_for_modifiers, file_drop_action, locations_from_file_list_value,
+};
 pub(crate) use crate::ui::browser::collection::{
     activate_recursive_search_result, bind_filter_query, debounce_filter_entry,
     detach_collection_view, focus_collection_item_when_allocated, focus_filter_entry,
     notify_filter_query, prepare_collection_inline_edit, recursive_search_activation_key,
-    scroll_collection_when_allocated, search_result_entry, search_result_navigation_position,
+    reveal_collection_after_layout, scroll_collection_when_allocated, search_result_entry,
+    search_result_navigation_position,
 };
 pub(super) use crate::ui::browser::columns::max_child_natural_width;
 pub(super) use crate::ui::browser::context_menu::{
-    install_folder_context_menu, install_item_context_menu,
+    install_folder_context_menu, install_item_context_menu, install_resolved_item_context_menu,
 };
 pub(super) use crate::ui::browser::desktop::{launch_terminal, open_location};
 pub(super) use crate::ui::browser::entry::{
     FOLDER_TYPE_GROUP, entry_filter, entry_icon, entry_model_value, format_file_size,
-    metadata_needs_fill, model_type_group,
+    metadata_needs_fill, model_type_group, rounded_size_and_unit,
 };
 pub(super) use crate::ui::browser::inline_edit::{
-    queue_rename, rename_stem_end, update_basename_validation,
+    queue_rename, rename_stem_end, reveal_rename_row, update_basename_validation,
 };
 pub(super) use crate::ui::browser::pane_header::{
     column_sort_direction_toggle, column_sort_menu, empty_trash_button, pane_new_folder_button,
@@ -153,6 +157,9 @@ pub(super) struct ViewState {
     interactive: bool,
     columns_click_activation: Cell<ClickActivation>,
     active_rename: RefCell<Option<ActiveRename>>,
+    pending_rename: RefCell<Option<PendingRename>>,
+    rename_generation: Cell<u64>,
+    rename_reveal_generation: Cell<u64>,
     pending_new_entry: RefCell<Option<Rc<PendingEntryRename>>>,
     file_progress_view: RefCell<Option<FileProgressView>>,
     pending_file_progress: RefCell<Option<glib::SourceId>>,
@@ -168,6 +175,7 @@ pub(super) struct ViewState {
     /// dialog opens once the entry it describes is actually loaded.
     pending_select_properties: Cell<bool>,
     pending_extract_retry: RefCell<Option<(FileEntry, Location)>>,
+    pending_archive_destination: RefCell<Option<Location>>,
     /// The entries a just-dispatched, non-permanent delete requested,
     /// snapshotted so a `CompletedWithErrors` response naming entries that
     /// failed only because the location doesn't support Trash can offer a
@@ -235,6 +243,8 @@ impl BrowserView {
             .vexpand(true)
             .build();
         scroller.add_css_class("fixed-scrollbar");
+        scroller.add_css_class("mode-scroll");
+        scroller.add_css_class("columns-scroll");
         let overlay = gtk::Overlay::new();
 
         let location_entry = gtk::Entry::builder()
@@ -301,6 +311,7 @@ impl BrowserView {
 
         let preferences = super::theme::ThemeManager::shared();
         let browser = Browser::with_preferences(source, preferences.sort_preferences());
+        browser.set_chooser_mode(!interactive);
         let preferences_for_sorting = preferences.clone();
         browser.observe_preferences(move |sorting| {
             preferences_for_sorting.set_sort_preferences(sorting);
@@ -338,6 +349,9 @@ impl BrowserView {
             interactive,
             columns_click_activation: Cell::new(ClickActivation::default()),
             active_rename: RefCell::new(None),
+            pending_rename: RefCell::new(None),
+            rename_generation: Cell::new(0),
+            rename_reveal_generation: Cell::new(0),
             pending_new_entry: RefCell::new(None),
             file_progress_view: RefCell::new(None),
             pending_file_progress: RefCell::new(None),
@@ -351,6 +365,7 @@ impl BrowserView {
             pending_transfer_selection: RefCell::new(None),
             pending_select_properties: Cell::new(false),
             pending_extract_retry: RefCell::new(None),
+            pending_archive_destination: RefCell::new(None),
             pending_delete_entries: RefCell::new(Vec::new()),
             pending_navigate: RefCell::new(None),
             pending_location_credentials: RefCell::new(None),
@@ -1126,13 +1141,29 @@ impl BrowserView {
             if selected.is_empty() {
                 return None;
             }
-            let position = selected.maximum();
             column
                 .search_results
                 .borrow()
-                .get(position as usize)
+                .get(selected.maximum() as usize)
                 .map(search_result_entry)
         })
+    }
+
+    pub fn selected_search_results(&self) -> Option<Vec<FileEntry>> {
+        if self.view_mode() != BrowserMode::Columns {
+            return self.state.mode_views.borrow().selected_search_results();
+        }
+        let depth = self.state.destination_depth()?;
+        let columns = self.state.columns.borrow();
+        let column = columns.get(depth)?;
+        column.search_handle.borrow().as_ref()?;
+        let results = column.search_results.borrow();
+        Some(
+            collection::bitset_positions(&column.selection.selection())
+                .into_iter()
+                .filter_map(|position| results.get(position as usize).map(search_result_entry))
+                .collect(),
+        )
     }
 
     pub fn item_view_has_focus(&self) -> bool {
@@ -1230,6 +1261,11 @@ impl BrowserView {
 }
 
 impl ViewState {
+    pub(in crate::ui) fn cancel_peek(&self) {
+        cancel_source(&self.pending_peek);
+        self.browser.close_peek();
+    }
+
     fn begin_global_activity(self: &Rc<Self>, label: impl Into<String>) -> GlobalActivity {
         let label = label.into();
         let id = self.global_activity.borrow_mut().begin(label.clone());
@@ -1272,6 +1308,7 @@ impl ViewState {
             };
             if state.pending_new_entry.borrow().is_some()
                 || state.active_rename.borrow().is_some()
+                || state.rename_operation_pending()
                 || state.mode_views.borrow().rename_is_active()
             {
                 return glib::ControlFlow::Continue;
