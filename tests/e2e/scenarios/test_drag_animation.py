@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
-"""Drag completion must not portray an accepted drop as source removal."""
+# SPDX-License-Identifier: MIT
 
 import time
 
@@ -77,8 +76,7 @@ def test_drag_completion_keeps_the_source_label_in_place(strata, outcome):
             connection.key(keysym("Escape"), False)
         connection.button(1, False)
         samples = []
-        # Sample inside the 240 ms exit animation, before the target's 300 ms
-        # transfer delay. GTK accepting MOVE is not filesystem completion.
+        # GTK accepts MOVE before the asynchronous transfer completes.
         for delay in (0.06, 0.12, 0.18):
             strata.wait(lambda: time.monotonic() >= released + delay, "the animation sample time")
             measurement = text_position(grab(), bounds)

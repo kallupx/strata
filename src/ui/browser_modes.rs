@@ -659,10 +659,15 @@ impl ModeViews {
             super::browser::prepare_collection_inline_edit(&section.view, position);
             section.bound_items.borrow().iter().find_map(|bound| {
                 let item = bound.item.upgrade()?;
-                (item.position() == position).then(|| bound.widget.upgrade())?
+                (item.position() == position).then(|| {
+                    bound
+                        .widget
+                        .upgrade()
+                        .map(|widget| (widget, section.view.clone(), position))
+                })?
             })
         });
-        let Some(widget) = widget else {
+        let Some((widget, collection, _)) = widget else {
             return false;
         };
         if !widget.is_mapped() || widget.width() <= 0 || pane.stack.is_transition_running() {
