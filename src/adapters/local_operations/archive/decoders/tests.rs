@@ -30,7 +30,7 @@ fn decode_fixture(
     match format {
         ArchiveFormat::Zip => {
             let file = fs::File::open(archive).map_err(super::archive_failed)?;
-            let mut archive = zip::ZipArchive::new(file).map_err(super::archive_failed)?;
+            let mut archive = zip::ZipArchive::new(file).map_err(super::zip_error)?;
             extract_zip_from_archive(&mut archive, destination, password, progress, &cancelled)
         }
         ArchiveFormat::SevenZ => extract_7z_from_reader(
