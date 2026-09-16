@@ -97,8 +97,9 @@ struct BoundRow {
     table: glib::WeakRef<gtk::Grid>,
 }
 
-struct VirtualPreviewState {
+pub(super) struct VirtualPreviewState {
     units: Rc<Vec<PreviewUnit>>,
+    wrapped: Cell<bool>,
     selection: Cell<Option<DocumentSelection>>,
     bound: RefCell<HashMap<usize, BoundRow>>,
     dragging: Cell<bool>,
@@ -109,20 +110,28 @@ struct VirtualPreviewState {
     pressed_link: RefCell<Option<String>>,
 }
 
-pub(super) fn rendered_document(layout: DocumentLayout, warnings: Vec<String>) -> gtk::Box {
+pub(super) fn rendered_document(
+    layout: DocumentLayout,
+    warnings: Vec<String>,
+    wrapped: bool,
+) -> (gtk::Box, Rc<VirtualPreviewState>) {
     let units = layout
         .units
         .into_iter()
         .map(PreviewUnit::Document)
         .collect();
-    virtual_preview(units, warnings, false).0
+    virtual_preview(units, warnings, false, wrapped)
 }
 
-pub(super) fn source_document(content: &str, truncated: bool) -> gtk::Box {
+pub(super) fn source_document(
+    content: &str,
+    truncated: bool,
+    wrapped: bool,
+) -> (gtk::Box, Rc<VirtualPreviewState>) {
     let content = normalize_preview_text(content);
     let (source, split_lines) = source_units(&content);
     let units = source.into_iter().map(PreviewUnit::Source).collect();
-    let (container, _) = virtual_preview(units, Vec::new(), true);
+    let (container, state) = virtual_preview(units, Vec::new(), true, wrapped);
     if truncated || split_lines {
         let message = match (truncated, split_lines) {
             (true, true) => {
@@ -139,7 +148,7 @@ pub(super) fn source_document(content: &str, truncated: bool) -> gtk::Box {
         notice.set_wrap(true);
         container.append(&notice);
     }
-    container
+    (container, state)
 }
 
 pub(super) fn use_virtual_source(content: &str) -> bool {
@@ -154,9 +163,11 @@ fn virtual_preview(
     units: Vec<PreviewUnit>,
     warnings: Vec<String>,
     source: bool,
+    wrapped: bool,
 ) -> (gtk::Box, Rc<VirtualPreviewState>) {
     let state = Rc::new(VirtualPreviewState {
         units: Rc::new(units),
+        wrapped: Cell::new(wrapped),
         selection: Cell::new(None),
         bound: RefCell::new(HashMap::new()),
         dragging: Cell::new(false),
@@ -201,6 +212,7 @@ fn virtual_preview(
             state_for_bind.units.len(),
             state_for_bind.units.clone(),
             document_tags_for_bind.as_ref(),
+            state_for_bind.wrapped.get(),
         );
         if !source && let Some(view) = bound.view.upgrade() {
             schedule_document_view_size(&view, row.width());
@@ -287,6 +299,60 @@ fn virtual_preview(
     (container, state)
 }
 
+impl VirtualPreviewState {
+    pub(super) fn set_wrapped(&self, wrapped: bool) {
+        if self.wrapped.replace(wrapped) == wrapped {
+            return;
+        }
+        for (index, bound) in self.bound.borrow().iter() {
+            let Some(view) = bound.view.upgrade() else {
+                continue;
+            };
+            match self.units.get(*index) {
+                Some(PreviewUnit::Document(_)) => {
+                    view.set_wrap_mode(document_wrap_mode(wrapped));
+                    let width = view.width();
+                    if width > 0 {
+                        size_document_text_view(&view, width);
+                    }
+                }
+                Some(PreviewUnit::Source(unit)) => {
+                    apply_source_view_wrap(&view, &normalize_preview_text(&unit.display), wrapped);
+                }
+                None => {}
+            }
+            if let Some(row) = bound.root.upgrade() {
+                row.queue_resize();
+            }
+        }
+    }
+}
+
+fn document_wrap_mode(wrapped: bool) -> gtk::WrapMode {
+    if wrapped {
+        gtk::WrapMode::WordChar
+    } else {
+        gtk::WrapMode::None
+    }
+}
+
+/// Source rows keep their horizontal scrolling unless wrapping is requested.
+fn apply_source_view_wrap(
+    view: &super::document_view::DocumentTextView,
+    text: &str,
+    wrapped: bool,
+) {
+    if wrapped {
+        view.set_hexpand(true);
+        view.set_size_request(-1, -1);
+        view.set_wrap_mode(gtk::WrapMode::WordChar);
+    } else {
+        view.set_hexpand(true);
+        view.set_wrap_mode(gtk::WrapMode::None);
+        set_text_view_content(view.upcast_ref(), text, view.right_margin());
+    }
+}
+
 fn bind_unit(
     row: &gtk::Box,
     unit: &PreviewUnit,
@@ -294,6 +360,7 @@ fn bind_unit(
     unit_count: usize,
     units: Rc<Vec<PreviewUnit>>,
     document_tags: Option<&gtk::TextTagTable>,
+    wrapped: bool,
 ) -> BoundRow {
     row.set_margin_top(if index == 0 { 12 } else { 0 });
     row.set_margin_bottom(if index + 1 == unit_count { 20 } else { 0 });
@@ -341,13 +408,14 @@ fn bind_unit(
                 units,
                 index,
                 document_tags.expect("rendered previews should share document text tags"),
+                wrapped,
             );
             let bound = BoundRow::default();
             bound.root.set(Some(row));
             bound.view.set(Some(&view));
             bound
         }
-        PreviewUnit::Source(unit) => bind_source_row(row, unit),
+        PreviewUnit::Source(unit) => bind_source_row(row, unit, wrapped),
     }
 }
 
@@ -357,14 +425,15 @@ fn bind_document_row(
     units: Rc<Vec<PreviewUnit>>,
     index: usize,
     document_tags: &gtk::TextTagTable,
+    wrapped: bool,
 ) -> super::document_view::DocumentTextView {
     let is_code = matches!(unit.kind, DocumentUnitKind::Code { .. });
     let view = if let Some(view) = reusable_document_view(row, is_code, unit) {
-        bind_document_text_view(&view, unit);
+        bind_document_text_view(&view, unit, wrapped);
         view
     } else {
         clear_box(row);
-        let view = document_text_view(unit, document_tags);
+        let view = document_text_view(unit, document_tags, wrapped);
         if is_code {
             let overlay = gtk::Overlay::new();
             overlay.add_css_class("preview-code-overlay");
@@ -420,7 +489,7 @@ fn document_uses_source_buffer(unit: &DocumentUnit) -> bool {
     })
 }
 
-fn bind_source_row(row: &gtk::Box, unit: &SourceUnit) -> BoundRow {
+fn bind_source_row(row: &gtk::Box, unit: &SourceUnit, wrapped: bool) -> BoundRow {
     let view = if let Some((numbers, view)) = source_row_views(row) {
         let numbers_text = source_line_numbers(unit);
         set_text_view_content(
@@ -431,6 +500,7 @@ fn bind_source_row(row: &gtk::Box, unit: &SourceUnit) -> BoundRow {
         let text = normalize_preview_text(&unit.display);
         set_text_view_content(view.upcast_ref(), &text, view.right_margin());
         view.set_selection_range(None);
+        apply_source_view_wrap(&view, &text, wrapped);
         view
     } else {
         clear_box(row);
@@ -438,6 +508,8 @@ fn bind_source_row(row: &gtk::Box, unit: &SourceUnit) -> BoundRow {
         line.add_css_class("preview-source-row");
         let numbers = source_line_numbers_view(unit);
         let view = plain_text_view(&unit.display, true);
+        let text = normalize_preview_text(&unit.display);
+        apply_source_view_wrap(&view, &text, wrapped);
         line.append(&numbers);
         line.append(&view);
         row.append(&line);
@@ -557,6 +629,7 @@ fn plain_text_view(text: &str, source: bool) -> super::document_view::DocumentTe
 fn document_text_view(
     unit: &DocumentUnit,
     document_tags: &gtk::TextTagTable,
+    wrapped: bool,
 ) -> super::document_view::DocumentTextView {
     let buffer = if document_uses_source_buffer(unit) {
         let buffer = sourceview5::Buffer::new(None);
@@ -578,11 +651,15 @@ fn document_text_view(
     view.set_focusable(false);
     view.add_css_class("preview-document");
     super::theme::register_document_view(&view);
-    bind_document_text_view(&view, unit);
+    bind_document_text_view(&view, unit, wrapped);
     view
 }
 
-fn bind_document_text_view(view: &super::document_view::DocumentTextView, unit: &DocumentUnit) {
+fn bind_document_text_view(
+    view: &super::document_view::DocumentTextView,
+    unit: &DocumentUnit,
+    wrapped: bool,
+) {
     let buffer = view.buffer();
     let text = normalize_preview_text(&unit.text);
     if let Ok(source_buffer) = buffer.clone().downcast::<sourceview5::Buffer>() {
@@ -612,11 +689,7 @@ fn bind_document_text_view(view: &super::document_view::DocumentTextView, unit: 
             .collect(),
     );
     view.set_selection_range(None);
-    view.set_wrap_mode(if is_code || !unit.wrap {
-        gtk::WrapMode::None
-    } else {
-        gtk::WrapMode::WordChar
-    });
+    view.set_wrap_mode(document_wrap_mode(wrapped));
     set_document_accessibility(view, unit);
 }
 

@@ -95,6 +95,7 @@ fn cross_row_selection_copies_full_middle_units_from_the_model() {
     ]);
     let state = VirtualPreviewState {
         units,
+        wrapped: std::cell::Cell::new(false),
         selection: std::cell::Cell::new(Some(DocumentSelection {
             anchor: SelectionPoint { unit: 0, offset: 6 },
             focus: SelectionPoint { unit: 2, offset: 4 },
@@ -120,6 +121,7 @@ fn selection_does_not_invent_newlines_between_line_chunks() {
     let units = Rc::new(vec![source("abcd", "abcd"), source("ef", "ef\n")]);
     let state = VirtualPreviewState {
         units,
+        wrapped: std::cell::Cell::new(false),
         selection: std::cell::Cell::new(Some(DocumentSelection {
             anchor: SelectionPoint { unit: 0, offset: 2 },
             focus: SelectionPoint { unit: 1, offset: 1 },
@@ -157,6 +159,7 @@ fn table_selection_is_atomic_and_copies_tsv() {
     })]);
     let state = VirtualPreviewState {
         units,
+        wrapped: std::cell::Cell::new(false),
         selection: std::cell::Cell::new(Some(DocumentSelection {
             anchor: SelectionPoint { unit: 0, offset: 0 },
             focus: SelectionPoint { unit: 0, offset: 1 },
@@ -310,7 +313,7 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
         line_count: 1,
         continuation: false,
     };
-    let first_view = bind_source_row(&row, &first)
+    let first_view = bind_source_row(&row, &first, false)
         .view
         .upgrade()
         .expect("source row should contain a text view");
@@ -321,7 +324,7 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
         line_count: 1,
         continuation: false,
     };
-    let second_view = bind_source_row(&row, &second)
+    let second_view = bind_source_row(&row, &second, false)
         .view
         .upgrade()
         .expect("source row should retain its text view");
@@ -362,10 +365,23 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
     ]);
     let document_tags = document_tag_table();
     let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let first_view = bind_document_row(&row, document(&units[0]), units.clone(), 0, &document_tags);
+    let first_view = bind_document_row(
+        &row,
+        document(&units[0]),
+        units.clone(),
+        0,
+        &document_tags,
+        false,
+    );
     let first_buffer = first_view.buffer();
-    let second_view =
-        bind_document_row(&row, document(&units[1]), units.clone(), 1, &document_tags);
+    let second_view = bind_document_row(
+        &row,
+        document(&units[1]),
+        units.clone(),
+        1,
+        &document_tags,
+        false,
+    );
     assert_eq!(first_view, second_view);
     assert_eq!(first_buffer, second_view.buffer());
     assert_eq!(
@@ -386,7 +402,14 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
     assert!(tag_names.iter().any(|name| name == "document-heading-2"));
     assert!(tag_names.iter().any(|name| name == "document-bold"));
     assert_eq!(second_view.accessible_role(), gtk::AccessibleRole::Heading);
-    let third_view = bind_document_row(&row, document(&units[2]), units.clone(), 2, &document_tags);
+    let third_view = bind_document_row(
+        &row,
+        document(&units[2]),
+        units.clone(),
+        2,
+        &document_tags,
+        false,
+    );
     assert_eq!(second_view, third_view);
     assert_eq!(third_view.accessible_role(), gtk::AccessibleRole::Generic);
     let third_tag_names = third_view
@@ -408,6 +431,7 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
         units.clone(),
         0,
         &document_tags,
+        false,
     );
     assert_eq!(
         third_view.buffer().tag_table(),
@@ -426,8 +450,8 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
         first: true,
         last: true,
     };
-    let rust_view = document_text_view(&code("rust", "let value = 1;"), &document_tags);
-    let python_view = document_text_view(&code("python3", "value = 1"), &document_tags);
+    let rust_view = document_text_view(&code("rust", "let value = 1;"), &document_tags, false);
+    let python_view = document_text_view(&code("python3", "value = 1"), &document_tags, false);
     let rust_buffer = rust_view
         .buffer()
         .downcast::<sourceview5::Buffer>()
@@ -493,7 +517,9 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
             units: vec![unit("first"), unit("second")],
         },
         Vec::new(),
-    );
+        false,
+    )
+    .0;
     let weak = root.downgrade();
 
     drop(root);
@@ -503,7 +529,7 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
 
     assert!(weak.upgrade().is_none());
 
-    let source_root = source_document(&"x".repeat(1024 * 1024), false);
+    let source_root = source_document(&"x".repeat(1024 * 1024), false, false).0;
     let weak_source = source_root.downgrade();
     drop(source_root);
     while gtk::glib::MainContext::default().pending() {
@@ -527,7 +553,7 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
     let content = "<table><tr><td>cell</td></tr></table>".repeat(300);
     let (source, _) = source_units(&content);
     let units = source.into_iter().map(PreviewUnit::Source).collect();
-    let (source_root, source_state) = super::virtual_preview(units, Vec::new(), true);
+    let (source_root, source_state) = super::virtual_preview(units, Vec::new(), true, false);
     stack.add_named(&source_root, Some("source"));
     stack.set_visible_child_name("source");
     while gtk::glib::MainContext::default().pending() {
@@ -560,8 +586,12 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
         PreviewUnit::Document(unit("Safe text remains visible.")),
         PreviewUnit::Document(code),
     ];
-    let (rendered_root, rendered_state) =
-        super::virtual_preview(units, vec!["Unsupported content omitted".to_owned()], false);
+    let (rendered_root, rendered_state) = super::virtual_preview(
+        units,
+        vec!["Unsupported content omitted".to_owned()],
+        false,
+        false,
+    );
     stack.add_named(&rendered_root, Some("rendered-again"));
     stack.set_visible_child_name("rendered-again");
     while gtk::glib::MainContext::default().pending() {
@@ -575,6 +605,118 @@ fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
         assert!(view.buffer().char_count() > 0);
     }
     window.close();
+}
+
+#[test]
+fn wrap_toggle_reflows_bound_rendered_and_source_rows() {
+    crate::test_support::gtk_test(
+        "ui::virtual_preview::tests::wrap_toggle_reflows_bound_rendered_and_source_rows",
+        || {
+            let stack = gtk::Stack::new();
+            let window = gtk::Window::builder()
+                .default_width(500)
+                .default_height(500)
+                .child(&stack)
+                .build();
+            window.present();
+            pump_main_context();
+
+            let paragraph = DocumentUnit {
+                kind: DocumentUnitKind::Paragraph,
+                text: "A paragraph wide enough to overflow the preview while the toggle is off."
+                    .to_owned(),
+                copy_text:
+                    "A paragraph wide enough to overflow the preview while the toggle is off.\n"
+                        .to_owned(),
+                spans: Vec::new(),
+                wrap: true,
+                first: true,
+                last: true,
+            };
+            let code = DocumentUnit {
+                kind: DocumentUnitKind::Code {
+                    list_depth: None,
+                    language: None,
+                },
+                text: "let value = 1;".to_owned(),
+                copy_text: "let value = 1;\n".to_owned(),
+                spans: Vec::new(),
+                wrap: true,
+                first: true,
+                last: true,
+            };
+            let (rendered, rendered_state) = rendered_document(
+                DocumentLayout {
+                    units: vec![paragraph, code],
+                },
+                Vec::new(),
+                false,
+            );
+            stack.add_named(&rendered, Some("rendered"));
+            stack.set_visible_child_name("rendered");
+            pump_main_context();
+
+            assert_eq!(
+                wrap_modes(&rendered_state),
+                vec![gtk::WrapMode::None, gtk::WrapMode::None]
+            );
+            rendered_state.set_wrapped(true);
+            assert_eq!(
+                wrap_modes(&rendered_state),
+                vec![gtk::WrapMode::WordChar, gtk::WrapMode::WordChar]
+            );
+            rendered_state.set_wrapped(false);
+            assert_eq!(
+                wrap_modes(&rendered_state),
+                vec![gtk::WrapMode::None, gtk::WrapMode::None]
+            );
+
+            let (source, source_state) = source_document("first\nsecond\nthird\n", false, false);
+            stack.add_named(&source, Some("source"));
+            stack.set_visible_child_name("source");
+            pump_main_context();
+            assert!(!source_state.bound.borrow().is_empty());
+            assert!(
+                wrap_modes(&source_state)
+                    .iter()
+                    .all(|mode| *mode == gtk::WrapMode::None)
+            );
+            source_state.set_wrapped(true);
+            assert!(
+                wrap_modes(&source_state)
+                    .iter()
+                    .all(|mode| *mode == gtk::WrapMode::WordChar)
+            );
+            window.close();
+        },
+    );
+}
+
+fn pump_main_context() {
+    let context = gtk::glib::MainContext::default();
+    while context.pending() {
+        context.iteration(false);
+    }
+}
+
+fn wrap_modes(state: &VirtualPreviewState) -> Vec<gtk::WrapMode> {
+    let mut rows = state
+        .bound
+        .borrow()
+        .iter()
+        .map(|(index, bound)| {
+            (
+                *index,
+                bound
+                    .view
+                    .upgrade()
+                    .expect("bound rows should hold a text view")
+                    .wrap_mode(),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(index, _)| *index);
+    rows.into_iter().map(|(_, mode)| mode).collect()
 }
 
 fn document(unit: &PreviewUnit) -> &DocumentUnit {

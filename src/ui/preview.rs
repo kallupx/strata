@@ -95,6 +95,7 @@ struct PendingSourcePreview {
 struct SourcePreviewView {
     view: sourceview5::View,
     scroll: RefCell<Option<gtk::ScrolledWindow>>,
+    virtual_state: RefCell<Option<Rc<super::virtual_preview::VirtualPreviewState>>>,
     generation: Rc<Cell<u64>>,
 }
 
@@ -102,6 +103,7 @@ struct DocumentPreview {
     stack: gtk::Stack,
     source: Option<PendingSourcePreview>,
     rendered: Option<(DocumentLayout, Vec<String>)>,
+    rendered_state: RefCell<Option<Rc<super::virtual_preview::VirtualPreviewState>>>,
     render_pending: bool,
 }
 
@@ -1040,6 +1042,9 @@ impl PreviewState {
                 truncated,
             } => {
                 self.print.set_visible(true);
+                self.wrap.set_visible(true);
+                self.wrap
+                    .set_active(super::theme::ThemeManager::shared().preview_text_wrap());
                 self.render_document_preview(
                     PendingSourcePreview {
                         entry: preview.entry,
@@ -1164,6 +1169,7 @@ impl PreviewState {
             stack: stack.clone(),
             source: Some(source),
             rendered: document.map(|document| (document, warnings)),
+            rendered_state: RefCell::new(None),
             render_pending,
         }));
         self.content.append(&stack);
@@ -1200,7 +1206,11 @@ impl PreviewState {
                     view
                 }),
                 DocumentView::Rendered => preview.rendered.take().map(|(document, warnings)| {
-                    super::virtual_preview::rendered_document(document, warnings).upcast()
+                    let wrapped = super::theme::ThemeManager::shared().preview_text_wrap();
+                    let (view, state) =
+                        super::virtual_preview::rendered_document(document, warnings, wrapped);
+                    preview.rendered_state.replace(Some(state));
+                    view.upcast()
                 }),
             };
             let Some(child) = child else {
@@ -1773,6 +1783,7 @@ impl PreviewState {
     fn clear_content(&self) {
         self.source_preview.cancel();
         self.source_preview.scroll.borrow_mut().take();
+        self.source_preview.virtual_state.borrow_mut().take();
         self.document_view_button.set_visible(false);
         self.document_preview.borrow_mut().take();
         self.stop_media();
@@ -1787,11 +1798,11 @@ impl PreviewState {
     }
 
     fn apply_text_wrap(&self, wrapped: bool) {
-        if let Some(view) = self.text_view.borrow().as_ref() {
-            view.set_wrap_mode(text_wrap_mode(wrapped));
-        }
-        if let Some(scroll) = self.text_scroll.borrow().as_ref() {
-            scroll.set_hscrollbar_policy(text_hscroll_policy(wrapped));
+        self.source_preview.set_wrapped(wrapped);
+        if let Some(preview) = self.document_preview.borrow().as_ref()
+            && let Some(state) = preview.rendered_state.borrow().as_ref()
+        {
+            state.set_wrapped(wrapped);
         }
     }
 
@@ -2097,6 +2108,7 @@ impl SourcePreviewView {
         Self {
             view,
             scroll: RefCell::new(None),
+            virtual_state: RefCell::new(None),
             generation: Rc::new(Cell::new(0)),
         }
     }
@@ -2110,6 +2122,7 @@ impl SourcePreviewView {
     ) -> (gtk::Widget, bool) {
         self.cancel();
         self.scroll.borrow_mut().take();
+        self.virtual_state.borrow_mut().take();
         if let Some(parent) = self.view.parent() {
             if let Ok(scroll) = parent.downcast::<gtk::ScrolledWindow>() {
                 scroll.set_child(None::<&gtk::Widget>);
@@ -2118,10 +2131,11 @@ impl SourcePreviewView {
             }
         }
         if super::virtual_preview::use_virtual_source(content) {
-            return (
-                super::virtual_preview::source_document(content, truncated).upcast(),
-                true,
-            );
+            let wrapped = super::theme::ThemeManager::shared().preview_text_wrap();
+            let (container, state) =
+                super::virtual_preview::source_document(content, truncated, wrapped);
+            self.virtual_state.replace(Some(state));
+            return (container.upcast(), true);
         }
         let display = normalize_preview_text(content).into_owned();
         let buffer = sourceview5::Buffer::new(None);
@@ -2152,6 +2166,16 @@ impl SourcePreviewView {
             .build();
         self.scroll.replace(Some(scroll.clone()));
         (scroll.upcast(), false)
+    }
+
+    fn set_wrapped(&self, wrapped: bool) {
+        self.view.set_wrap_mode(text_wrap_mode(wrapped));
+        if let Some(scroll) = self.scroll.borrow().as_ref() {
+            scroll.set_hscrollbar_policy(text_hscroll_policy(wrapped));
+        }
+        if let Some(state) = self.virtual_state.borrow().as_ref() {
+            state.set_wrapped(wrapped);
+        }
     }
 
     fn cancel(&self) {
