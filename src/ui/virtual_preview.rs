@@ -17,7 +17,7 @@ use crate::services::{
 };
 
 const SOURCE_UNIT_BYTES: usize = 16 * 1024;
-const SOURCE_UNIT_LINES: usize = 256;
+const SOURCE_UNIT_LINES: usize = 64;
 const PATHOLOGICAL_TEXT_UNIT_BYTES: usize = 2 * 1024;
 const TABLE_CELL_DISPLAY_BYTES: usize = 512;
 const VIRTUAL_ROW_MIN_HEIGHT: i32 = 16;
