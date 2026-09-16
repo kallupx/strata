@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 use std::{
     ffi::OsStr,
@@ -348,7 +348,7 @@ fn parse_document_with_limits(
     validate_document(parsed, limits)
 }
 
-/// Parses release notes through the same Markdown model without changing their legacy limits.
+// Release notes retain their legacy unbounded parser limits.
 pub fn parse_markdown(markdown: &str) -> Document {
     let cancellation = Cancellation::default();
     let limits = ParseLimits {
@@ -382,6 +382,8 @@ fn parse_markdown_bounded(
     let mut table_cell: Option<String> = None;
     let mut table_depth = None;
     let mut raw_html = false;
+    let mut completed_markup = 0usize;
+    let mut completed_blocks = 0;
     let mut options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     if document_features {
         options |= Options::ENABLE_TABLES;
@@ -677,6 +679,25 @@ fn parse_markdown_bounded(
         }
         if matches!(event, Event::End(_)) {
             budget.leave();
+        }
+        completed_markup += blocks[completed_blocks..]
+            .iter()
+            .map(block_markup_bytes)
+            .sum::<usize>();
+        completed_blocks = blocks.len();
+        if table_row
+            .as_ref()
+            .is_some_and(|row| row.len() > limits.table_cells)
+        {
+            return Err("Rendered preview exceeded the 512-cell limit for one table".to_owned());
+        }
+        let pending_markup = active.as_ref().map_or(0, |block| block.markup().len())
+            + table_cell.as_ref().map_or(0, String::len)
+            + table_row.as_ref().map_or(0, |row| {
+                row.iter().map(|cell| cell.markup.len()).sum::<usize>()
+            });
+        if completed_markup.saturating_add(pending_markup) > limits.markup {
+            return Err("Rendered preview exceeded the 4 MB markup limit".to_owned());
         }
     }
     finish_block(&mut active, &mut blocks);

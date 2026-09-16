@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 use std::{
     cell::{Cell, RefCell},
@@ -20,6 +20,7 @@ const SOURCE_UNIT_BYTES: usize = 16 * 1024;
 const SOURCE_UNIT_LINES: usize = 64;
 const PATHOLOGICAL_TEXT_UNIT_BYTES: usize = 2 * 1024;
 const TABLE_CELL_DISPLAY_BYTES: usize = 512;
+const TABLE_CELL_MARKUP_BYTES: usize = 16 * 1024;
 const VIRTUAL_ROW_MIN_HEIGHT: i32 = 16;
 const AUTOSCROLL_EDGE: f64 = 36.0;
 
@@ -50,7 +51,11 @@ impl PreviewUnit {
                 kind: DocumentUnitKind::Table { .. },
                 ..
             }) => 1,
-            _ => self.display_text().chars().count(),
+            _ => self
+                .display_text()
+                .chars()
+                .count()
+                .max(usize::from(!self.copy_text().is_empty())),
         }
     }
 }
@@ -338,7 +343,6 @@ fn document_wrap_mode(wrapped: bool) -> gtk::WrapMode {
     }
 }
 
-/// Source rows keep their horizontal scrolling unless wrapping is requested.
 fn apply_source_view_wrap(
     view: &super::document_view::DocumentTextView,
     text: &str,
@@ -1061,8 +1065,13 @@ fn bind_document_table(table: &gtk::Grid, rows: &[Vec<DocumentTableCellLayout>])
                 label.set_tooltip_text(Some(
                     "Cell shortened for responsive preview; copying the table keeps the complete text.",
                 ));
+            } else if let Some(markup) = styled_markup(&cell.text, &cell.spans) {
+                label.set_markup(&markup);
             } else {
-                label.set_markup(&styled_markup(&cell.text, &cell.spans));
+                label.set_text(&cell.text);
+                label.set_tooltip_text(Some(
+                    "Cell formatting omitted for responsive preview; copying keeps the complete text.",
+                ));
             }
             if cell.header {
                 label.add_css_class("header");
@@ -1100,7 +1109,7 @@ fn open_web_link(uri: &str, parent: &impl IsA<gtk::Widget>) {
     }
 }
 
-fn styled_markup(text: &str, spans: &[DocumentSpan]) -> String {
+fn styled_markup(text: &str, spans: &[DocumentSpan]) -> Option<String> {
     let mut events = Vec::with_capacity(spans.len() * 2);
     for (index, span) in spans.iter().enumerate() {
         events.push((span.range.start, false, index));
@@ -1118,11 +1127,12 @@ fn styled_markup(text: &str, spans: &[DocumentSpan]) -> String {
     let mut event = 0;
     while event < events.len() {
         let position = events[event].0.min(boundaries.len().saturating_sub(1));
-        output.push_str(&glib::markup_escape_text(
-            &text[boundaries[cursor]..boundaries[position]],
-        ));
+        append_table_markup(
+            &mut output,
+            &glib::markup_escape_text(&text[boundaries[cursor]..boundaries[position]]),
+        )?;
         for index in active.iter().rev() {
-            output.push_str(span_close(&spans[*index].style));
+            append_table_markup(&mut output, span_close(&spans[*index].style))?;
         }
         while event < events.len() && events[event].0 == position && events[event].1 {
             active.remove(&events[event].2);
@@ -1133,15 +1143,26 @@ fn styled_markup(text: &str, spans: &[DocumentSpan]) -> String {
             event += 1;
         }
         for index in &active {
-            output.push_str(&span_open(&spans[*index].style));
+            append_table_markup(&mut output, &span_open(&spans[*index].style))?;
         }
         cursor = position;
     }
-    output.push_str(&glib::markup_escape_text(&text[boundaries[cursor]..]));
+    append_table_markup(
+        &mut output,
+        &glib::markup_escape_text(&text[boundaries[cursor]..]),
+    )?;
     for index in active.iter().rev() {
-        output.push_str(span_close(&spans[*index].style));
+        append_table_markup(&mut output, span_close(&spans[*index].style))?;
     }
-    output
+    Some(output)
+}
+
+fn append_table_markup(output: &mut String, markup: &str) -> Option<()> {
+    if output.len().saturating_add(markup.len()) > TABLE_CELL_MARKUP_BYTES {
+        return None;
+    }
+    output.push_str(markup);
+    Some(())
 }
 
 fn span_open(style: &DocumentSpanStyle) -> String {
@@ -1692,8 +1713,12 @@ fn update_bound_selection(state: &VirtualPreviewState, index: usize) {
             buffer.remove_tag(tag, &buffer_start, &buffer_end);
         }
         if let Some((start, end)) = range.filter(|(start, end)| start < end) {
-            let start = i32::try_from(start).unwrap_or(i32::MAX);
-            let end = i32::try_from(end).unwrap_or(i32::MAX);
+            let start = i32::try_from(start)
+                .unwrap_or(i32::MAX)
+                .min(buffer.char_count());
+            let end = i32::try_from(end)
+                .unwrap_or(i32::MAX)
+                .min(buffer.char_count());
             view.set_selection_range(Some((start, end)));
             if let Some(tag) = selection_tag.as_ref() {
                 buffer.apply_tag(

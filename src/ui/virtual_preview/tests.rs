@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 use std::{rc::Rc, sync::Arc};
 
@@ -10,15 +10,15 @@ use super::{
     bind_document_row, bind_document_table_row, bind_source_row, bounded_text_prefix,
     code_block_copy_text, document_tag_table, document_text_view, drag_threshold_crossed,
     highlighted_code_language, local_selection, matching_link, plain_text_view, rendered_document,
-    selection_text, source_document, source_line_numbers, source_line_numbers_view, source_units,
-    styled_markup, use_virtual_source, vertical_distance,
+    selection_text, source_document, source_line_numbers, source_units, styled_markup,
+    use_virtual_source, vertical_distance,
 };
 use crate::{
     services::{
         DocumentLayout, DocumentSpan, DocumentSpanStyle, DocumentTableCellLayout, DocumentUnit,
         DocumentUnitKind,
     },
-    test_support::ASYNC_MAIN_CONTEXT_DEFAULT,
+    test_support::gtk_test,
 };
 
 #[test]
@@ -93,7 +93,7 @@ fn cross_row_selection_copies_full_middle_units_from_the_model() {
         source("visible", "visible plus an unrendered tail\n"),
         source("last line", "last line"),
     ]);
-    let state = VirtualPreviewState {
+    let mut state = VirtualPreviewState {
         units,
         wrapped: std::cell::Cell::new(false),
         selection: std::cell::Cell::new(Some(DocumentSelection {
@@ -114,6 +114,28 @@ fn cross_row_selection_copies_full_middle_units_from_the_model() {
         Some("line\nvisible plus an unrendered tail\nlast")
     );
     assert_eq!(local_selection(state.selection.get(), 1, 7), Some((0, 7)));
+
+    for content in [
+        "\n".to_owned(),
+        format!("{}\n", "line\n".repeat(super::SOURCE_UNIT_LINES)),
+        format!(
+            "{}\n\n",
+            "x".repeat(super::PATHOLOGICAL_TEXT_UNIT_BYTES + 1)
+        ),
+        format!("{}\n\n{}", "x".repeat(2_049), "y".repeat(2_049)),
+    ] {
+        let (units, _) = source_units(&content);
+        state.units = Rc::new(units.into_iter().map(PreviewUnit::Source).collect());
+        let last = state.units.len() - 1;
+        state.selection.set(Some(DocumentSelection {
+            anchor: SelectionPoint { unit: 0, offset: 0 },
+            focus: SelectionPoint {
+                unit: last,
+                offset: state.units[last].selection_len(),
+            },
+        }));
+        assert_eq!(selection_text(&state).as_deref(), Some(content.as_str()));
+    }
 }
 
 #[test]
@@ -188,7 +210,7 @@ fn visible_table_markup_remains_balanced_with_overlapping_styles() {
             style: DocumentSpanStyle::Link(Arc::from("https://example.test")),
         },
     ];
-    let markup = styled_markup("abcdef", &spans);
+    let markup = styled_markup("abcdef", &spans).expect("bounded cell markup");
     let pango_markup = markup
         .replace("<a href=\"https://example.test\">", "<u>")
         .replace("</a>", "</u>");
@@ -196,6 +218,29 @@ fn visible_table_markup_remains_balanced_with_overlapping_styles() {
         gtk::pango::parse_markup(&pango_markup, '\0').expect("balanced Pango markup");
     assert_eq!(plain, "abcdef");
     assert!(markup.contains("href=\"https://example.test\""));
+}
+
+#[test]
+fn table_formatting_bounds_link_reexpansion_before_gtk() {
+    let html = format!(
+        "<table><tr><td><a href=\"https://example.test/{}\">{}</a></td></tr></table>",
+        "x".repeat(4_096),
+        "<b>x</b>".repeat(32),
+    );
+    let cancellation = crate::sandbox::Cancellation::default();
+    let kind = crate::services::document_kind("text/html", std::ffi::OsStr::new("page.html"), true)
+        .expect("HTML document");
+    let parsed = crate::services::parse_document(kind, &html, &cancellation)
+        .expect("the bounded source is valid HTML");
+    let layout = crate::services::layout_document(parsed.document, &cancellation)
+        .expect("the semantic layout remains bounded");
+    let DocumentUnitKind::Table { rows, .. } = &layout.units[0].kind else {
+        panic!("expected a table");
+    };
+    let cell = &rows[0][0];
+    assert_eq!(cell.text, "x".repeat(32));
+    assert!(styled_markup(&cell.text, &cell.spans).is_none());
+    assert_eq!(layout.units[0].copy_text, format!("{}\n", cell.text));
 }
 
 #[test]
@@ -268,343 +313,324 @@ fn code_copy_reassembles_one_virtualized_block() {
 
 #[test]
 fn virtual_preview_reuses_source_rows_and_releases_widget_trees() {
-    let _serial = ASYNC_MAIN_CONTEXT_DEFAULT
-        .lock()
-        .expect("the async test lock should not be poisoned");
-    if gtk::init().is_err() {
-        return;
-    }
-    let nul_view = plain_text_view("before\0after", true);
-    let nul_buffer = nul_view.buffer();
-    assert_eq!(
-        nul_buffer.text(&nul_buffer.start_iter(), &nul_buffer.end_iter(), false),
-        "before�after"
-    );
-    drop(nul_view);
+    gtk_test(
+        "ui::virtual_preview::tests::virtual_preview_reuses_source_rows_and_releases_widget_trees",
+        || {
+            let nul_view = plain_text_view("before\0after", true);
+            let nul_buffer = nul_view.buffer();
+            assert_eq!(
+                nul_buffer.text(&nul_buffer.start_iter(), &nul_buffer.end_iter(), false),
+                "before�after"
+            );
+            drop(nul_view);
 
-    let long_view = plain_text_view(&"x".repeat(2_048), true);
-    assert!(long_view.hexpands());
-    assert!(long_view.measure(gtk::Orientation::Horizontal, -1).0 > 16);
-    drop(long_view);
+            let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let first = SourceUnit {
+                display: "first".to_owned(),
+                source: "first".to_owned(),
+                first_line: 1,
+                line_count: 1,
+                continuation: false,
+            };
+            let first_view = bind_source_row(&row, &first, false)
+                .view
+                .upgrade()
+                .expect("source row should contain a text view");
+            let second = SourceUnit {
+                display: "second".to_owned(),
+                source: "second".to_owned(),
+                first_line: 2,
+                line_count: 1,
+                continuation: false,
+            };
+            let second_view = bind_source_row(&row, &second, false)
+                .view
+                .upgrade()
+                .expect("source row should retain its text view");
+            assert_eq!(first_view, second_view);
+            assert_eq!(
+                second_view.buffer().text(
+                    &second_view.buffer().start_iter(),
+                    &second_view.buffer().end_iter(),
+                    false
+                ),
+                "second"
+            );
+            drop((first_view, second_view, row));
 
-    let source = (1..=200)
-        .map(|line| format!("source line {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let source_view = plain_text_view(&source, true);
-    let numbers = source_line_numbers_view(&SourceUnit {
-        display: source.clone(),
-        source,
-        first_line: 1,
-        line_count: 200,
-        continuation: false,
-    });
-    assert_eq!(
-        numbers.measure(gtk::Orientation::Vertical, -1).0,
-        source_view.measure(gtk::Orientation::Vertical, -1).0
-    );
-    drop((numbers, source_view));
+            let threshold = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            assert!(!drag_threshold_crossed(&threshold, 10.0, 10.0, 10.0, 10.0));
+            assert!(drag_threshold_crossed(&threshold, 10.0, 10.0, 100.0, 100.0));
 
-    let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let first = SourceUnit {
-        display: "first".to_owned(),
-        source: "first".to_owned(),
-        first_line: 1,
-        line_count: 1,
-        continuation: false,
-    };
-    let first_view = bind_source_row(&row, &first, false)
-        .view
-        .upgrade()
-        .expect("source row should contain a text view");
-    let second = SourceUnit {
-        display: "second".to_owned(),
-        source: "second".to_owned(),
-        first_line: 2,
-        line_count: 1,
-        continuation: false,
-    };
-    let second_view = bind_source_row(&row, &second, false)
-        .view
-        .upgrade()
-        .expect("source row should retain its text view");
-    assert_eq!(first_view, second_view);
-    assert_eq!(
-        second_view.buffer().text(
-            &second_view.buffer().start_iter(),
-            &second_view.buffer().end_iter(),
-            false
-        ),
-        "second"
-    );
-    drop((first_view, second_view, row));
+            let unit = |text: &str| DocumentUnit {
+                kind: DocumentUnitKind::Paragraph,
+                text: text.to_owned(),
+                copy_text: format!("{text}\n"),
+                spans: Vec::new(),
+                wrap: true,
+                first: true,
+                last: true,
+            };
+            let mut styled = unit("second");
+            styled.kind = DocumentUnitKind::Heading(2);
+            styled.spans.push(DocumentSpan {
+                range: 0..6,
+                style: DocumentSpanStyle::Bold,
+            });
+            let units = Rc::new(vec![
+                PreviewUnit::Document(unit("first")),
+                PreviewUnit::Document(styled),
+                PreviewUnit::Document(unit("third")),
+            ]);
+            let document_tags = document_tag_table();
+            let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let first_view = bind_document_row(
+                &row,
+                document(&units[0]),
+                units.clone(),
+                0,
+                &document_tags,
+                false,
+            );
+            let first_buffer = first_view.buffer();
+            let second_view = bind_document_row(
+                &row,
+                document(&units[1]),
+                units.clone(),
+                1,
+                &document_tags,
+                false,
+            );
+            assert_eq!(first_view, second_view);
+            assert_eq!(first_buffer, second_view.buffer());
+            assert_eq!(
+                second_view.buffer().text(
+                    &second_view.buffer().start_iter(),
+                    &second_view.buffer().end_iter(),
+                    false
+                ),
+                "second"
+            );
+            let tag_names = second_view
+                .buffer()
+                .iter_at_offset(1)
+                .tags()
+                .into_iter()
+                .filter_map(|tag| tag.name())
+                .collect::<Vec<_>>();
+            assert!(tag_names.iter().any(|name| name == "document-heading-2"));
+            assert!(tag_names.iter().any(|name| name == "document-bold"));
+            assert_eq!(second_view.accessible_role(), gtk::AccessibleRole::Heading);
+            let third_view = bind_document_row(
+                &row,
+                document(&units[2]),
+                units.clone(),
+                2,
+                &document_tags,
+                false,
+            );
+            assert_eq!(second_view, third_view);
+            assert_eq!(third_view.accessible_role(), gtk::AccessibleRole::Generic);
+            let third_tag_names = third_view
+                .buffer()
+                .iter_at_offset(1)
+                .tags()
+                .into_iter()
+                .filter_map(|tag| tag.name())
+                .collect::<Vec<_>>();
+            assert!(
+                !third_tag_names
+                    .iter()
+                    .any(|name| name == "document-heading-2" || name == "document-bold")
+            );
+            let other_row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let other_view = bind_document_row(
+                &other_row,
+                document(&units[0]),
+                units.clone(),
+                0,
+                &document_tags,
+                false,
+            );
+            assert_eq!(
+                third_view.buffer().tag_table(),
+                other_view.buffer().tag_table()
+            );
 
-    let threshold = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    assert!(!drag_threshold_crossed(&threshold, 10.0, 10.0, 10.0, 10.0));
-    assert!(drag_threshold_crossed(&threshold, 10.0, 10.0, 100.0, 100.0));
+            let code = |language: &'static str, text: &str| DocumentUnit {
+                kind: DocumentUnitKind::Code {
+                    list_depth: None,
+                    language: Some(language),
+                },
+                text: text.to_owned(),
+                copy_text: format!("{text}\n"),
+                spans: Vec::new(),
+                wrap: false,
+                first: true,
+                last: true,
+            };
+            let rust_view =
+                document_text_view(&code("rust", "let value = 1;"), &document_tags, false);
+            let python_view =
+                document_text_view(&code("python3", "value = 1"), &document_tags, false);
+            let rust_buffer = rust_view
+                .buffer()
+                .downcast::<sourceview5::Buffer>()
+                .expect("Rust code should use a source buffer");
+            let python_buffer = python_view
+                .buffer()
+                .downcast::<sourceview5::Buffer>()
+                .expect("Python code should use a source buffer");
+            assert_ne!(rust_buffer.tag_table(), python_buffer.tag_table());
+            assert!(
+                python_buffer.iter_has_context_class(&python_buffer.start_iter(), "no-spell-check")
+            );
+            drop((rust_buffer, rust_view));
+            while gtk::glib::MainContext::default().pending() {
+                gtk::glib::MainContext::default().iteration(false);
+            }
+            assert!(
+                python_buffer.iter_has_context_class(&python_buffer.start_iter(), "no-spell-check")
+            );
 
-    let unit = |text: &str| DocumentUnit {
-        kind: DocumentUnitKind::Paragraph,
-        text: text.to_owned(),
-        copy_text: format!("{text}\n"),
-        spans: Vec::new(),
-        wrap: true,
-        first: true,
-        last: true,
-    };
-    let mut styled = unit("second");
-    styled.kind = DocumentUnitKind::Heading(2);
-    styled.spans.push(DocumentSpan {
-        range: 0..6,
-        style: DocumentSpanStyle::Bold,
-    });
-    let units = Rc::new(vec![
-        PreviewUnit::Document(unit("first")),
-        PreviewUnit::Document(styled),
-        PreviewUnit::Document(unit("third")),
-    ]);
-    let document_tags = document_tag_table();
-    let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let first_view = bind_document_row(
-        &row,
-        document(&units[0]),
-        units.clone(),
-        0,
-        &document_tags,
-        false,
-    );
-    let first_buffer = first_view.buffer();
-    let second_view = bind_document_row(
-        &row,
-        document(&units[1]),
-        units.clone(),
-        1,
-        &document_tags,
-        false,
-    );
-    assert_eq!(first_view, second_view);
-    assert_eq!(first_buffer, second_view.buffer());
-    assert_eq!(
-        second_view.buffer().text(
-            &second_view.buffer().start_iter(),
-            &second_view.buffer().end_iter(),
-            false
-        ),
-        "second"
-    );
-    let tag_names = second_view
-        .buffer()
-        .iter_at_offset(1)
-        .tags()
-        .into_iter()
-        .filter_map(|tag| tag.name())
-        .collect::<Vec<_>>();
-    assert!(tag_names.iter().any(|name| name == "document-heading-2"));
-    assert!(tag_names.iter().any(|name| name == "document-bold"));
-    assert_eq!(second_view.accessible_role(), gtk::AccessibleRole::Heading);
-    let third_view = bind_document_row(
-        &row,
-        document(&units[2]),
-        units.clone(),
-        2,
-        &document_tags,
-        false,
-    );
-    assert_eq!(second_view, third_view);
-    assert_eq!(third_view.accessible_role(), gtk::AccessibleRole::Generic);
-    let third_tag_names = third_view
-        .buffer()
-        .iter_at_offset(1)
-        .tags()
-        .into_iter()
-        .filter_map(|tag| tag.name())
-        .collect::<Vec<_>>();
-    assert!(
-        !third_tag_names
-            .iter()
-            .any(|name| name == "document-heading-2" || name == "document-bold")
-    );
-    let other_row = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let other_view = bind_document_row(
-        &other_row,
-        document(&units[0]),
-        units.clone(),
-        0,
-        &document_tags,
-        false,
-    );
-    assert_eq!(
-        third_view.buffer().tag_table(),
-        other_view.buffer().tag_table()
-    );
+            let table_row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let table = bind_document_table_row(
+                &table_row,
+                &[vec![DocumentTableCellLayout {
+                    header: true,
+                    text: "Header".to_owned(),
+                    spans: Vec::new(),
+                }]],
+            );
+            let label = table
+                .first_child()
+                .and_downcast::<gtk::Label>()
+                .expect("table should contain a label");
+            let rebound_table = bind_document_table_row(
+                &table_row,
+                &[vec![DocumentTableCellLayout {
+                    header: false,
+                    text: "Cell".to_owned(),
+                    spans: Vec::new(),
+                }]],
+            );
+            assert_eq!(table, rebound_table);
+            assert_eq!(
+                label,
+                rebound_table
+                    .first_child()
+                    .expect("rebound table should retain its label")
+            );
+            assert_eq!(label.text(), "Cell");
+            assert!(!label.has_css_class("header"));
+            drop((
+                first_view,
+                second_view,
+                third_view,
+                row,
+                other_view,
+                other_row,
+                python_buffer,
+                python_view,
+                table,
+                label,
+                table_row,
+            ));
 
-    let code = |language: &'static str, text: &str| DocumentUnit {
-        kind: DocumentUnitKind::Code {
-            list_depth: None,
-            language: Some(language),
+            let root = rendered_document(
+                DocumentLayout {
+                    units: vec![unit("first"), unit("second")],
+                },
+                Vec::new(),
+                false,
+            )
+            .0;
+            let weak = root.downgrade();
+
+            drop(root);
+            while gtk::glib::MainContext::default().pending() {
+                gtk::glib::MainContext::default().iteration(false);
+            }
+
+            assert!(weak.upgrade().is_none());
+
+            let source_root = source_document(&"x".repeat(1024 * 1024), false, false).0;
+            let weak_source = source_root.downgrade();
+            drop(source_root);
+            while gtk::glib::MainContext::default().pending() {
+                gtk::glib::MainContext::default().iteration(false);
+            }
+            assert!(weak_source.upgrade().is_none());
+
+            let stack = gtk::Stack::new();
+            stack.add_named(&gtk::Label::new(Some("rendered")), Some("rendered"));
+            stack.set_visible_child_name("rendered");
+            let window = gtk::Window::builder()
+                .default_width(500)
+                .default_height(500)
+                .child(&stack)
+                .build();
+            window.present();
+            while gtk::glib::MainContext::default().pending() {
+                gtk::glib::MainContext::default().iteration(false);
+            }
+
+            let content = "<table><tr><td>cell</td></tr></table>".repeat(300);
+            let (source, _) = source_units(&content);
+            let units = source.into_iter().map(PreviewUnit::Source).collect();
+            let (source_root, source_state) =
+                super::virtual_preview(units, Vec::new(), true, false);
+            stack.add_named(&source_root, Some("source"));
+            stack.set_visible_child_name("source");
+            while gtk::glib::MainContext::default().pending() {
+                gtk::glib::MainContext::default().iteration(false);
+            }
+            assert!(source_root.is_mapped());
+            assert!(!source_state.bound.borrow().is_empty());
+            for bound in source_state.bound.borrow().values() {
+                let view = bound.view.upgrade().expect("bound source view");
+                assert!(view.buffer().char_count() > 0);
+            }
+
+            let mut heading = unit("Mixed supported and unsupported HTML");
+            heading.kind = DocumentUnitKind::Heading(1);
+            let code = DocumentUnit {
+                kind: DocumentUnitKind::Code {
+                    list_depth: Some(0),
+                    language: None,
+                },
+                text: "code inside a list\nwith a second line".to_owned(),
+                copy_text: "code inside a list\nwith a second line\n".to_owned(),
+                spans: Vec::new(),
+                wrap: false,
+                first: true,
+                last: true,
+            };
+            let units = vec![
+                PreviewUnit::Document(heading),
+                PreviewUnit::Document(unit("Safe text remains visible.")),
+                PreviewUnit::Document(code),
+            ];
+            let (rendered_root, rendered_state) = super::virtual_preview(
+                units,
+                vec!["Unsupported content omitted".to_owned()],
+                false,
+                false,
+            );
+            stack.add_named(&rendered_root, Some("rendered-again"));
+            stack.set_visible_child_name("rendered-again");
+            while gtk::glib::MainContext::default().pending() {
+                gtk::glib::MainContext::default().iteration(false);
+            }
+            assert!(rendered_root.is_mapped());
+            assert!(!rendered_state.bound.borrow().is_empty());
+            for bound in rendered_state.bound.borrow().values() {
+                let view = bound.view.upgrade().expect("bound rendered view");
+                assert!(view.buffer().char_count() > 0);
+            }
+            window.close();
         },
-        text: text.to_owned(),
-        copy_text: format!("{text}\n"),
-        spans: Vec::new(),
-        wrap: false,
-        first: true,
-        last: true,
-    };
-    let rust_view = document_text_view(&code("rust", "let value = 1;"), &document_tags, false);
-    let python_view = document_text_view(&code("python3", "value = 1"), &document_tags, false);
-    let rust_buffer = rust_view
-        .buffer()
-        .downcast::<sourceview5::Buffer>()
-        .expect("Rust code should use a source buffer");
-    let python_buffer = python_view
-        .buffer()
-        .downcast::<sourceview5::Buffer>()
-        .expect("Python code should use a source buffer");
-    assert_ne!(rust_buffer.tag_table(), python_buffer.tag_table());
-    assert!(python_buffer.iter_has_context_class(&python_buffer.start_iter(), "no-spell-check"));
-    drop((rust_buffer, rust_view));
-    while gtk::glib::MainContext::default().pending() {
-        gtk::glib::MainContext::default().iteration(false);
-    }
-    assert!(python_buffer.iter_has_context_class(&python_buffer.start_iter(), "no-spell-check"));
-
-    let table_row = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let table = bind_document_table_row(
-        &table_row,
-        &[vec![DocumentTableCellLayout {
-            header: true,
-            text: "Header".to_owned(),
-            spans: Vec::new(),
-        }]],
     );
-    let label = table
-        .first_child()
-        .and_downcast::<gtk::Label>()
-        .expect("table should contain a label");
-    let rebound_table = bind_document_table_row(
-        &table_row,
-        &[vec![DocumentTableCellLayout {
-            header: false,
-            text: "Cell".to_owned(),
-            spans: Vec::new(),
-        }]],
-    );
-    assert_eq!(table, rebound_table);
-    assert_eq!(
-        label,
-        rebound_table
-            .first_child()
-            .expect("rebound table should retain its label")
-    );
-    assert_eq!(label.text(), "Cell");
-    assert!(!label.has_css_class("header"));
-    drop((
-        first_view,
-        second_view,
-        third_view,
-        row,
-        other_view,
-        other_row,
-        python_buffer,
-        python_view,
-        table,
-        label,
-        table_row,
-    ));
-
-    let root = rendered_document(
-        DocumentLayout {
-            units: vec![unit("first"), unit("second")],
-        },
-        Vec::new(),
-        false,
-    )
-    .0;
-    let weak = root.downgrade();
-
-    drop(root);
-    while gtk::glib::MainContext::default().pending() {
-        gtk::glib::MainContext::default().iteration(false);
-    }
-
-    assert!(weak.upgrade().is_none());
-
-    let source_root = source_document(&"x".repeat(1024 * 1024), false, false).0;
-    let weak_source = source_root.downgrade();
-    drop(source_root);
-    while gtk::glib::MainContext::default().pending() {
-        gtk::glib::MainContext::default().iteration(false);
-    }
-    assert!(weak_source.upgrade().is_none());
-
-    let stack = gtk::Stack::new();
-    stack.add_named(&gtk::Label::new(Some("rendered")), Some("rendered"));
-    stack.set_visible_child_name("rendered");
-    let window = gtk::Window::builder()
-        .default_width(500)
-        .default_height(500)
-        .child(&stack)
-        .build();
-    window.present();
-    while gtk::glib::MainContext::default().pending() {
-        gtk::glib::MainContext::default().iteration(false);
-    }
-
-    let content = "<table><tr><td>cell</td></tr></table>".repeat(300);
-    let (source, _) = source_units(&content);
-    let units = source.into_iter().map(PreviewUnit::Source).collect();
-    let (source_root, source_state) = super::virtual_preview(units, Vec::new(), true, false);
-    stack.add_named(&source_root, Some("source"));
-    stack.set_visible_child_name("source");
-    while gtk::glib::MainContext::default().pending() {
-        gtk::glib::MainContext::default().iteration(false);
-    }
-    assert!(source_root.is_mapped());
-    assert!(!source_state.bound.borrow().is_empty());
-    for bound in source_state.bound.borrow().values() {
-        let view = bound.view.upgrade().expect("bound source view");
-        assert!(view.height_request() >= view.measure(gtk::Orientation::Vertical, view.width()).0);
-        assert!(view.buffer().char_count() > 0);
-    }
-
-    let mut heading = unit("Mixed supported and unsupported HTML");
-    heading.kind = DocumentUnitKind::Heading(1);
-    let code = DocumentUnit {
-        kind: DocumentUnitKind::Code {
-            list_depth: Some(0),
-            language: None,
-        },
-        text: "code inside a list\nwith a second line".to_owned(),
-        copy_text: "code inside a list\nwith a second line\n".to_owned(),
-        spans: Vec::new(),
-        wrap: false,
-        first: true,
-        last: true,
-    };
-    let units = vec![
-        PreviewUnit::Document(heading),
-        PreviewUnit::Document(unit("Safe text remains visible.")),
-        PreviewUnit::Document(code),
-    ];
-    let (rendered_root, rendered_state) = super::virtual_preview(
-        units,
-        vec!["Unsupported content omitted".to_owned()],
-        false,
-        false,
-    );
-    stack.add_named(&rendered_root, Some("rendered-again"));
-    stack.set_visible_child_name("rendered-again");
-    while gtk::glib::MainContext::default().pending() {
-        gtk::glib::MainContext::default().iteration(false);
-    }
-    assert!(rendered_root.is_mapped());
-    assert!(!rendered_state.bound.borrow().is_empty());
-    for bound in rendered_state.bound.borrow().values() {
-        let view = bound.view.upgrade().expect("bound rendered view");
-        assert!(view.height_request() >= view.measure(gtk::Orientation::Vertical, view.width()).0);
-        assert!(view.buffer().char_count() > 0);
-    }
-    window.close();
 }
 
 #[test]

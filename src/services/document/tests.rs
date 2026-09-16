@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 use std::time::Duration;
 
@@ -792,6 +792,32 @@ fn html_markup_limit_applies_while_links_are_reemitted() {
             .expect_err("repeated link markup must stop at the output limit")
             .contains("markup limit")
     );
+}
+
+#[test]
+fn markdown_reference_expansion_stops_at_the_markup_limit_during_parsing() {
+    let limits = ParseLimits {
+        events: 30,
+        markup: 128,
+        ..ParseLimits::default()
+    };
+    for body in [
+        "[x][ref] ".repeat(100),
+        "[x][ref]\n\n".repeat(100),
+        format!("| A |\n| - |\n{}", "| [x][ref] |\n".repeat(100)),
+    ] {
+        let markdown = format!("{body}\n\n[ref]: https://example.test/{}", "x".repeat(64));
+        assert!(
+            parse_document_with_limits(
+                DocumentKind::Markdown,
+                &markdown,
+                &Cancellation::default(),
+                limits,
+            )
+            .expect_err("reference expansion must stop before the later event limit")
+            .contains("markup limit")
+        );
+    }
 }
 
 #[test]
