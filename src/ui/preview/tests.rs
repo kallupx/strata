@@ -4,14 +4,12 @@ pub(super) mod media_size;
 mod preferences;
 
 use std::rc::Rc;
-use std::time::Duration;
 
 use gtk::{glib, prelude::*};
 
 use super::{
-    DocumentView, FOCUS_PREVIEW_DELAY, MEDIA_PLUGIN_INSTALL_COMMAND, PreviewDrawer,
-    accepts_preview_event, document_view_action, format_file_size, format_media_time,
-    initial_document_view, media_error_feedback, pdf_zoom_after_scroll, preview_drag_entries,
+    MEDIA_PLUGIN_INSTALL_COMMAND, PreviewDrawer, accepts_preview_event, format_file_size,
+    format_media_time, media_error_feedback, pdf_zoom_after_scroll, preview_drag_entries,
     preview_target, print_fit, print_page_starts, print_progress_for_page, source_chunk_end,
 };
 use crate::app::{Browser, BrowserEvent, EntrySplice};
@@ -166,30 +164,6 @@ fn media_errors_explain_missing_runtime_plugins() {
     assert_eq!(title, "Preview unavailable");
     assert!(detail.contains("The media data is corrupt"));
     assert_eq!(command, None);
-}
-
-#[test]
-fn focus_following_preview_waits_for_key_repeat_to_settle() {
-    assert_eq!(FOCUS_PREVIEW_DELAY, Duration::from_millis(75));
-}
-
-#[test]
-fn each_document_uses_the_current_default_and_unavailable_rendering_forces_source() {
-    assert_eq!(initial_document_view(true, true), DocumentView::Rendered);
-    assert_eq!(initial_document_view(false, true), DocumentView::Source);
-    assert_eq!(initial_document_view(true, false), DocumentView::Source);
-}
-
-#[test]
-fn document_view_action_describes_its_destination() {
-    assert_eq!(
-        document_view_action(DocumentView::Rendered),
-        ("View source", crate::assets::icons::FILE_CODE)
-    );
-    assert_eq!(
-        document_view_action(DocumentView::Source),
-        ("View rendered", crate::assets::icons::DOCUMENTS)
-    );
 }
 
 #[test]

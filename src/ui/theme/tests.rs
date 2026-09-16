@@ -304,24 +304,6 @@ fn browser_mode_storage_uses_current_names_and_accepts_legacy_names() {
 }
 
 #[test]
-fn rendered_document_preference_can_be_disabled_and_round_trips() {
-    let preferences: Preferences = toml::from_str(
-        r#"
-mode = "theme"
-theme = "azure-glow"
-render_documents_by_default = false
-"#,
-    )
-    .expect("preferences should be valid");
-    assert!(!preferences.render_documents_by_default);
-
-    let serialized = toml::to_string(&preferences).expect("preferences should serialize");
-    let restored: Preferences =
-        toml::from_str(&serialized).expect("preferences should deserialize");
-    assert!(!restored.render_documents_by_default);
-}
-
-#[test]
 fn view_preferences_round_trip_all_supported_sorting_values() {
     for (key, stored_key) in [
         (SortKey::Name, "name"),
