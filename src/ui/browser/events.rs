@@ -27,6 +27,26 @@ use std::time::Instant;
 
 impl ViewState {
     pub(super) fn handle(self: &Rc<Self>, event: &BrowserEvent) {
+        if matches!(
+            event,
+            BrowserEvent::NavigationStarting
+                | BrowserEvent::Reset
+                | BrowserEvent::ColumnsTruncated { .. }
+                | BrowserEvent::ColumnsRelocated { .. }
+                | BrowserEvent::EntriesInserted { .. }
+                | BrowserEvent::EntriesReplaced { .. }
+                | BrowserEvent::EntriesPublished { .. }
+                | BrowserEvent::EntriesSpliced { .. }
+                | BrowserEvent::SortingStarted { .. }
+                | BrowserEvent::ColumnReloaded { .. }
+                | BrowserEvent::HiddenToggled { .. }
+                | BrowserEvent::FocusChanged { .. }
+                | BrowserEvent::SelectionSetChanged { .. }
+                | BrowserEvent::SelectionSynced { .. }
+                | BrowserEvent::OpenRequested { .. }
+        ) {
+            self.cancel_click_rename();
+        }
         match event {
             BrowserEvent::SelectionSynced { .. } => return,
             BrowserEvent::NavigationStarting => {}

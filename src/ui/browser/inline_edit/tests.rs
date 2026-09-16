@@ -947,3 +947,69 @@ fn invalid_renames_retain_the_original_file_in_every_view_mode() {
         },
     );
 }
+
+#[test]
+fn slow_click_rename_opens_editor_after_the_double_click_interval() {
+    gtk_test(
+        "ui::browser::inline_edit::tests::slow_click_rename_opens_editor_after_the_double_click_interval",
+        || {
+            for mode in [BrowserMode::Columns, BrowserMode::Icons, BrowserMode::List] {
+                let fixture = tempfile::tempdir().expect("directory fixture");
+                std::fs::write(fixture.path().join("notes.txt"), b"body").expect("fixture file");
+                std::fs::write(fixture.path().join("other.txt"), b"body").expect("fixture file");
+                let view = BrowserView::new(
+                    Rc::new(crate::adapters::LocalFileSource),
+                    PeekBehavior::default(),
+                );
+                view.set_view_mode(mode);
+                let window = gtk::Window::builder()
+                    .child(&view.widget())
+                    .default_width(600)
+                    .default_height(300)
+                    .build();
+                window.present();
+                let browser = view.browser();
+                browser.navigate(Location::local(fixture.path()));
+                wait_until(|| {
+                    browser
+                        .column_snapshot(0)
+                        .is_some_and(|snapshot| !snapshot.loading && snapshot.count == 2)
+                });
+                browser.select(0, 0);
+                wait_until(|| browser.focused_item().is_some());
+
+                view.state.schedule_click_rename(0, 0);
+                assert!(
+                    !view.rename_is_active(),
+                    "editor opens only after the timeout"
+                );
+                wait_until(|| view.rename_is_active());
+                assert!(view.state.cancel_rename());
+                assert!(!view.rename_is_active());
+
+                view.state.schedule_click_rename(0, 0);
+                browser.select(0, 1);
+                browser.select(0, 0);
+                let deadline = Instant::now()
+                    + Duration::from_millis(
+                        view.state
+                            .scroller
+                            .settings()
+                            .gtk_double_click_time()
+                            .max(1) as u64
+                            + 100,
+                    );
+                while Instant::now() < deadline {
+                    glib::MainContext::default().iteration(false);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                assert!(
+                    !view.rename_is_active(),
+                    "selection changes cancel rename in {mode:?}"
+                );
+                browser.clear_observer();
+                window.destroy();
+            }
+        },
+    );
+}
