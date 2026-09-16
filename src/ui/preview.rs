@@ -584,6 +584,10 @@ impl PreviewState {
         if self.current.borrow().as_ref() == Some(&entry) {
             return;
         }
+        if !self.revealer.reveals_child() {
+            self.show(entry, depth);
+            return;
+        }
         let cancelled_request = self.current_request.replace(None).is_some();
         let cancelled_load = self.load.borrow_mut().take().is_some();
         let cancelled_pdf_load = !self.pdf_loads.borrow().is_empty();
