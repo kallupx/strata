@@ -1,6 +1,12 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 use gtk::prelude::*;
+
+pub(super) fn pane_header_action(widget: &impl IsA<gtk::Widget>) {
+    widget.add_css_class("column-header-action");
+    widget.set_valign(gtk::Align::Center);
+    widget.set_cursor_from_name(Some("pointer"));
+}
 
 pub(super) fn form_entry() -> gtk::Entry {
     let entry = gtk::Entry::new();
@@ -21,10 +27,48 @@ pub(super) fn form_label(text: &str) -> gtk::Label {
     label
 }
 
+pub(super) fn form_error_label() -> gtk::Label {
+    let label = gtk::Label::new(None);
+    label.add_css_class("form-field-error");
+    label.set_xalign(0.0);
+    label.set_visible(false);
+    label
+}
+
+pub(super) fn set_form_field_error(
+    field: &impl IsA<gtk::Widget>,
+    helper: &gtk::Label,
+    message: Option<&str>,
+) {
+    if let Some(message) = message {
+        field.add_css_class("error");
+        helper.set_text(message);
+        helper.set_visible(true);
+    } else {
+        field.remove_css_class("error");
+        helper.set_visible(false);
+    }
+}
+
 pub(super) fn form_check_button(label: &str) -> gtk::CheckButton {
     let button = gtk::CheckButton::with_label(label);
     button.add_css_class("form-check");
     button
+}
+
+pub(super) fn menu_option(label: &str, selected: bool) -> (gtk::Button, gtk::Image) {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let check = crate::assets::primary_icon(crate::assets::icons::CHECK, 16);
+    check.set_visible(selected);
+    let label = gtk::Label::new(Some(label));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    row.append(&label);
+    row.append(&check);
+    let option = gtk::Button::builder().child(&row).build();
+    option.add_css_class("column-menu-option");
+    option.set_has_frame(false);
+    (option, check)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -86,6 +130,7 @@ pub(super) struct ModalLayout {
     pub close: gtk::Button,
     pub cancel: gtk::Button,
     pub confirm: gtk::Button,
+    pub icon: gtk::Image,
 }
 
 impl ModalLayout {
@@ -143,7 +188,7 @@ pub(super) fn modal_layout_with_tone(
     confirm_label: &str,
     tone: ModalTone,
 ) -> ModalLayout {
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let content = super::accessibility::dialog_box(title);
     content.add_css_class("action-dialog");
     content.set_halign(gtk::Align::Center);
     content.set_valign(gtk::Align::Center);
@@ -227,6 +272,7 @@ pub(super) fn modal_layout_with_tone(
         close,
         cancel,
         confirm,
+        icon,
     }
 }
 
@@ -262,3 +308,6 @@ pub(super) fn segmented_control(
 
     (control, buttons)
 }
+
+#[cfg(test)]
+mod tests;

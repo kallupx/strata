@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 use std::ffi::OsString;
 
@@ -18,13 +18,115 @@ fn entry(path: &str) -> FileEntry {
 
 fn named_entry(path: &str, name: &str) -> FileEntry {
     FileEntry {
+        thumbnail_path: None,
         location: location(path),
         native_name: OsString::from(name),
         display_name: name.into(),
         kind: EntryKind::Directory,
         size: MetadataValue::Unknown,
         modified_unix_seconds: MetadataValue::Unknown,
+        is_hidden: false,
+        mode: MetadataValue::Unknown,
+        image_dimensions: MetadataValue::Unknown,
+        child_count: MetadataValue::Unknown,
+        duration_seconds: MetadataValue::Unknown,
     }
+}
+
+fn listing_without_a_load_cursor(state: &mut NavigationState) {
+    state.navigate(location("/fixture"), RequestId(1));
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            named_entry("/fixture/alpha", "alpha"),
+            named_entry("/fixture/bravo", "bravo"),
+            named_entry("/fixture/charlie", "charlie"),
+        ],
+    );
+}
+
+fn listing_with_the_first_entry_selected(state: &mut NavigationState) {
+    state.navigate(location("/fixture"), RequestId(1));
+    state.select_first_on_load(0);
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            named_entry("/fixture/alpha", "alpha"),
+            named_entry("/fixture/bravo", "bravo"),
+            named_entry("/fixture/charlie", "charlie"),
+        ],
+    );
+}
+
+#[test]
+fn shared_defaults_do_not_replace_existing_column_sort_selection_or_location() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/fixture"), RequestId(1));
+    state.apply_batch(RequestId(1), vec![entry("/fixture/child")]);
+    state.set_selection(0, &[0], Some(0));
+    let local = state.column_preferences(0).expect("existing column");
+    let path = state.current_path();
+    let defaults = ViewPreferences {
+        sort_key: SortKey::Size,
+        sort_direction: SortDirection::Descending,
+        ..local
+    };
+    state.set_default_preferences(defaults);
+    assert_eq!(state.column_preferences(0), Some(local));
+    assert_eq!(state.current_path(), path);
+    assert_eq!(state.selected_positions(0), [0]);
+    state.descend(0, location("/fixture/child"), RequestId(2));
+    assert_eq!(state.column_preferences(1), Some(defaults));
+}
+
+#[test]
+fn focusing_a_column_preserves_selection_and_descendants() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/fixture"), RequestId(1));
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            named_entry("/fixture/alpha", "alpha"),
+            named_entry("/fixture/bravo", "bravo"),
+        ],
+    );
+    state.set_selection(0, &[0, 1], Some(1));
+    state.descend(0, location("/fixture/alpha"), RequestId(2));
+    let path = state.current_path();
+    assert!(state.focus_column(0));
+    assert_eq!(state.selected_positions(0), [0, 1]);
+    assert_eq!(state.active_focus(), Some((0, Some(1))));
+    assert_eq!(state.current_path(), path);
+    assert!(state.focus_column(1));
+    assert_eq!(state.active_focus(), Some((1, None)));
+    assert!(state.selected_entries().is_empty());
+    assert!(!state.focus_column(2));
+    assert_eq!(state.active_depth(), Some(1));
+}
+
+#[test]
+fn empty_selection_sync_preserves_the_keyboard_cursor() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/fixture"), RequestId(1));
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            named_entry("/fixture/alpha", "alpha"),
+            named_entry("/fixture/bravo", "bravo"),
+            named_entry("/fixture/charlie", "charlie"),
+        ],
+    );
+    state.select(0, 1);
+    assert_eq!(state.clear_active_selection(), Some((0, 1)));
+    assert!(state.set_selection(0, &[], None));
+    assert!(state.selected_positions(0).is_empty());
+    assert_eq!(state.active_focus(), Some((0, Some(1))));
+    assert_eq!(state.move_selection(1), Some((0, 2)));
+
+    assert!(state.set_selection(0, &[], Some(1)));
+    assert!(state.selected_positions(0).is_empty());
+    assert_eq!(state.active_focus(), Some((0, Some(1))));
+    assert_eq!(state.move_selection(-1), Some((0, 0)));
 }
 
 #[test]
@@ -95,6 +197,138 @@ fn keyboard_range_selection_extends_and_contracts_from_its_anchor() {
 }
 
 #[test]
+fn extending_from_no_selection_starts_at_a_single_edge_entry() {
+    let mut state = NavigationState::default();
+    listing_without_a_load_cursor(&mut state);
+
+    assert_eq!(
+        state.extend_selection(1).map(|(_, _, range)| range),
+        Some(vec![0])
+    );
+    assert_eq!(
+        state.extend_selection(1).map(|(_, _, range)| range),
+        Some(vec![0, 1])
+    );
+
+    let mut state = NavigationState::default();
+    listing_without_a_load_cursor(&mut state);
+    assert_eq!(
+        state.extend_selection(-1).map(|(_, _, range)| range),
+        Some(vec![2])
+    );
+    assert_eq!(
+        state.extend_selection(-1).map(|(_, _, range)| range),
+        Some(vec![1, 2])
+    );
+}
+
+#[test]
+fn extending_from_an_escape_cleared_cursor_starts_on_that_entry() {
+    let mut state = NavigationState::default();
+    listing_with_the_first_entry_selected(&mut state);
+    assert_eq!(state.active_focus(), Some((0, Some(0))));
+    assert_eq!(state.selected_positions(0), [0]);
+
+    assert_eq!(state.clear_active_selection(), Some((0, 0)));
+    assert!(state.selected_positions(0).is_empty());
+    assert_eq!(state.active_focus(), Some((0, Some(0))));
+    assert_eq!(state.selection_anchor_position(0), Some(0));
+
+    assert_eq!(
+        state.extend_selection(1).map(|(_, _, range)| range),
+        Some(vec![0])
+    );
+    assert_eq!(state.selection_anchor_position(0), Some(0));
+    assert_eq!(
+        state.extend_selection(1).map(|(_, _, range)| range),
+        Some(vec![0, 1])
+    );
+}
+
+#[test]
+fn extending_from_an_escape_cleared_range_starts_on_the_cursor() {
+    let mut state = NavigationState::default();
+    listing_with_the_first_entry_selected(&mut state);
+    assert_eq!(
+        state.extend_selection(1).map(|(_, _, range)| range),
+        Some(vec![0, 1])
+    );
+    assert_eq!(state.active_focus(), Some((0, Some(1))));
+    assert_eq!(state.selection_anchor_position(0), Some(0));
+
+    assert_eq!(state.clear_active_selection(), Some((0, 1)));
+    assert!(state.selected_positions(0).is_empty());
+    assert_eq!(state.active_focus(), Some((0, Some(1))));
+    assert_eq!(state.selection_anchor_position(0), Some(0));
+
+    assert_eq!(
+        state.extend_selection(1).map(|(_, _, range)| range),
+        Some(vec![1])
+    );
+    assert_eq!(state.selection_anchor_position(0), Some(1));
+    assert_eq!(
+        state.extend_selection(1).map(|(_, _, range)| range),
+        Some(vec![1, 2])
+    );
+}
+
+#[test]
+fn visual_ranges_cross_type_groups_and_contract_without_selecting_filtered_entries() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/fixture"), RequestId(1));
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            named_entry("/fixture/a.txt", "a.txt"),
+            named_entry("/fixture/b.txt", "b.txt"),
+            named_entry("/fixture/c.txt", "c.txt"),
+            named_entry("/fixture/d.json", "d.json"),
+            named_entry("/fixture/e.json", "e.json"),
+        ],
+    );
+    state.select(0, 4);
+    let visual_order = [3, 4, 0, 2];
+    assert_eq!(
+        state.extend_visual_selection(0, 2, &visual_order),
+        Some(vec![4, 0, 2])
+    );
+    assert_eq!(
+        state.extend_visual_selection(0, 0, &visual_order),
+        Some(vec![4, 0])
+    );
+    assert_eq!(
+        state.extend_visual_selection(0, 4, &visual_order),
+        Some(vec![4])
+    );
+    assert_eq!(
+        state.extend_visual_selection(0, 3, &visual_order),
+        Some(vec![3, 4])
+    );
+    assert_eq!(state.extend_visual_selection(0, 1, &visual_order), None);
+    assert_eq!(state.extend_visual_selection(0, 99, &[4, 99]), None);
+    assert_eq!(state.selected_entries().len(), 2);
+}
+
+#[test]
+fn a_filtered_out_range_anchor_restarts_at_the_visible_target() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/fixture"), RequestId(1));
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            named_entry("/fixture/a", "a"),
+            named_entry("/fixture/b", "b"),
+        ],
+    );
+    state.select(0, 0);
+    assert_eq!(state.extend_visual_selection(0, 1, &[1]), Some(vec![1]));
+    assert_eq!(
+        state.extend_visual_selection(0, 0, &[0, 1]),
+        Some(vec![0, 1])
+    );
+}
+
+#[test]
 fn active_path_is_independent_from_the_parent_highlight() {
     let mut state = NavigationState::default();
     state.navigate(location("/fixture"), RequestId(1));
@@ -112,6 +346,49 @@ fn active_path_is_independent_from_the_parent_highlight() {
 
     assert_eq!(state.active_child_position(0), Some(0));
     assert_eq!(state.columns[0].selected, Some(1));
+}
+
+#[test]
+fn camera_device_order_monitor_changes_preserve_existing_positions() {
+    let mut state = NavigationState::default();
+    let watched = Location::uri("gphoto2://camera/");
+    state.navigate(watched.clone(), RequestId(1));
+    let photo = |name: &str| FileEntry {
+        location: Location::uri(format!("gphoto2://camera/202609_a/{name}")),
+        kind: EntryKind::File,
+        ..named_entry("/unused", name)
+    };
+    state.apply_batch(RequestId(1), vec![photo("z.jpg"), photo("m.jpg")]);
+    state.set_selection(0, &[1], Some(1));
+    let (splices, _) = state
+        .apply_directory_change(0, &watched, DirectoryChange::Upsert(photo("a.jpg")))
+        .expect("new photo appended");
+    assert_eq!(splices[0].position, 2);
+    let mut updated = photo("m.jpg");
+    updated.display_name = "b.jpg".into();
+    updated.size = MetadataValue::Known(99);
+    let (splices, _) = state
+        .apply_directory_change(0, &watched, DirectoryChange::Upsert(updated))
+        .expect("existing photo updated");
+    assert_eq!(splices.len(), 1);
+    assert_eq!(splices[0].position, 1);
+    assert_eq!(splices[0].removed, 1);
+    assert_eq!(state.selected_positions(0), [1]);
+    assert_eq!(
+        state.columns[0]
+            .entries
+            .iter()
+            .map(|entry| entry.display_name.as_str())
+            .collect::<Vec<_>>(),
+        ["z.jpg", "b.jpg", "a.jpg"]
+    );
+    state.apply_directory_change(
+        0,
+        &watched,
+        DirectoryChange::Remove(photo("z.jpg").location),
+    );
+    assert_eq!(state.selected_positions(0), [0]);
+    assert_eq!(state.columns[0].entries[0].size, MetadataValue::Known(99));
 }
 
 #[test]
@@ -167,6 +444,35 @@ fn monitor_updates_reposition_only_the_changed_entry() {
     assert_eq!(splices[0].removed, 1);
     assert_eq!(splices[1].entries.len(), 1);
     assert_eq!(state.columns[0].entries[2].display_name, "zulu");
+}
+
+#[test]
+fn monitor_updates_to_existing_entry_at_same_position_uses_single_splice() {
+    let mut state = NavigationState::default();
+    let watched = location("/home");
+    state.navigate(watched.clone(), RequestId(1));
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            named_entry("/home/alpha", "alpha"),
+            named_entry("/home/bravo", "bravo"),
+            named_entry("/home/charlie", "charlie"),
+        ],
+    );
+
+    let mut updated = named_entry("/home/bravo", "bravo");
+    updated.size = MetadataValue::Known(9999);
+
+    let (splices, _) = state
+        .apply_directory_change(0, &watched, DirectoryChange::Upsert(updated))
+        .expect("updating an existing entry's metadata should change the column");
+
+    assert_eq!(splices.len(), 1);
+    assert_eq!(splices[0].position, 1);
+    assert_eq!(splices[0].removed, 1);
+    assert_eq!(splices[0].entries.len(), 1);
+    assert_eq!(splices[0].entries[0].size, MetadataValue::Known(9999));
+    assert_eq!(state.columns[0].entries[1].size, MetadataValue::Known(9999));
 }
 
 #[test]
@@ -246,6 +552,82 @@ fn monitor_moves_follow_the_selected_entry() {
 }
 
 #[test]
+fn relocating_a_column_preserves_selection_preferences_and_active_depth() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/home"), RequestId(1));
+    state.apply_batch(RequestId(1), vec![named_entry("/home/old", "old")]);
+    state.select(0, 0);
+    state.descend(0, location("/home/old"), RequestId(2));
+    state.apply_batch(
+        RequestId(2),
+        vec![
+            named_entry("/home/old/one", "one"),
+            named_entry("/home/old/two", "two"),
+        ],
+    );
+    state.set_selection(1, &[0, 1], Some(1));
+    let preferences = ViewPreferences {
+        sort_direction: SortDirection::Descending,
+        ..ViewPreferences::default()
+    };
+    state.apply_sort_preferences(1, preferences);
+    state.focus_column(0);
+
+    state.relocate_column(1, location("/home/renamed"), RequestId(3));
+    assert_eq!(state.active_depth(), Some(0));
+    assert_eq!(state.selected_positions(0), [0]);
+    assert_eq!(state.column_preferences(1), Some(preferences));
+    assert!(
+        state
+            .apply_batch(RequestId(2), vec![named_entry("/home/old/stale", "stale")])
+            .is_none()
+    );
+    state.apply_batch(
+        RequestId(3),
+        vec![
+            named_entry("/home/renamed/one", "one"),
+            named_entry("/home/renamed/two", "two"),
+        ],
+    );
+    assert_eq!(state.selected_positions(1), [0, 1]);
+    let column = &state.columns[1];
+    assert_eq!(
+        column.entries[column.selected.expect("keyboard cursor")].display_name,
+        "two"
+    );
+    assert!(
+        column
+            .selection_anchor
+            .as_ref()
+            .expect("selection anchor")
+            .is_within(&location("/home/renamed"))
+    );
+}
+
+#[test]
+fn a_rename_rebases_the_pending_selection_during_a_refresh() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/home"), RequestId(1));
+    state.apply_batch(RequestId(1), vec![named_entry("/home/old", "old")]);
+    state.select(0, 0);
+    state.reload_column(0, RequestId(2));
+    state.apply_directory_change(
+        0,
+        &location("/home"),
+        DirectoryChange::Move {
+            from: location("/home/old"),
+            entry: named_entry("/home/new", "new"),
+        },
+    );
+    state.install_snapshot(RequestId(2), vec![named_entry("/home/new", "new")]);
+    assert_eq!(state.selected_positions(0), [0]);
+    assert_eq!(
+        state.focused_entry().expect("focused entry").2.location,
+        location("/home/new")
+    );
+}
+
+#[test]
 fn external_moves_rebase_open_descendant_locations() {
     let mut state = NavigationState::default();
     state.navigate(location("/home"), RequestId(1));
@@ -286,6 +668,21 @@ fn external_removals_close_affected_descendant_columns() {
 }
 
 #[test]
+fn remote_external_removals_close_the_exact_open_column() {
+    let root = Location::uri("sftp://user@host/mnt/share");
+    let removed = Location::uri("sftp://user@host/mnt/share/removed");
+    let mut state = NavigationState::default();
+    state.navigate(root.clone(), RequestId(1));
+    assert!(state.descend(0, removed.clone(), RequestId(2)));
+
+    let path = state
+        .path_after_external_change(0, &DirectoryChange::Remove(removed))
+        .expect("the removed remote column should be closed");
+
+    assert_eq!(path.locations(), &[root]);
+}
+
+#[test]
 fn selecting_a_sibling_replaces_deeper_columns() {
     let mut state = NavigationState::default();
     state.navigate(location("/home"), RequestId(1));
@@ -318,8 +715,101 @@ fn empty_is_distinct_from_loading_and_error() {
     state.navigate(location("/empty"), RequestId(1));
     assert_eq!(state.columns[0].load_state, LoadState::Loading);
 
-    assert_eq!(state.finish(RequestId(1)), Some(0));
+    assert_eq!(state.finish(RequestId(1), false, None, None), Some(0));
     assert_eq!(state.columns[0].load_state, LoadState::Empty);
+}
+
+#[test]
+fn truncated_load_state_survives_until_reload() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/partial"), RequestId(1));
+
+    assert_eq!(state.finish(RequestId(1), true, None, None), Some(0));
+    assert!(state.columns[0].truncated);
+
+    state.reload_column(0, RequestId(2));
+    assert!(!state.columns[0].truncated);
+}
+
+#[test]
+fn reload_clears_the_resolved_delete_capability() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/fixture"), RequestId(1));
+
+    assert_eq!(
+        state.finish(RequestId(1), false, None, Some(false)),
+        Some(0)
+    );
+    assert_eq!(state.can_delete_at(0), Some(false));
+
+    state.reload_column(0, RequestId(2));
+    assert_eq!(state.can_delete_at(0), None);
+}
+
+#[test]
+fn reload_restores_a_multi_selection_after_snapshot() {
+    let mut state = NavigationState::default();
+    listing_without_a_load_cursor(&mut state);
+    assert!(state.set_selection(0, &[0, 2], Some(2)));
+
+    state.reload_column(0, RequestId(2));
+    assert!(state.selected_positions(0).is_empty());
+    assert_eq!(
+        state.install_snapshot(
+            RequestId(2),
+            vec![
+                named_entry("/fixture/alpha", "alpha"),
+                named_entry("/fixture/bravo", "bravo"),
+                named_entry("/fixture/charlie", "charlie"),
+            ],
+        ),
+        Some(0)
+    );
+
+    assert_eq!(state.selected_positions(0), [0, 2]);
+    assert_eq!(state.active_focus(), Some((0, Some(2))));
+}
+
+#[test]
+fn reload_does_not_select_an_unselected_focus() {
+    for positions in [vec![], vec![0, 1]] {
+        let mut state = NavigationState::default();
+        listing_without_a_load_cursor(&mut state);
+        assert!(state.set_selection(0, &positions, Some(2)));
+        state.reload_column(0, RequestId(2));
+        state.install_snapshot(
+            RequestId(2),
+            vec![
+                named_entry("/fixture/alpha", "alpha"),
+                named_entry("/fixture/bravo", "bravo"),
+                named_entry("/fixture/charlie", "charlie"),
+            ],
+        );
+        assert_eq!(state.selected_positions(0), positions);
+        assert_eq!(state.active_focus(), Some((0, Some(2))));
+    }
+}
+
+#[test]
+fn reload_drops_selection_members_that_left_the_listing() {
+    let mut state = NavigationState::default();
+    listing_without_a_load_cursor(&mut state);
+    assert!(state.set_selection(0, &[0, 2], Some(2)));
+
+    state.reload_column(0, RequestId(2));
+    assert_eq!(
+        state.install_snapshot(
+            RequestId(2),
+            vec![
+                named_entry("/fixture/alpha", "alpha"),
+                named_entry("/fixture/bravo", "bravo"),
+            ],
+        ),
+        Some(0)
+    );
+
+    assert_eq!(state.selected_positions(0), [0]);
+    assert_eq!(state.active_focus(), Some((0, Some(0))));
 }
 
 #[test]
@@ -373,6 +863,124 @@ fn parent_removes_the_deepest_committed_column() {
     assert_eq!(parent.locations(), &[location("/home")]);
 }
 
+fn hidden_entry(path: &str, name: &str) -> FileEntry {
+    FileEntry {
+        thumbnail_path: None,
+        location: location(path),
+        native_name: OsString::from(name),
+        display_name: name.into(),
+        kind: EntryKind::Directory,
+        size: MetadataValue::Unknown,
+        modified_unix_seconds: MetadataValue::Unknown,
+        is_hidden: true,
+        mode: MetadataValue::Unknown,
+        image_dimensions: MetadataValue::Unknown,
+        child_count: MetadataValue::Unknown,
+        duration_seconds: MetadataValue::Unknown,
+    }
+}
+
+#[test]
+fn keyboard_selection_skips_hidden_entries_when_hidden_files_are_not_shown() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/home"), RequestId(1));
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            named_entry("/home/alpha", "alpha"),
+            hidden_entry("/home/bravo", "bravo"),
+            named_entry("/home/charlie", "charlie"),
+        ],
+    );
+
+    assert_eq!(state.move_selection(1), Some((0, 0)));
+    assert_eq!(state.move_selection(1), Some((0, 2)));
+    assert_eq!(state.move_selection(1), Some((0, 2)));
+    assert_eq!(state.move_selection(-1), Some((0, 0)));
+    assert_eq!(state.move_selection(-1), Some((0, 0)));
+
+    state.set_show_hidden(true);
+    assert_eq!(state.move_selection(1), Some((0, 1)));
+    assert_eq!(state.move_selection(1), Some((0, 2)));
+}
+
+#[test]
+fn staged_keyboard_descent_selects_the_first_visible_entry() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/home"), RequestId(1));
+    state.select_first_on_load(0);
+    state.install_snapshot(
+        RequestId(1),
+        vec![
+            hidden_entry("/home/.hidden", ".hidden"),
+            named_entry("/home/visible", "visible"),
+        ],
+    );
+
+    assert_eq!(
+        state.focused_entry().map(|(_, position, _)| position),
+        Some(1)
+    );
+    assert!(
+        state.selection_is_load_cursor(),
+        "the first visible item after load is a cursor, not a user selection"
+    );
+
+    assert!(state.set_selection(0, &[1], Some(1)));
+    assert!(
+        state.selection_is_load_cursor(),
+        "echoing the load selection must not treat it as a user pick"
+    );
+
+    assert!(state.set_selection(0, &[], None));
+    assert!(
+        state.selection_is_load_cursor(),
+        "an empty GTK echo is not itself a paste-into target"
+    );
+    assert!(state.set_selection(0, &[1], Some(1)));
+    assert!(
+        state.selection_is_load_cursor(),
+        "restoring the load cursor after an empty echo is still a load cursor"
+    );
+
+    assert!(state.set_selection(0, &[0], Some(0)));
+    assert!(
+        state.selection_is_load_cursor(),
+        "GTK focusing another row without a user pick must not arm paste-into"
+    );
+
+    state.commit_selection();
+    assert!(state.set_selection(0, &[0], Some(0)));
+    assert!(
+        !state.selection_is_load_cursor(),
+        "choosing another item is a user selection"
+    );
+    assert!(state.set_selection(0, &[1], Some(1)));
+    assert!(!state.selection_is_load_cursor());
+}
+
+#[test]
+fn keyboard_selection_extension_skips_hidden_entries() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/home"), RequestId(1));
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            named_entry("/home/alpha", "alpha"),
+            hidden_entry("/home/bravo", "bravo"),
+            named_entry("/home/charlie", "charlie"),
+        ],
+    );
+    assert!(state.select(0, 0));
+
+    assert_eq!(
+        state.extend_selection(1).map(|(_, _, range)| range),
+        Some(vec![0, 2])
+    );
+    assert_eq!(state.selected_entries().len(), 2);
+    assert!(!state.selected_entries().iter().any(|e| e.is_hidden));
+}
+
 #[test]
 fn keyboard_selection_is_bounded_and_tracks_the_active_column() {
     let mut state = NavigationState::default();
@@ -384,6 +992,96 @@ fn keyboard_selection_is_bounded_and_tracks_the_active_column() {
     assert_eq!(state.move_selection(1), Some((0, 1)));
     assert_eq!(state.move_selection(-1), Some((0, 0)));
     assert_eq!(state.move_selection(-1), Some((0, 0)));
+}
+
+#[test]
+fn paging_moves_by_a_page_and_stops_at_the_ends() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/home"), RequestId(1));
+    let entries = (0..12)
+        .map(|index| entry(&format!("/home/item-{index:02}")))
+        .collect();
+    state.apply_batch(RequestId(1), entries);
+
+    assert_eq!(state.page_along(1, 5, None), Some((0, 0)));
+    assert_eq!(state.page_along(1, 5, None), Some((0, 5)));
+    assert_eq!(state.page_along(1, 5, None), Some((0, 10)));
+    assert_eq!(state.page_along(1, 5, None), Some((0, 11)));
+    assert_eq!(state.page_along(-1, 5, None), Some((0, 6)));
+    assert_eq!(state.page_along(-1, 5, None), Some((0, 1)));
+    assert_eq!(state.page_along(-1, 5, None), Some((0, 0)));
+    assert_eq!(state.selected_entries().len(), 1);
+}
+
+#[test]
+fn paging_skips_hidden_entries_when_hidden_files_are_not_shown() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/home"), RequestId(1));
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            named_entry("/home/alpha", "alpha"),
+            hidden_entry("/home/bravo", "bravo"),
+            named_entry("/home/charlie", "charlie"),
+            named_entry("/home/delta", "delta"),
+        ],
+    );
+
+    assert!(state.select(0, 0));
+    assert_eq!(state.page_along(1, 1, None), Some((0, 2)));
+    assert_eq!(state.page_along(-1, 1, None), Some((0, 0)));
+}
+
+#[test]
+fn paging_by_usize_max_jumps_to_the_first_or_last_visible_entry() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/home"), RequestId(1));
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            hidden_entry("/home/alpha", "alpha"),
+            named_entry("/home/bravo", "bravo"),
+            named_entry("/home/charlie", "charlie"),
+            hidden_entry("/home/delta", "delta"),
+        ],
+    );
+
+    assert!(state.select(0, 2));
+    assert_eq!(state.page_along(1, usize::MAX, None), Some((0, 2)));
+    assert_eq!(state.page_along(-1, usize::MAX, None), Some((0, 1)));
+}
+
+#[test]
+fn paging_an_empty_column_keeps_the_selection_unchanged() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/home"), RequestId(1));
+    state.apply_batch(RequestId(1), Vec::new());
+
+    assert_eq!(state.page_along(1, 4, None), None);
+}
+
+#[test]
+fn paging_along_visual_order_follows_display_order_not_source_indices() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/home"), RequestId(1));
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            named_entry("/home/a.txt", "a.txt"),
+            named_entry("/home/b.json", "b.json"),
+            named_entry("/home/c.txt", "c.txt"),
+            named_entry("/home/d.json", "d.json"),
+        ],
+    );
+    assert!(state.select(0, 0));
+    let visual_order = [0, 2, 1, 3];
+    assert_eq!(
+        state.page_along(1, 2, Some(&visual_order)),
+        Some((0, 1)),
+        "two steps from a.txt along txt-then-json lands on b.json"
+    );
+    assert_eq!(state.page_along(1, 1, Some(&visual_order)), Some((0, 3)));
+    assert_eq!(state.page_along(-1, 2, Some(&visual_order)), Some((0, 2)));
 }
 
 #[test]
@@ -456,6 +1154,67 @@ fn batches_are_merged_into_one_global_sort_order() {
 }
 
 #[test]
+fn names_are_sorted_case_insensitively() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/fixture"), RequestId(1));
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            named_entry("/fixture/apple", "apple"),
+            named_entry("/fixture/Banana", "Banana"),
+            named_entry("/fixture/cherry", "cherry"),
+            named_entry("/fixture/Date", "Date"),
+        ],
+    );
+
+    assert_eq!(
+        state.columns[0]
+            .entries
+            .iter()
+            .map(|entry| entry.display_name.as_str())
+            .collect::<Vec<_>>(),
+        ["apple", "Banana", "cherry", "Date"]
+    );
+}
+
+#[test]
+fn names_that_differ_only_by_case_have_a_deterministic_order() {
+    assert_eq!(compare_display_names("file", "FILE"), Ordering::Greater);
+    assert_eq!(
+        compare_display_names("Straße", "STRASSE"),
+        Ordering::Greater
+    );
+}
+
+#[test]
+fn numeric_suffixes_sort_naturally() {
+    for (left, right) in [
+        ("File 1", "File 2"),
+        ("File 2", "File 10"),
+        ("File 1", "File 10"),
+        ("File 99999999999999999999", "File 100000000000000000000"),
+        ("File 0002", "File 10"),
+        ("File 02", "File 2"),
+        ("File 0", "File 00"),
+        ("file 2 part 9", "File 2 part 10"),
+        ("Straße 2", "STRASSE 10"),
+        ("File 2", "File 2a"),
+    ] {
+        assert_eq!(
+            compare_display_names(left, right),
+            Ordering::Less,
+            "{left} < {right}"
+        );
+        assert_eq!(
+            compare_display_names(right, left),
+            Ordering::Greater,
+            "{right} > {left}"
+        );
+        assert_eq!(compare_display_names(left, left), Ordering::Equal);
+    }
+}
+
+#[test]
 fn changing_sort_preferences_preserves_the_selected_entry() {
     let mut state = NavigationState::default();
     state.navigate(location("/fixture"), RequestId(1));
@@ -470,7 +1229,7 @@ fn changing_sort_preferences_preserves_the_selected_entry() {
 
     assert!(
         state
-            .set_column_preferences(
+            .apply_sort_preferences(
                 0,
                 ViewPreferences {
                     sort_direction: SortDirection::Descending,
@@ -501,7 +1260,7 @@ fn changed_sort_preferences_are_inherited_by_new_columns() {
         ..ViewPreferences::default()
     };
 
-    assert!(state.set_column_preferences(0, preferences).is_some());
+    assert!(state.apply_sort_preferences(0, preferences).is_some());
     assert!(state.descend(0, location("/fixture/child"), RequestId(2)));
 
     assert_eq!(state.column_preferences(1), Some(preferences));
@@ -529,7 +1288,7 @@ fn changing_sort_preferences_only_reorders_the_target_column() {
 
     assert!(
         state
-            .set_column_preferences(
+            .apply_sort_preferences(
                 1,
                 ViewPreferences {
                     sort_direction: SortDirection::Descending,
@@ -541,4 +1300,481 @@ fn changing_sort_preferences_only_reorders_the_target_column() {
 
     assert_eq!(state.columns[0].entries[0].display_name, "a");
     assert_eq!(state.columns[1].entries[0].display_name, "z");
+}
+
+fn file_entry(path: &str, name: &str) -> FileEntry {
+    FileEntry {
+        location: location(path),
+        native_name: OsString::from(name),
+        thumbnail_path: None,
+        display_name: name.into(),
+        kind: EntryKind::File,
+        size: MetadataValue::Unknown,
+        modified_unix_seconds: MetadataValue::Unknown,
+        mode: MetadataValue::Unknown,
+        is_hidden: false,
+        image_dimensions: MetadataValue::Unknown,
+        child_count: MetadataValue::Unknown,
+        duration_seconds: MetadataValue::Unknown,
+    }
+}
+
+fn metadata_update(path: &str, size: u64, modified: i64) -> MetadataUpdate {
+    MetadataUpdate {
+        location: location(path),
+        size: MetadataValue::Known(size),
+        modified_unix_seconds: MetadataValue::Known(modified),
+        mode: MetadataValue::Unknown,
+        image_dimensions: MetadataValue::Unknown,
+        child_count: MetadataValue::Unknown,
+        duration_seconds: MetadataValue::Unknown,
+    }
+}
+
+#[test]
+fn metadata_fill_updates_values_without_reordering() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/fixture"), RequestId(1));
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            file_entry("/fixture/bravo", "bravo"),
+            file_entry("/fixture/alpha", "alpha"),
+        ],
+    );
+    let order_before: Vec<_> = state.columns[0]
+        .entries
+        .iter()
+        .map(|entry| entry.display_name.clone())
+        .collect();
+
+    let applied = state.apply_metadata(
+        RequestId(1),
+        vec![
+            metadata_update("/fixture/alpha", 10, 100),
+            metadata_update("/fixture/bravo", 20, 200),
+        ],
+    );
+
+    assert_eq!(applied, Some((0, vec![0, 1])));
+    let entries = &state.columns[0].entries;
+    assert_eq!(entries[0].size, MetadataValue::Known(10));
+    assert_eq!(entries[1].modified_unix_seconds, MetadataValue::Known(200));
+    let order_after: Vec<_> = entries
+        .iter()
+        .map(|entry| entry.display_name.clone())
+        .collect();
+    assert_eq!(order_before, order_after);
+}
+
+#[test]
+fn metadata_fill_for_a_superseded_load_is_dropped() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/fixture"), RequestId(1));
+    state.apply_batch(RequestId(1), vec![file_entry("/fixture/alpha", "alpha")]);
+
+    assert_eq!(
+        state.apply_metadata(
+            RequestId(2),
+            vec![metadata_update("/fixture/alpha", 10, 100)]
+        ),
+        None
+    );
+    assert_eq!(
+        state.apply_metadata(
+            RequestId(1),
+            vec![metadata_update("/fixture/ghost", 10, 100)]
+        ),
+        None
+    );
+    assert_eq!(state.columns[0].entries[0].size, MetadataValue::Unknown);
+}
+
+#[test]
+fn depth_for_request_tracks_live_loads_only() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/fixture"), RequestId(1));
+    assert_eq!(state.depth_for_request(RequestId(1)), Some(0));
+    assert_eq!(state.depth_for_request(RequestId(9)), None);
+
+    assert!(state.descend(0, location("/fixture/sub"), RequestId(2)));
+    assert_eq!(state.depth_for_request(RequestId(2)), Some(1));
+
+    state.reload_column(0, RequestId(3));
+    assert_eq!(state.depth_for_request(RequestId(1)), None);
+    assert_eq!(state.depth_for_request(RequestId(3)), Some(0));
+}
+
+#[test]
+fn positioned_fill_applies_in_place_and_flags_moved_rows() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/fixture"), RequestId(1));
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            file_entry("/fixture/alpha", "alpha"),
+            file_entry("/fixture/bravo", "bravo"),
+            file_entry("/fixture/charlie", "charlie"),
+        ],
+    );
+
+    let applied = state.apply_positioned_metadata(
+        RequestId(1),
+        vec![
+            (0, metadata_update("/fixture/alpha", 30, 100)),
+            (2, metadata_update("/fixture/charlie", 10, 200)),
+        ],
+    );
+    assert!(
+        matches!(applied, Some((0, ref positions, ref stale)) if positions == &[0, 2] && stale.is_empty())
+    );
+    assert_eq!(state.columns[0].entries[0].size, MetadataValue::Known(30));
+
+    state.columns[0].entries.remove(0);
+    let applied = state.apply_positioned_metadata(
+        RequestId(1),
+        vec![
+            (1, metadata_update("/fixture/bravo", 20, 150)),
+            (2, metadata_update("/fixture/charlie", 10, 200)),
+        ],
+    );
+    assert!(
+        matches!(applied, Some((0, ref positions, ref stale)) if positions.is_empty() && stale.len() == 2)
+    );
+    assert_eq!(state.columns[0].entries[0].size, MetadataValue::Unknown);
+}
+
+#[test]
+fn fill_updates_never_clobber_known_fields() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/fixture"), RequestId(1));
+    let mut half_known = file_entry("/fixture/half", "half");
+    half_known.size = MetadataValue::Known(50);
+    state.apply_batch(RequestId(1), vec![half_known]);
+
+    let applied = state.apply_metadata(
+        RequestId(1),
+        vec![MetadataUpdate {
+            location: location("/fixture/half"),
+            size: MetadataValue::Unknown,
+            modified_unix_seconds: MetadataValue::Known(300),
+            mode: MetadataValue::Known(0o100640),
+            image_dimensions: MetadataValue::Known((1920, 1080)),
+            child_count: MetadataValue::Known(4),
+            duration_seconds: MetadataValue::Known(83),
+        }],
+    );
+    assert!(matches!(applied, Some((0, ref positions)) if positions == &[0]));
+    assert_eq!(state.columns[0].entries[0].size, MetadataValue::Known(50));
+    assert_eq!(
+        state.columns[0].entries[0].modified_unix_seconds,
+        MetadataValue::Known(300)
+    );
+    assert_eq!(
+        state.columns[0].entries[0].mode,
+        MetadataValue::Known(0o100640)
+    );
+    assert_eq!(
+        state.columns[0].entries[0].image_dimensions,
+        MetadataValue::Known((1920, 1080))
+    );
+    assert_eq!(
+        state.columns[0].entries[0].child_count,
+        MetadataValue::Known(4)
+    );
+    assert_eq!(
+        state.columns[0].entries[0].duration_seconds,
+        MetadataValue::Known(83)
+    );
+
+    let applied = state.apply_metadata(
+        RequestId(1),
+        vec![MetadataUpdate {
+            location: location("/fixture/half"),
+            size: MetadataValue::Unknown,
+            modified_unix_seconds: MetadataValue::Unknown,
+            mode: MetadataValue::Unknown,
+            image_dimensions: MetadataValue::Unknown,
+            child_count: MetadataValue::Unknown,
+            duration_seconds: MetadataValue::Unknown,
+        }],
+    );
+    assert_eq!(applied, None);
+    assert_eq!(
+        state.columns[0].entries[0].image_dimensions,
+        MetadataValue::Known((1920, 1080))
+    );
+    assert_eq!(
+        state.columns[0].entries[0].child_count,
+        MetadataValue::Known(4)
+    );
+    assert_eq!(
+        state.columns[0].entries[0].duration_seconds,
+        MetadataValue::Known(83)
+    );
+}
+
+#[test]
+fn gap_targets_cover_directory_mtimes_but_never_directory_sizes() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/fixture"), RequestId(1));
+    let mut complete_file = file_entry("/fixture/done", "done");
+    complete_file.size = MetadataValue::Known(5);
+    complete_file.modified_unix_seconds = MetadataValue::Known(60);
+    let mut half_file = file_entry("/fixture/half", "half");
+    half_file.size = MetadataValue::Known(50);
+    state.apply_batch(
+        RequestId(1),
+        vec![named_entry("/fixture/sub", "sub"), complete_file, half_file],
+    );
+
+    assert_eq!(
+        state.column_unknown_metadata(0).map(|targets| {
+            targets
+                .into_iter()
+                .map(|(position, location)| (position, location.display_path()))
+                .collect::<Vec<_>>()
+        }),
+        Some(vec![
+            (0, "/fixture/sub".to_owned()),
+            (2, "/fixture/half".to_owned()),
+        ])
+    );
+}
+
+#[test]
+fn selected_count_reports_without_cloning_entries() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/fixture"), RequestId(1));
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            named_entry("/fixture/alpha", "alpha"),
+            named_entry("/fixture/bravo", "bravo"),
+            named_entry("/fixture/charlie", "charlie"),
+        ],
+    );
+    assert_eq!(state.selected_count(), 0);
+    assert!(state.set_selection(0, &[0, 2], Some(2)));
+    assert_eq!(state.selected_count(), 2);
+}
+
+#[test]
+fn the_range_anchor_is_readable_and_replaceable_by_position() {
+    let mut state = NavigationState::default();
+    state.navigate(location("/fixture"), RequestId(1));
+    state.select_first_on_load(0);
+    state.apply_batch(
+        RequestId(1),
+        vec![
+            named_entry("/fixture/a", "a"),
+            named_entry("/fixture/b", "b"),
+            named_entry("/fixture/c", "c"),
+        ],
+    );
+    assert_eq!(state.selection_anchor_position(0), Some(0));
+    assert!(state.set_selection_anchor(0, 2));
+    assert_eq!(state.selection_anchor_position(0), Some(2));
+    assert!(!state.set_selection_anchor(0, 9));
+    assert!(!state.set_selection_anchor(1, 0));
+    assert_eq!(state.selection_anchor_position(0), Some(2));
+    assert_eq!(
+        state.extend_visual_selection(0, 1, &[0, 1, 2]),
+        Some(vec![1, 2])
+    );
+}
+
+fn typed_entry(name: &str, kind: EntryKind) -> FileEntry {
+    FileEntry {
+        thumbnail_path: None,
+        location: location(&format!("/fixture/{name}")),
+        native_name: OsString::from(name),
+        display_name: name.into(),
+        kind,
+        size: MetadataValue::Unknown,
+        modified_unix_seconds: MetadataValue::Unknown,
+        is_hidden: false,
+        mode: MetadataValue::Unknown,
+        image_dimensions: MetadataValue::Unknown,
+        child_count: MetadataValue::Unknown,
+        duration_seconds: MetadataValue::Unknown,
+    }
+}
+
+#[test]
+fn type_sorting_orders_by_mime_descriptions_with_folders_first() {
+    let mut entries = [
+        typed_entry("z_other.qqqqq", EntryKind::File),
+        typed_entry("b_notes.json", EntryKind::File),
+        typed_entry("a_notes.json", EntryKind::File),
+        typed_entry("folder_z", EntryKind::Directory),
+        typed_entry("folder_a", EntryKind::Directory),
+        typed_entry("a_other.qqqqq", EntryKind::File),
+        typed_entry("doc.pdf", EntryKind::File),
+        typed_entry("script.py", EntryKind::File),
+    ];
+
+    let preferences_asc = ViewPreferences {
+        folders_first: true,
+        sort_key: SortKey::Type,
+        sort_direction: SortDirection::Ascending,
+        show_hidden: false,
+    };
+    entries.sort_by(|left, right| compare_entries(left, right, preferences_asc));
+    let names_asc: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry.display_name.as_str())
+        .collect();
+    assert_eq!(
+        names_asc,
+        [
+            "folder_a",
+            "folder_z",
+            "a_notes.json",
+            "b_notes.json",
+            "doc.pdf",
+            "script.py",
+            "a_other.qqqqq",
+            "z_other.qqqqq",
+        ]
+    );
+
+    let preferences_desc = ViewPreferences {
+        folders_first: true,
+        sort_key: SortKey::Type,
+        sort_direction: SortDirection::Descending,
+        show_hidden: false,
+    };
+    entries.sort_by(|left, right| compare_entries(left, right, preferences_desc));
+    let names_desc: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry.display_name.as_str())
+        .collect();
+    assert_eq!(
+        names_desc,
+        [
+            "folder_a",
+            "folder_z",
+            "a_other.qqqqq",
+            "z_other.qqqqq",
+            "script.py",
+            "doc.pdf",
+            "a_notes.json",
+            "b_notes.json",
+        ]
+    );
+}
+
+#[test]
+fn type_sorting_orders_by_mime_descriptions_without_folders_first() {
+    let mut entries = [
+        typed_entry("z_other.qqqqq", EntryKind::File),
+        typed_entry("b_notes.json", EntryKind::File),
+        typed_entry("a_notes.json", EntryKind::File),
+        typed_entry("folder_z", EntryKind::Directory),
+        typed_entry("folder_a", EntryKind::Directory),
+        typed_entry("a_other.qqqqq", EntryKind::File),
+        typed_entry("doc.pdf", EntryKind::File),
+        typed_entry("script.py", EntryKind::File),
+    ];
+
+    let preferences_asc = ViewPreferences {
+        folders_first: false,
+        sort_key: SortKey::Type,
+        sort_direction: SortDirection::Ascending,
+        show_hidden: false,
+    };
+    entries.sort_by(|left, right| compare_entries(left, right, preferences_asc));
+    let names_asc: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry.display_name.as_str())
+        .collect();
+    assert_eq!(
+        names_asc,
+        [
+            "folder_a",
+            "folder_z",
+            "a_notes.json",
+            "b_notes.json",
+            "doc.pdf",
+            "script.py",
+            "a_other.qqqqq",
+            "z_other.qqqqq",
+        ]
+    );
+
+    let preferences_desc = ViewPreferences {
+        folders_first: false,
+        sort_key: SortKey::Type,
+        sort_direction: SortDirection::Descending,
+        show_hidden: false,
+    };
+    entries.sort_by(|left, right| compare_entries(left, right, preferences_desc));
+    let names_desc: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry.display_name.as_str())
+        .collect();
+    assert_eq!(
+        names_desc,
+        [
+            "a_other.qqqqq",
+            "z_other.qqqqq",
+            "script.py",
+            "doc.pdf",
+            "a_notes.json",
+            "b_notes.json",
+            "folder_a",
+            "folder_z",
+        ]
+    );
+}
+
+#[test]
+fn column_entry_counts_breakdown_and_hidden() {
+    let mut state = NavigationState::default();
+    assert_eq!(state.column_entry_counts(0), None);
+
+    state.navigate(location("/fixture"), RequestId(1));
+    assert_eq!(
+        state.column_entry_counts(0),
+        Some(ColumnEntryCounts {
+            total: 0,
+            files: 0,
+            folders: 0,
+        })
+    );
+
+    let mut folder = named_entry("/fixture/folder1", "folder1");
+    folder.kind = EntryKind::Directory;
+
+    let mut file1 = named_entry("/fixture/file1.txt", "file1.txt");
+    file1.kind = EntryKind::File;
+
+    let mut file2 = named_entry("/fixture/file2.txt", "file2.txt");
+    file2.kind = EntryKind::File;
+
+    let mut hidden_file = named_entry("/fixture/.hidden", ".hidden");
+    hidden_file.kind = EntryKind::File;
+    hidden_file.is_hidden = true;
+
+    state.apply_batch(RequestId(1), vec![folder, file1, file2, hidden_file]);
+
+    assert_eq!(
+        state.column_entry_counts(0),
+        Some(ColumnEntryCounts {
+            total: 3,
+            files: 2,
+            folders: 1,
+        })
+    );
+
+    state.set_show_hidden(true);
+    assert_eq!(
+        state.column_entry_counts(0),
+        Some(ColumnEntryCounts {
+            total: 4,
+            files: 3,
+            folders: 1,
+        })
+    );
 }

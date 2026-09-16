@@ -1,6 +1,10 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
-use super::{PreviewContent, content_family, has_plain_text_extension, normalize_preview_text};
+use super::{
+    MediaPreviewSize, PreviewContent, content_family, has_plain_text_extension,
+    is_extensionless_dotfile, is_image_path, is_media_path,
+    is_non_executable_extensionless_dotfile, normalize_preview_text,
+};
 
 #[test]
 fn preview_text_normalizes_nul_before_any_gtk_view() {
@@ -9,6 +13,31 @@ fn preview_text_normalizes_nul_before_any_gtk_view() {
         normalize_preview_text("ordinary text"),
         std::borrow::Cow::Borrowed(_)
     ));
+}
+
+#[test]
+fn media_viewport_sizes_follow_display_scale_without_exceeding_the_pixel_budget() {
+    assert_eq!(
+        MediaPreviewSize::for_viewport(520, 800, 1),
+        MediaPreviewSize::new(520, 800)
+    );
+    assert_eq!(
+        MediaPreviewSize::for_viewport(520, 800, 2),
+        MediaPreviewSize::new(1040, 1280)
+    );
+    assert_eq!(
+        MediaPreviewSize::for_viewport(i32::MAX, i32::MAX, 2),
+        MediaPreviewSize::new(1280, 1280)
+    );
+}
+
+#[test]
+fn recognizes_image_paths_for_metadata_probes() {
+    assert!(is_image_path(std::path::Path::new("photo.PNG")));
+    assert!(!is_image_path(std::path::Path::new("notes.txt")));
+    assert!(is_media_path(std::path::Path::new("movie.mp4")));
+    assert!(is_media_path(std::path::Path::new("song.flac")));
+    assert!(!is_media_path(std::path::Path::new("photo.png")));
 }
 
 #[test]
@@ -22,6 +51,30 @@ fn recognizes_configuration_files_as_plain_text() {
     assert!(!has_plain_text_extension(std::ffi::OsStr::new(
         "archive.zip"
     )));
+}
+
+#[test]
+fn recognizes_extensionless_dotfiles() {
+    assert!(is_extensionless_dotfile(std::ffi::OsStr::new(".steampath")));
+    assert!(!is_extensionless_dotfile(std::ffi::OsStr::new("steampath")));
+    assert!(!is_extensionless_dotfile(std::ffi::OsStr::new(
+        ".settings.toml"
+    )));
+}
+
+#[test]
+fn recognizes_non_executable_extensionless_dotfiles() {
+    let name = std::ffi::OsStr::new(".steamid");
+
+    assert!(is_non_executable_extensionless_dotfile(
+        name,
+        Some(0o100644)
+    ));
+    assert!(!is_non_executable_extensionless_dotfile(
+        name,
+        Some(0o100755)
+    ));
+    assert!(!is_non_executable_extensionless_dotfile(name, None));
 }
 
 #[test]

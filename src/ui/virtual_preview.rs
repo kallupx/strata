@@ -7,16 +7,13 @@ use std::{
     time::Duration,
 };
 
-use gtk::{glib, prelude::*};
+use gtk::{gio, glib, prelude::*};
 use sourceview5::prelude::*;
 
-use crate::{
-    model::Location,
-    services::{
-        DocumentLayout, DocumentListChildKind, DocumentSpan, DocumentSpanStyle,
-        DocumentTableCellLayout, DocumentUnit, DocumentUnitKind, has_web_scheme,
-        normalize_preview_text,
-    },
+use crate::services::{
+    DocumentLayout, DocumentListChildKind, DocumentSpan, DocumentSpanStyle,
+    DocumentTableCellLayout, DocumentUnit, DocumentUnitKind, has_web_scheme,
+    normalize_preview_text,
 };
 
 const SOURCE_UNIT_BYTES: usize = 16 * 1024;
@@ -1015,11 +1012,17 @@ fn document_table_cell() -> gtk::Label {
     label.set_hexpand(true);
     label.connect_activate_link(|label, uri| {
         if has_web_scheme(uri) {
-            super::browser::open_location(&Location::uri(uri), label);
+            open_web_link(uri, label);
         }
         glib::Propagation::Stop
     });
     label
+}
+
+fn open_web_link(uri: &str, parent: &impl IsA<gtk::Widget>) {
+    if let Err(error) = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>) {
+        super::modal::show_error_dialog(parent, "Unable to open link", &error.to_string());
+    }
 }
 
 fn styled_markup(text: &str, spans: &[DocumentSpan]) -> String {
@@ -1142,7 +1145,7 @@ fn install_pointer_selection(
         if let Some(uri) = matching_link(pressed.as_deref(), released.as_deref())
             && has_web_scheme(uri)
         {
-            super::browser::open_location(&Location::uri(uri), &list);
+            open_web_link(uri, &list);
         }
     });
     list.add_controller(click);

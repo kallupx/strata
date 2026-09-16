@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 use super::{
     LocationValidationError, UriCredentials, backend_unavailable_message, sanitize_uri_credentials,
@@ -89,4 +89,52 @@ fn backend_unavailable_message_names_the_known_smb_package() {
 fn backend_unavailable_message_falls_back_for_unknown_schemes() {
     let message = backend_unavailable_message("dav://host/path");
     assert!(message.contains("dav://"));
+}
+
+#[test]
+fn default_fill_reports_unsupported_synchronously() {
+    use super::{
+        DirectoryEvent, FileSource, LoadHandle, MetadataOutcome, MetadataRequest, RequestId,
+    };
+    use crate::model::Location;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    struct NoMetadata;
+    impl FileSource for NoMetadata {
+        fn validate_location(
+            &self,
+            _location: &Location,
+        ) -> Result<(), super::LocationValidationError> {
+            Ok(())
+        }
+
+        fn enumerate(
+            &self,
+            _request: super::DirectoryRequest,
+            _emit: Rc<dyn Fn(DirectoryEvent)>,
+        ) -> LoadHandle {
+            LoadHandle::new(|| {})
+        }
+    }
+
+    let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let collected = events.clone();
+    let _handle = NoMetadata.fill_metadata(
+        MetadataRequest {
+            id: RequestId(4),
+            entries: Vec::new(),
+            full: false,
+            include_icon_details: false,
+            time_budget: Duration::from_secs(1),
+        },
+        Rc::new(move |event| collected.borrow_mut().push(event)),
+    );
+    assert!(matches!(
+        events.borrow().as_slice(),
+        [DirectoryEvent::MetadataFinished {
+            request_id: RequestId(4),
+            outcome: MetadataOutcome::Unsupported,
+        }]
+    ));
 }

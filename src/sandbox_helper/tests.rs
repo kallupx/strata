@@ -1,7 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 use std::{
-    path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
 };
@@ -9,80 +8,10 @@ use std::{
 use gdk_pixbuf::prelude::*;
 
 use super::{
-    MediaBackend, bounded_output, bounded_output_with_timeout, bounded_surface_dimensions,
-    media_backends, media_command, read_limited, render_pixbuf, render_raw, run,
-    run_media_backends, scale_embedded_thumbnail,
+    bounded_output, bounded_output_with_timeout, bounded_surface_dimensions, pdf_render_request,
+    read_limited, render_pixbuf, render_raw, render_raw_thumbnail, render_simple_dcraw, run,
+    scale_embedded_thumbnail,
 };
-
-fn arguments(backend: &MediaBackend) -> String {
-    media_command(backend, Path::new("/input"))
-        .get_args()
-        .map(|argument| argument.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-#[test]
-fn media_backends_are_deterministic_and_ordered() {
-    let devices = [
-        PathBuf::from("/dev/nvidiactl"),
-        PathBuf::from("/dev/dri/renderD129"),
-        PathBuf::from("/dev/nvidia0"),
-        PathBuf::from("/dev/dri/renderD128"),
-    ];
-
-    assert_eq!(
-        media_backends(&devices),
-        [
-            MediaBackend::VaApi("/dev/dri/renderD128".into()),
-            MediaBackend::VaApi("/dev/dri/renderD129".into()),
-            MediaBackend::Vulkan(0),
-            MediaBackend::Vulkan(1),
-            MediaBackend::Software,
-        ]
-    );
-    assert_eq!(
-        media_backends(&["/dev/nvidia0".into(), "/dev/nvidiactl".into()]),
-        [MediaBackend::Vulkan(0), MediaBackend::Software]
-    );
-}
-
-#[test]
-fn hardware_failures_fall_back_and_first_success_stops() {
-    let backends = [
-        MediaBackend::VaApi("/dev/dri/renderD128".into()),
-        MediaBackend::Vulkan(0),
-        MediaBackend::Software,
-    ];
-    let mut attempts = Vec::new();
-    let result = run_media_backends(&backends, |backend| {
-        attempts.push(backend.clone());
-        match backend {
-            MediaBackend::VaApi(_) => Err(()),
-            MediaBackend::Vulkan(_) => Ok(None),
-            MediaBackend::Software => Ok(Some("software")),
-        }
-    });
-
-    assert_eq!(result, Ok("software"));
-    assert_eq!(attempts, backends);
-
-    attempts.clear();
-    let result = run_media_backends(&backends, |backend| {
-        attempts.push(backend.clone());
-        Ok::<_, ()>(matches!(backend, MediaBackend::Vulkan(_)).then_some("vulkan"))
-    });
-    assert_eq!(result, Ok("vulkan"));
-    assert_eq!(attempts, &backends[..2]);
-}
-
-#[test]
-fn final_software_failure_returns_the_normalization_error() {
-    assert_eq!(
-        run_media_backends(&[MediaBackend::Software], |_| Ok::<Option<()>, ()>(None)),
-        Err("Unable to normalize media preview".to_owned())
-    );
-}
 
 #[test]
 fn timed_bounded_commands_stop_and_report_failure_at_their_deadline() {
@@ -111,6 +40,22 @@ fn timed_bounded_commands_stop_and_report_failure_at_their_deadline() {
         Duration::from_secs(1),
     );
     assert!(oversized.is_err());
+}
+
+#[test]
+fn pdf_preview_requests_carry_a_bounded_page_and_viewport() {
+    assert_eq!(
+        pdf_render_request("12:640x800"),
+        Ok((12, crate::sandbox::PdfRenderSize::new(640, 800)))
+    );
+    assert_eq!(
+        pdf_render_request("0:99999x1"),
+        Ok((0, crate::sandbox::PdfRenderSize::new(99999, 1)))
+    );
+    assert!(pdf_render_request("12").is_err());
+    assert!(pdf_render_request("12:0").is_err());
+    assert!(pdf_render_request("page:640x800").is_err());
+    assert!(pdf_render_request("12:wide").is_err());
 }
 
 #[test]
@@ -163,56 +108,6 @@ fn file_reads_stop_before_exceeding_the_output_limit() {
 }
 
 #[test]
-fn media_commands_select_the_backend_and_preserve_limits() {
-    for backend in [
-        MediaBackend::VaApi("/dev/dri/renderD129".into()),
-        MediaBackend::Vulkan(1),
-    ] {
-        assert!(
-            media_command(&backend, Path::new("/input"))
-                .get_envs()
-                .any(|(name, value)| name == "MALLOC_ARENA_MAX" && value == Some("1".as_ref()))
-        );
-    }
-
-    let vaapi = arguments(&MediaBackend::VaApi("/dev/dri/renderD129".into()));
-    assert!(vaapi.contains("-threads 1 -filter_threads 1"));
-    assert!(vaapi.contains("-hwaccel vaapi -hwaccel_device /dev/dri/renderD129"));
-    assert!(vaapi.contains("-hwaccel_output_format vaapi"));
-    assert!(
-        vaapi.contains(
-            "-vf scale_vaapi=w=1280:h=1280:force_original_aspect_ratio=decrease:force_divisible_by=2:format=nv12 -c:v h264_vaapi"
-        )
-    );
-    assert!(vaapi.contains("-c:a aac -b:a 96k -movflags +frag_keyframe+empty_moov -f mp4"));
-
-    let vulkan = arguments(&MediaBackend::Vulkan(1));
-    assert!(vulkan.contains("-threads 1 -filter_threads 1"));
-    assert!(vulkan.contains("-init_hw_device vulkan=vk:1 -filter_hw_device vk"));
-    assert!(vulkan.contains("-hwaccel vulkan -hwaccel_device vk"));
-    assert!(vulkan.contains(
-        "-vf scale_vulkan=w='if(gte(iw,ih),min(1280,trunc(iw/2)*2),-2)':h='if(gte(iw,ih),-2,min(1280,trunc(ih/2)*2))':format=nv12 -c:v h264_vulkan"
-    ));
-    assert!(vulkan.contains("-usage transcode -tune ull"));
-    assert!(vulkan.contains("-c:a aac -b:a 96k -movflags +frag_keyframe+empty_moov -f mp4"));
-
-    let software = arguments(&MediaBackend::Software);
-    assert!(software.contains(
-        "-vf scale=w=1280:h=1280:force_original_aspect_ratio=decrease,format=yuv420p -c:v libvpx -auto-alt-ref 0"
-    ));
-    assert!(software.contains("-threads 2 -deadline realtime -cpu-used 8"));
-    assert!(software.contains("-c:a libopus -b:a 96k -f webm"));
-
-    for command in [vaapi, vulkan, software] {
-        assert!(command.contains("-max_alloc 536870912 -max_pixels 50000000"));
-        assert!(command.contains("-map 0:v:0 -map 0:a:0? -sn -dn -t 30"));
-        assert!(command.contains("-fpsmax 30"));
-        assert!(command.contains("-b:v 2M -maxrate 3M -bufsize 4M"));
-        assert!(command.ends_with("pipe:1"));
-    }
-}
-
-#[test]
 fn embedded_thumbnails_scale_to_the_requested_size() {
     let source = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 80, 60)
         .expect("allocate thumbnail");
@@ -231,19 +126,38 @@ fn embedded_thumbnails_scale_to_the_requested_size() {
 }
 
 #[test]
+fn image_previews_preserve_small_sources_and_bound_large_decodes() {
+    let directory = tempfile::tempdir().expect("image fixture");
+    let path = directory.path().join("image.png");
+    for (width, height, expected) in [(80, 40, (80, 40)), (1200, 600, (800, 400))] {
+        let source = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, width, height)
+            .expect("source image");
+        source.fill(0x3366_99ff);
+        source.savev(&path, "png", &[]).expect("save source");
+        let png = render_raw(&path, 800).expect("render image preview");
+        let loader = gdk_pixbuf::PixbufLoader::new();
+        loader.write(&png).expect("load preview");
+        loader.close().expect("finish preview");
+        let preview = loader.pixbuf().expect("decoded preview");
+        assert_eq!((preview.width(), preview.height()), expected);
+    }
+}
+
+#[test]
 fn preview_image_uses_raw_fallbacks() {
     let directory = tempfile::tempdir().expect("tempdir");
     let input = directory.path().join("photo.ARW");
     let output = directory.path().join("result.png");
     std::fs::write(&input, b"not a camera file").expect("write stub");
 
-    let pixbuf = render_pixbuf(&input, 1400).expect_err("stub must fail pixbuf");
-    let raw = render_raw(&input, 1400);
+    let pixbuf = render_pixbuf(&input, 800).expect_err("stub must fail pixbuf");
+    let raw = render_raw(&input, 800);
     let preview = run(&[
         "preview-image".into(),
         input.to_string_lossy().into_owned(),
         output.to_string_lossy().into_owned(),
-        "1400".into(),
+        "800".into(),
+        "software".into(),
     ]);
 
     match raw {
@@ -251,6 +165,52 @@ fn preview_image_uses_raw_fallbacks() {
         Err(raw) => {
             assert_ne!(pixbuf, raw);
             assert_eq!(preview.expect_err("stub should fail RAW fallbacks"), raw);
+        }
+    }
+}
+
+#[test]
+fn concurrent_raw_fallbacks_do_not_share_staging_files() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let input = directory.path().join("photo.ARW");
+    std::fs::write(&input, b"not a camera file").expect("write stub");
+    let expected = render_simple_dcraw(&input, 256).expect_err("invalid RAW file");
+
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|_| scope.spawn(|| render_simple_dcraw(&input, 256)))
+            .collect();
+        for worker in workers {
+            assert_eq!(worker.join().expect("worker"), Err(expected.clone()));
+        }
+    });
+}
+
+#[test]
+fn thumbnail_raw_uses_embedded_preview_fallbacks() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let input = directory.path().join("photo.ARW");
+    let output = directory.path().join("result.png");
+    std::fs::write(&input, b"not a camera file").expect("write stub");
+
+    let pixbuf = render_pixbuf(&input, 256).expect_err("stub must fail pixbuf");
+    let thumbnail = render_raw_thumbnail(&input, 256);
+    let helper = run(&[
+        "thumbnail-raw".into(),
+        input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+        "256".into(),
+        "software".into(),
+    ]);
+
+    match thumbnail {
+        Ok(_) => helper.expect("thumbnail-raw should use embedded preview fallbacks"),
+        Err(thumbnail) => {
+            assert_ne!(pixbuf, thumbnail);
+            assert_eq!(
+                helper.expect_err("stub should fail RAW fallbacks"),
+                thumbnail
+            );
         }
     }
 }

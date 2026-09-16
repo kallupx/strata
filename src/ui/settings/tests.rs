@@ -1,40 +1,67 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
+
+mod preferences;
+mod reference;
+mod typography;
 
 use std::rc::Rc;
 
-use crate::services::{BuildKind, Channel, ReleaseMetadata, UpdateCheck, Version};
-
-use super::{
-    COMPACT_NAVIGATION_BREAKPOINT, DIALOG_HEIGHT, DIALOG_MARGIN, DIALOG_WIDTH,
-    RELEASE_CHANNEL_DESCRIPTION, RELEASE_CHANNEL_TITLE, install_guard, installed_version_status,
-    is_stale_check, offer_still_eligible, responsive_dialog_size, shows_available_release_notes,
-    theme_background_is_light, theme_name_matches, uses_compact_navigation,
+use crate::services::{
+    BuildKind, Channel, InstallSource, ManagedInstall, ReleaseMetadata, UpdateCheck, UpdateMethod,
+    Version,
 };
 
-#[test]
-fn a_checks_result_is_current_only_for_the_generation_it_was_issued_under() {
-    assert!(!is_stale_check(1, 1));
-    assert!(!is_stale_check(0, 0));
-}
+use super::{
+    COMPACT_NAVIGATION_BREAKPOINT, UPDATE_DUE_INTERVAL, aur_update_command,
+    effective_update_channel, force_due_update_check,
+    general::{video_preview_backend_label, video_preview_control_state},
+    install_guard, installed_version_status, is_stale_check, managed_channel_description,
+    managed_install_summary, offer_still_eligible, omarchy_update_command,
+    resolve_update_method_async, responsive_dialog_size, shows_available_release_notes,
+    theme::{theme_background_is_light, theme_name_matches},
+    update_check_due, update_check_message, update_dialog_status, update_status_markup,
+    uses_compact_navigation,
+};
+use crate::{sandbox::MediaPreviewBackend, test_support::gtk_test, ui::theme::ThemeManager};
 
 #[test]
 fn a_checks_result_is_stale_once_a_newer_check_has_started() {
     // The scenario Important 1 fixes: a check issued as generation 1 is
     // still in flight when a channel toggle starts generation 2. Generation
     // 1's eventual result must never be applied.
+    assert!(!is_stale_check(1, 1));
     assert!(is_stale_check(1, 2));
     assert!(is_stale_check(2, 1));
 }
 
-#[test]
-fn settings_dialog_keeps_its_preferred_size_when_space_allows() {
-    assert_eq!(
-        responsive_dialog_size(
-            DIALOG_WIDTH + DIALOG_MARGIN * 2,
-            DIALOG_HEIGHT + DIALOG_MARGIN * 2,
-        ),
-        (DIALOG_WIDTH, DIALOG_HEIGHT)
-    );
+fn packaged() -> InstallSource {
+    let managed: ManagedInstall = toml::from_str(
+        r#"
+        manager = "pacman"
+        package = "strata-bin"
+        channel = "stable"
+        update_command = "yay -Syu strata-bin"
+        alternate_package = "strata-rc-bin"
+        "#,
+    )
+    .expect("the marker to parse");
+    InstallSource::Managed(managed)
+}
+
+fn available_release() -> UpdateCheck {
+    UpdateCheck::Available {
+        release: ReleaseMetadata {
+            version: "0.8.0".to_owned(),
+            url: "https://github.com/lgse/strata/releases/tag/v0.8.0".to_owned(),
+            notes: String::new(),
+            note_blocks: Vec::new(),
+            kind: BuildKind::Stable,
+            tag: "v0.8.0".to_owned(),
+            published_at: None,
+            commit: None,
+        },
+        download_url: "https://example.invalid/strata.tar.gz".to_owned(),
+    }
 }
 
 #[test]
@@ -66,6 +93,11 @@ fn theme_appearance_uses_background_luminance() {
     assert!(theme_background_is_light("#ffffff"));
     assert!(theme_background_is_light("#efecf4"));
     assert!(!theme_background_is_light("#1e1d1f"));
+    assert!(theme_background_is_light("rgb(255,255,255)"));
+    assert!(!theme_background_is_light("rgb(30,29,31)"));
+    assert!(theme_background_is_light("#fff"));
+    assert!(theme_background_is_light("white"));
+    assert!(!theme_background_is_light("black"));
     assert!(!theme_background_is_light("invalid"));
 }
 
@@ -93,19 +125,106 @@ fn available_notes_are_shown_only_for_a_newer_release() {
 }
 
 #[test]
-fn release_channel_copy_distinguishes_preview_from_nightly() {
-    assert_eq!(RELEASE_CHANNEL_TITLE, "Release channel");
+fn a_packaged_install_is_told_how_to_update_through_its_package_manager() {
+    let result = available_release();
+    let message = update_check_message(&result, UpdateMethod::Aur);
+    let markup = update_status_markup(message, &result, &packaged());
+
+    assert!(markup.ends_with("\nUpdate Strata with: yay -Syu strata-bin"));
+}
+
+#[test]
+fn a_user_owned_install_gets_no_packaging_guidance() {
+    let result = available_release();
+    let message = update_check_message(&result, UpdateMethod::InPlace);
+
     assert_eq!(
-        RELEASE_CHANNEL_DESCRIPTION,
-        "Preview receives alpha, beta, and release-candidate builds. Nightly also receives daily development builds."
+        update_status_markup(message.clone(), &result, &InstallSource::SelfManaged),
+        message
     );
+}
+
+#[test]
+fn packaging_guidance_is_withheld_when_no_update_is_available() {
+    let message = update_check_message(&UpdateCheck::UpToDate, UpdateMethod::Aur);
+
+    assert_eq!(
+        update_status_markup(message.clone(), &UpdateCheck::UpToDate, &packaged()),
+        message
+    );
+}
+
+#[test]
+fn the_managed_row_names_the_package_channel_and_commands() {
+    let source = packaged();
+    let managed = source.managed().expect("a managed install");
+
+    assert_eq!(
+        managed_install_summary(managed),
+        "Installed by pacman as strata-bin.\n\
+         Tracking the stable release channel.\n\
+         Update Strata with: yay -Syu strata-bin\n\
+         Other release channels are published as strata-rc-bin."
+    );
+}
+
+#[test]
+fn the_channel_selector_explains_a_packaged_channel_and_how_to_change_it() {
+    let source = packaged();
+    let managed = source.managed().expect("a managed install");
+
+    assert_eq!(
+        managed_channel_description(managed),
+        "This install tracks the stable release channel. \
+         Other release channels are published as strata-rc-bin."
+    );
+}
+
+#[test]
+fn the_packaged_channel_selection_follows_the_installed_package() {
+    let source = packaged();
+    let managed = source.managed().expect("a managed install");
+
+    assert_eq!(managed.tracked_channel(), Some(Channel::Stable));
+}
+
+#[test]
+fn the_update_dialog_defers_to_the_package_manager() {
+    let source = packaged();
+    let managed = source.managed().expect("a managed install");
+
+    assert_eq!(
+        update_dialog_status(managed),
+        "Installed by pacman as strata-bin. Update Strata with: yay -Syu strata-bin"
+    );
+}
+
+#[test]
+fn video_preview_backend_selector_labels_all_options() {
+    for (backend, label) in [
+        (MediaPreviewBackend::Automatic, "Automatic"),
+        (MediaPreviewBackend::VaApi, "VA-API"),
+        (MediaPreviewBackend::Vulkan, "Vulkan"),
+    ] {
+        assert_eq!(video_preview_backend_label(backend), label);
+    }
+    assert_eq!(
+        video_preview_backend_label(MediaPreviewBackend::Software),
+        "Automatic"
+    );
+}
+
+#[test]
+fn video_preview_controls_follow_enabled_state() {
+    assert_eq!(video_preview_control_state(true), (true, true, true));
+    assert_eq!(video_preview_control_state(false), (false, true, false));
 }
 
 #[test]
 fn installed_version_status_stays_plain_for_a_stable_build() {
     let version = Version::parse("0.6.0").expect("valid version");
     assert_eq!(
-        installed_version_status(&version, BuildKind::Stable),
+        installed_version_status(&version, BuildKind::Stable, UpdateMethod::InPlace),
         "Version 0.6.0"
     );
 }
@@ -114,9 +233,100 @@ fn installed_version_status_stays_plain_for_a_stable_build() {
 fn installed_version_status_names_the_build_kind_for_a_prerelease() {
     let version = Version::parse("0.6.0-rc.1").expect("valid version");
     assert_eq!(
-        installed_version_status(&version, BuildKind::Rc),
+        installed_version_status(&version, BuildKind::Rc, UpdateMethod::InPlace),
         "Version 0.6.0-rc.1 · Release candidate"
     );
+}
+
+#[test]
+fn package_managed_updates_always_follow_stable() {
+    for selected in [Channel::Stable, Channel::Preview, Channel::Nightly] {
+        assert_eq!(
+            effective_update_channel(selected, UpdateMethod::Omarchy),
+            Channel::Stable
+        );
+        assert_eq!(
+            effective_update_channel(selected, UpdateMethod::Pacman),
+            Channel::Stable
+        );
+    }
+}
+
+#[test]
+fn manual_and_marked_package_updates_keep_the_selected_channel() {
+    for selected in [Channel::Stable, Channel::Preview, Channel::Nightly] {
+        assert_eq!(
+            effective_update_channel(selected, UpdateMethod::InPlace),
+            selected
+        );
+        assert_eq!(
+            effective_update_channel(selected, UpdateMethod::Aur),
+            selected
+        );
+    }
+}
+
+#[test]
+fn package_managed_status_identifies_omarchy() {
+    let version = Version::parse("0.8.0").expect("valid version");
+    assert_eq!(
+        installed_version_status(&version, BuildKind::Stable, UpdateMethod::Omarchy),
+        "Version 0.8.0 · Managed by Omarchy"
+    );
+}
+
+#[test]
+fn aur_updates_open_in_the_configured_terminal() {
+    let terminal = super::terminal::Terminal::resolve_with(
+        None,
+        Some(std::ffi::OsStr::new("xdg-terminal-exec")),
+    )
+    .expect("explicit terminal resolves");
+    let command = aur_update_command(&terminal, "paru", "strata-bin");
+
+    assert_eq!(command.get_program(), "xdg-terminal-exec");
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        ["--", "paru", "-Syu", "strata-bin"]
+    );
+}
+
+#[test]
+fn omarchy_updates_open_in_the_configured_terminal() {
+    let terminal = super::terminal::Terminal::resolve_with(
+        None,
+        Some(std::ffi::OsStr::new("xdg-terminal-exec")),
+    )
+    .expect("explicit terminal resolves");
+    let command = omarchy_update_command(&terminal);
+
+    assert_eq!(command.get_program(), "xdg-terminal-exec");
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        ["--", "omarchy", "update"]
+    );
+}
+
+#[test]
+fn package_managed_update_directs_users_to_omarchy_update() {
+    let message = update_check_message(
+        &UpdateCheck::Available {
+            release: ReleaseMetadata {
+                version: "0.9.0".to_owned(),
+                url: "https://example.test/release".to_owned(),
+                notes: String::new(),
+                note_blocks: Vec::new(),
+                kind: BuildKind::Stable,
+                tag: "v0.9.0".to_owned(),
+                published_at: None,
+                commit: None,
+            },
+            download_url: "https://example.test/download".to_owned(),
+        },
+        UpdateMethod::Omarchy,
+    );
+
+    assert!(message.contains("Run “omarchy update” to install"));
 }
 
 #[test]
@@ -155,4 +365,174 @@ fn every_window_installs_behind_one_process_wide_guard() {
         "an install started in one window must be visible in every other"
     );
     first.set(false);
+}
+
+#[test]
+fn due_check_respects_its_ttl() {
+    use std::time::{Duration, Instant};
+
+    let now = Instant::now();
+    assert!(update_check_due(None, now));
+    assert!(!update_check_due(Some(now), now));
+    assert!(update_check_due(Some(now - UPDATE_DUE_INTERVAL), now));
+    assert!(!update_check_due(
+        Some(now - UPDATE_DUE_INTERVAL + Duration::from_secs(1)),
+        now
+    ));
+}
+
+#[test]
+fn stale_due_result_is_not_published_or_replayed() {
+    gtk_test(
+        "ui::settings::tests::stale_due_result_is_not_published_or_replayed",
+        || {
+            ThemeManager::seed_saved_preferences_for_test();
+            super::clear_cached_update_notice();
+            let manager = ThemeManager::shared();
+            manager.set_checks_for_updates(true);
+            let channel = manager.release_channel();
+            let published = Rc::new(std::cell::Cell::new(0));
+            let observed = published.clone();
+            let notice: super::UpdateNoticeHandler = Rc::new(move |_| {
+                observed.set(observed.get() + 1);
+            });
+            super::register_update_notice(&notice);
+
+            manager.set_checks_for_updates(false);
+            super::complete_due_update_check(
+                &Rc::downgrade(&manager),
+                channel,
+                available_release(),
+                UpdateMethod::InPlace,
+                super::current_check_generation(),
+            );
+            assert_eq!(published.get(), 0);
+
+            let replayed = Rc::new(std::cell::Cell::new(0));
+            let observed = replayed.clone();
+            let later: super::UpdateNoticeHandler = Rc::new(move |_| {
+                observed.set(observed.get() + 1);
+            });
+            super::register_update_notice(&later);
+            assert_eq!(replayed.get(), 0);
+        },
+    );
+}
+
+#[test]
+fn due_failed_or_up_to_date_does_not_clear_existing_notice() {
+    gtk_test(
+        "ui::settings::tests::due_failed_or_up_to_date_does_not_clear_existing_notice",
+        || {
+            ThemeManager::seed_saved_preferences_for_test();
+            super::clear_cached_update_notice();
+            let manager = ThemeManager::shared();
+            manager.set_checks_for_updates(true);
+            let channel = manager.release_channel();
+            let notices = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let observed = notices.clone();
+            let notice: super::UpdateNoticeHandler = Rc::new(move |result| {
+                observed.borrow_mut().push(result.is_some());
+            });
+            super::register_update_notice(&notice);
+
+            super::publish_update_notice_for_test(Some((
+                match available_release() {
+                    UpdateCheck::Available { release, .. } => release,
+                    _ => unreachable!(),
+                },
+                "https://example.invalid/strata.tar.gz".to_owned(),
+                UpdateMethod::InPlace,
+            )));
+            assert_eq!(*notices.borrow(), vec![true]);
+
+            super::complete_due_update_check(
+                &Rc::downgrade(&manager),
+                channel,
+                UpdateCheck::Failed("network error".into()),
+                UpdateMethod::InPlace,
+                super::current_check_generation(),
+            );
+            assert_eq!(*notices.borrow(), vec![true]);
+
+            super::complete_due_update_check(
+                &Rc::downgrade(&manager),
+                channel,
+                UpdateCheck::UpToDate,
+                UpdateMethod::InPlace,
+                super::current_check_generation(),
+            );
+            assert_eq!(*notices.borrow(), vec![true]);
+        },
+    );
+}
+
+#[test]
+fn superseded_due_check_does_not_override_newer_check() {
+    gtk_test(
+        "ui::settings::tests::superseded_due_check_does_not_override_newer_check",
+        || {
+            ThemeManager::seed_saved_preferences_for_test();
+            super::clear_cached_update_notice();
+            let manager = ThemeManager::shared();
+            manager.set_checks_for_updates(true);
+            let channel = manager.release_channel();
+            let notices = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let observed = notices.clone();
+            let notice: super::UpdateNoticeHandler = Rc::new(move |result| {
+                observed.borrow_mut().push(result.is_some());
+            });
+            super::register_update_notice(&notice);
+
+            let older_generation = super::next_check_generation_for_test();
+            let _newer_generation = super::next_check_generation_for_test();
+
+            super::publish_update_notice_for_test(None);
+            assert_eq!(*notices.borrow(), vec![false]);
+
+            super::complete_due_update_check(
+                &Rc::downgrade(&manager),
+                channel,
+                available_release(),
+                UpdateMethod::InPlace,
+                older_generation,
+            );
+            assert_eq!(*notices.borrow(), vec![false]);
+        },
+    );
+}
+
+#[test]
+fn the_first_session_check_bypasses_the_persisted_cache() {
+    use std::time::Instant;
+
+    assert!(force_due_update_check(None));
+    assert!(!force_due_update_check(Some(Instant::now())));
+}
+
+#[test]
+fn update_method_resolves_and_caches() {
+    use std::time::{Duration, Instant};
+
+    let _serial = crate::test_support::ASYNC_MAIN_CONTEXT_DEFAULT
+        .lock()
+        .expect("the async test lock should not be poisoned");
+    let first: Rc<std::cell::RefCell<Option<UpdateMethod>>> =
+        Rc::new(std::cell::RefCell::new(None));
+    let second: Rc<std::cell::RefCell<Option<UpdateMethod>>> =
+        Rc::new(std::cell::RefCell::new(None));
+    let capture = first.clone();
+    resolve_update_method_async(move |method| {
+        *capture.borrow_mut() = Some(method);
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while first.borrow().is_none() && Instant::now() < deadline {
+        gtk::glib::MainContext::default().iteration(true);
+    }
+    let resolved = first.borrow().expect("the update method should resolve");
+    let capture = second.clone();
+    resolve_update_method_async(move |method| {
+        *capture.borrow_mut() = Some(method);
+    });
+    assert_eq!(second.borrow().expect("the cache should answer"), resolved);
 }

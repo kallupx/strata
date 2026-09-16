@@ -1,16 +1,16 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 #[cfg(test)]
 mod tests;
 
-use std::{collections::HashSet, rc::Rc};
+use std::{collections::HashSet, path::PathBuf, rc::Rc};
 
 use crate::model::{FileEntry, Location};
 
 use super::LoadHandle;
 
 pub fn validate_basename(name: &str) -> Result<(), &'static str> {
-    if name.is_empty() {
+    if name.trim().is_empty() {
         Err("Enter a name")
     } else if name.contains('/') {
         Err("Names cannot contain /")
@@ -38,12 +38,14 @@ pub struct CreateDirectoryRequest {
     pub id: OperationRequestId,
     pub parent: Location,
     pub name: String,
+    pub unique_name: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransferConflict {
     FailIfExists,
     ReplaceExisting,
+    KeepBoth,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,11 +54,37 @@ pub struct PasteItem {
     pub conflict: TransferConflict,
 }
 
+/// A completed move: where an item started and where it ended up.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MoveRecord {
+    pub original: Location,
+    pub current: Location,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UndoMoveItem {
+    pub record: MoveRecord,
+    pub conflict: TransferConflict,
+}
+
+#[derive(Clone, Debug)]
+pub struct UndoMoveRequest {
+    pub id: OperationRequestId,
+    pub items: Vec<UndoMoveItem>,
+}
+
+#[derive(Clone, Debug)]
+pub struct UndoCopyRequest {
+    pub id: OperationRequestId,
+    pub locations: Vec<Location>,
+}
+
 #[derive(Clone, Debug)]
 pub struct CreateFileRequest {
     pub id: OperationRequestId,
     pub parent: Location,
     pub name: String,
+    pub unique_name: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -75,9 +103,21 @@ pub struct DeleteRequest {
 }
 
 #[derive(Clone, Debug)]
+pub struct RestoreTrashItem {
+    pub entry: FileEntry,
+    pub destination: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub enum RestoreSource {
+    TrashEntries(Vec<RestoreTrashItem>),
+    OriginalLocations(Vec<Location>),
+}
+
+#[derive(Clone, Debug)]
 pub struct RestoreRequest {
     pub id: OperationRequestId,
-    pub entries: Vec<FileEntry>,
+    pub source: RestoreSource,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +126,7 @@ pub enum ArchiveFormat {
     SevenZ,
     TarGz,
     Tar,
+    Rar,
 }
 
 impl ArchiveFormat {
@@ -95,11 +136,12 @@ impl ArchiveFormat {
             Self::SevenZ => "7z",
             Self::TarGz => "tar.gz",
             Self::Tar => "tar",
+            Self::Rar => "rar",
         }
     }
 
     pub fn supports_password(self) -> bool {
-        matches!(self, Self::Zip | Self::SevenZ)
+        matches!(self, Self::Zip | Self::SevenZ | Self::Rar)
     }
 
     pub fn from_extension(name: &str) -> Option<Self> {
@@ -112,6 +154,8 @@ impl ArchiveFormat {
             Some(Self::Zip)
         } else if lower.ends_with(".7z") {
             Some(Self::SevenZ)
+        } else if lower.ends_with(".rar") {
+            Some(Self::Rar)
         } else {
             None
         }
@@ -153,6 +197,10 @@ pub enum OperationEvent {
     Created {
         request_id: OperationRequestId,
     },
+    EntryCreated {
+        request_id: OperationRequestId,
+        location: Location,
+    },
     Pasted {
         request_id: OperationRequestId,
         locations: Vec<Location>,
@@ -164,8 +212,10 @@ pub enum OperationEvent {
     },
     TransferProgress {
         request_id: OperationRequestId,
-        completed: usize,
-        total: usize,
+        completed_items: usize,
+        transferred_bytes: u64,
+        total_bytes: Option<u64>,
+        created_location: Option<Location>,
     },
     DeleteProgress {
         request_id: OperationRequestId,
@@ -186,6 +236,11 @@ pub enum OperationEvent {
     CompletedWithErrors {
         request_id: OperationRequestId,
         deleted_locations: Vec<Location>,
+        /// Entries that failed only because this location doesn't support
+        /// Trash, so a retry with `permanent: true` on just these would
+        /// likely succeed.
+        retryable_locations: Vec<Location>,
+        has_non_retryable_failures: bool,
         message: String,
     },
     Restored {
@@ -237,6 +292,9 @@ pub trait OperationProvider {
         emit: Rc<dyn Fn(OperationEvent)>,
     ) -> LoadHandle;
     fn paste(&self, request: PasteRequest, emit: Rc<dyn Fn(OperationEvent)>) -> LoadHandle;
+    /// Moves completed transfers back to their original locations.
+    fn undo_move(&self, request: UndoMoveRequest, emit: Rc<dyn Fn(OperationEvent)>) -> LoadHandle;
+    fn undo_copy(&self, request: UndoCopyRequest, emit: Rc<dyn Fn(OperationEvent)>) -> LoadHandle;
     fn delete(&self, request: DeleteRequest, emit: Rc<dyn Fn(OperationEvent)>) -> LoadHandle;
     fn restore(&self, request: RestoreRequest, emit: Rc<dyn Fn(OperationEvent)>) -> LoadHandle;
     fn compress(&self, request: CompressRequest, emit: Rc<dyn Fn(OperationEvent)>) -> LoadHandle;

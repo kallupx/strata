@@ -1,7 +1,8 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     fs, io,
     path::{Path, PathBuf},
     rc::Rc,
@@ -13,9 +14,12 @@ use serde::{Deserialize, Serialize};
 use sourceview5::prelude::BufferExt as _;
 
 use crate::{
-    model::{SortDirection, SortKey, ViewPreferences},
-    services::Channel,
+    model::{FolderColorValue, SortDirection, SortKey, ViewPreferences},
+    sandbox::MediaPreviewBackend,
+    services::{Channel, CrossVolumeDropStrategy},
 };
+
+mod bindings;
 
 thread_local! {
     static SHARED_MANAGER: RefCell<std::rc::Weak<ThemeManager>> = const { RefCell::new(std::rc::Weak::new()) };
@@ -23,9 +27,25 @@ thread_local! {
     static SOURCE_BUFFERS: RefCell<Vec<glib::WeakRef<sourceview5::Buffer>>> = const { RefCell::new(Vec::new()) };
     static DOCUMENT_BUFFERS: RefCell<Vec<glib::WeakRef<gtk::TextBuffer>>> = const { RefCell::new(Vec::new()) };
     static DOCUMENT_VIEWS: RefCell<Vec<glib::WeakRef<super::document_view::DocumentTextView>>> = const { RefCell::new(Vec::new()) };
+    /// Installed on the first source preview buffer, so startup performs no SourceView I/O.
+    static PENDING_STYLE_TOKENS: RefCell<Option<(ThemeTokens, Option<SourcePalette>)>> = const { RefCell::new(None) };
+    static STYLE_SCHEME_DIRTY: Cell<bool> = const { Cell::new(true) };
+}
+
+fn notify_live<T>(listeners: Vec<T>, is_live: impl Fn(&T) -> bool, run: impl Fn(&T)) -> Vec<T> {
+    let live: Vec<T> = listeners
+        .into_iter()
+        .filter(|entry| is_live(entry))
+        .collect();
+    for entry in &live {
+        run(entry);
+    }
+    live
 }
 
 const THEME_CATALOG: &str = include_str!("../../data/themes/catalog.toml");
+const GTK_DEFAULT_DPI: f64 = 96.0;
+const GTK_DPI_UNITS: f64 = 1024.0;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ThemeTokens {
@@ -42,6 +62,7 @@ pub struct ThemeTokens {
     pub dim_text: String,
 }
 
+#[derive(Clone)]
 struct SourcePalette {
     statement: String,
     string: String,
@@ -69,7 +90,7 @@ struct CatalogTheme {
     tokens: ThemeTokens,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 struct Preferences {
     mode: String,
     theme: String,
@@ -79,16 +100,64 @@ struct Preferences {
     single_click_previews: bool,
     #[serde(default = "default_enabled")]
     render_documents_by_default: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hardware_accelerated_video_previews: Option<bool>,
+    #[serde(default = "default_video_preview_backend")]
+    video_preview_backend: String,
     #[serde(default)]
     search_open_files_directly: bool,
+    #[serde(default = "default_enabled")]
+    type_to_search: bool,
+    #[serde(default)]
+    arrow_navigation_scoped: bool,
+    #[serde(default = "default_enabled")]
+    filter_include_subfolders: bool,
+    #[serde(default = "default_enabled")]
+    show_keybinding_hints: bool,
     #[serde(default)]
     reduce_motion: bool,
+    #[serde(default = "default_enabled")]
+    element_glow: bool,
     #[serde(default = "default_browser_mode")]
     browser_mode: String,
     #[serde(default = "default_browser_density")]
     browser_density: String,
     #[serde(default)]
+    group_by_type: bool,
+    #[serde(default = "default_file_clicks", rename = "list_file_clicks")]
+    columns_file_clicks: u8,
+    #[serde(default = "default_folder_clicks", rename = "list_folder_clicks")]
+    columns_folder_clicks: u8,
+    #[serde(default = "default_file_clicks", rename = "grid_file_clicks")]
+    icons_file_clicks: u8,
+    #[serde(default = "default_double_clicks", rename = "grid_folder_clicks")]
+    icons_folder_clicks: u8,
+    #[serde(default = "default_file_clicks", rename = "explorer_file_clicks")]
+    list_file_clicks: u8,
+    #[serde(default = "default_double_clicks", rename = "explorer_folder_clicks")]
+    list_folder_clicks: u8,
+    #[serde(default = "default_sidebar_order")]
+    sidebar_order: Vec<String>,
+    #[serde(default = "default_enabled")]
+    sidebar_show_home: bool,
+    #[serde(default = "default_enabled")]
+    sidebar_show_trash: bool,
+    #[serde(default = "default_enabled")]
+    sidebar_show_network: bool,
+    #[serde(default = "default_enabled")]
+    sidebar_show_desktop: bool,
+    #[serde(default = "default_enabled")]
+    sidebar_show_documents: bool,
+    #[serde(default = "default_enabled")]
+    sidebar_show_downloads: bool,
+    #[serde(default = "default_enabled")]
+    sidebar_show_pictures: bool,
+    #[serde(default = "default_enabled")]
+    sidebar_show_videos: bool,
+    #[serde(default)]
     show_hidden: bool,
+    #[serde(default)]
+    text_size: TextSize,
     #[serde(default = "default_enabled")]
     folders_first: bool,
     #[serde(default = "default_sort_key")]
@@ -97,28 +166,79 @@ struct Preferences {
     sort_direction: String,
     #[serde(default = "default_enabled")]
     check_for_updates: bool,
+    #[serde(default)]
+    preview_muted: bool,
+    #[serde(default = "default_full_volume")]
+    preview_volume: f64,
+    #[serde(default)]
+    preview_text_wrap: bool,
+    #[serde(default)]
+    auto_refresh_interval: u32,
+    #[serde(default = "default_cross_volume_drop_strategy")]
+    cross_volume_drop_strategy: String,
+    #[serde(default)]
+    open_folder_after_drop: bool,
     #[serde(default = "default_release_channel")]
     release_channel: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_directory: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    folder_colors: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    custom_icons: HashMap<String, String>,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             mode: "theme".to_owned(),
-            theme: "azure-glow".to_owned(),
+            theme: "tokyo-night".to_owned(),
             folder_peeking: true,
             single_click_previews: true,
             render_documents_by_default: true,
+            hardware_accelerated_video_previews: None,
+            video_preview_backend: default_video_preview_backend(),
             search_open_files_directly: false,
+            type_to_search: true,
+            arrow_navigation_scoped: false,
+            filter_include_subfolders: true,
+            show_keybinding_hints: true,
             reduce_motion: false,
+            element_glow: true,
             browser_mode: default_browser_mode(),
             browser_density: default_browser_density(),
+            group_by_type: false,
+            columns_file_clicks: default_file_clicks(),
+            columns_folder_clicks: default_folder_clicks(),
+            icons_file_clicks: default_file_clicks(),
+            icons_folder_clicks: default_double_clicks(),
+            list_file_clicks: default_file_clicks(),
+            list_folder_clicks: default_double_clicks(),
+            sidebar_order: default_sidebar_order(),
+            sidebar_show_home: true,
+            sidebar_show_trash: true,
+            sidebar_show_network: true,
+            sidebar_show_desktop: true,
+            sidebar_show_documents: true,
+            sidebar_show_downloads: true,
+            sidebar_show_pictures: true,
+            sidebar_show_videos: true,
             show_hidden: false,
+            text_size: TextSize::default(),
             folders_first: true,
             sort_key: default_sort_key(),
             sort_direction: default_sort_direction(),
             check_for_updates: true,
+            preview_muted: false,
+            preview_volume: default_full_volume(),
+            preview_text_wrap: false,
+            auto_refresh_interval: 0,
+            cross_volume_drop_strategy: default_cross_volume_drop_strategy(),
+            open_folder_after_drop: false,
             release_channel: default_release_channel(),
+            default_directory: None,
+            folder_colors: HashMap::new(),
+            custom_icons: HashMap::new(),
         }
     }
 }
@@ -131,12 +251,57 @@ fn default_release_channel() -> String {
     "stable".to_owned()
 }
 
+mod text_size;
+pub use text_size::TextSize;
+
 fn default_browser_mode() -> String {
     "columns".to_owned()
 }
 
+fn browser_mode_from_stored(value: &str) -> super::browser_modes::BrowserMode {
+    match value {
+        "icons" | "grid" => super::browser_modes::BrowserMode::Icons,
+        "list" | "explorer" => super::browser_modes::BrowserMode::List,
+        _ => super::browser_modes::BrowserMode::Columns,
+    }
+}
+
+fn stored_browser_mode(mode: super::browser_modes::BrowserMode) -> &'static str {
+    match mode {
+        super::browser_modes::BrowserMode::Columns => "columns",
+        super::browser_modes::BrowserMode::Icons => "icons",
+        super::browser_modes::BrowserMode::List => "list",
+    }
+}
+
+fn default_video_preview_backend() -> String {
+    "automatic".to_owned()
+}
+
 fn default_browser_density() -> String {
     "compact".to_owned()
+}
+
+fn default_file_clicks() -> u8 {
+    2
+}
+
+fn default_folder_clicks() -> u8 {
+    1
+}
+
+fn default_double_clicks() -> u8 {
+    2
+}
+
+fn default_sidebar_order() -> Vec<String> {
+    vec![
+        "desktop".to_owned(),
+        "documents".to_owned(),
+        "downloads".to_owned(),
+        "pictures".to_owned(),
+        "videos".to_owned(),
+    ]
 }
 
 fn default_sort_key() -> String {
@@ -147,14 +312,33 @@ fn default_sort_direction() -> String {
     "ascending".to_owned()
 }
 
+fn default_full_volume() -> f64 {
+    1.0
+}
+
+fn default_cross_volume_drop_strategy() -> String {
+    CrossVolumeDropStrategy::Ask.as_str().to_owned()
+}
+
+fn normalized_volume(volume: f64) -> f64 {
+    if volume.is_finite() {
+        volume.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
 pub struct ThemeManager {
     provider: gtk::CssProvider,
     themes: RefCell<Vec<Theme>>,
     preferences: RefCell<Preferences>,
-    omarchy_available: bool,
-    omarchy_monitor: RefCell<Option<gio::FileMonitor>>,
+    omarchy_available: Cell<bool>,
+    omarchy_monitors: RefCell<Vec<gio::FileMonitor>>,
     pending_omarchy_refresh: RefCell<Option<glib::SourceId>>,
     previewing: Cell<bool>,
+    changes: bindings::PreferenceChanges,
+    persistence_dirty: Cell<bool>,
+    persistence_enabled: bool,
 }
 
 impl ThemeManager {
@@ -172,7 +356,14 @@ impl ThemeManager {
     fn load() -> Rc<Self> {
         let themes = merge_builtin_and_custom_themes(builtins(), load_custom_themes());
         let omarchy_available = load_omarchy_theme().is_some();
-        let mut preferences = read_preferences().unwrap_or_default();
+        let loaded = read_preferences();
+        let persistence_enabled = loaded.is_ok();
+        let mut preferences = loaded.unwrap_or_else(|error| {
+            tracing::warn!(%error, path = %settings_path().display(),
+                "unable to load settings; using temporary defaults without saving; fix the file and restart Strata");
+            Preferences::default()
+        });
+        preferences.preview_volume = normalized_volume(preferences.preview_volume);
         if !themes.iter().any(|theme| theme.id == preferences.theme) {
             preferences.theme = "azure-glow".to_owned();
         }
@@ -186,14 +377,18 @@ impl ThemeManager {
         let manager = Rc::new(Self {
             provider: gtk::CssProvider::new(),
             themes: RefCell::new(themes),
+            changes: bindings::PreferenceChanges::new(preferences.clone()),
+            persistence_dirty: Cell::new(false),
+            persistence_enabled,
             preferences: RefCell::new(preferences),
-            omarchy_available,
-            omarchy_monitor: RefCell::new(None),
+            omarchy_available: Cell::new(omarchy_available),
+            omarchy_monitors: RefCell::new(Vec::new()),
             pending_omarchy_refresh: RefCell::new(None),
             previewing: Cell::new(false),
         });
         manager.install_provider();
         manager.apply_selected();
+        manager.monitor_text_scaling();
         manager.monitor_omarchy();
         manager
     }
@@ -203,7 +398,7 @@ impl ThemeManager {
     }
 
     pub fn is_omarchy_available(&self) -> bool {
-        self.omarchy_available
+        self.omarchy_available.get()
     }
 
     pub fn follows_omarchy(&self) -> bool {
@@ -221,6 +416,81 @@ impl ThemeManager {
     pub fn set_folder_peeking(&self, enabled: bool) {
         self.preferences.borrow_mut().folder_peeking = enabled;
         self.save_preferences();
+    }
+
+    pub fn folder_color(&self, path: &Path) -> Option<FolderColorValue> {
+        let preferences = self.preferences.borrow();
+        if preferences.folder_colors.is_empty() {
+            return None;
+        }
+        let key = path.to_string_lossy();
+        let color_name = preferences.folder_colors.get(key.as_ref())?;
+        FolderColorValue::parse(color_name)
+    }
+
+    pub fn set_folder_color(&self, path: &Path, color: Option<FolderColorValue>) {
+        self.set_folder_colors(&[path.to_path_buf()], color);
+    }
+
+    pub fn set_folder_colors(&self, paths: &[PathBuf], color: Option<FolderColorValue>) {
+        if paths.is_empty() {
+            return;
+        }
+        {
+            let mut preferences = self.preferences.borrow_mut();
+            for path in paths {
+                let key = path.to_string_lossy().into_owned();
+                if let Some(color) = &color {
+                    preferences
+                        .folder_colors
+                        .insert(key, color.to_preference_string());
+                } else {
+                    preferences.folder_colors.remove(&key);
+                }
+            }
+        }
+        self.save_preferences();
+        super::thumbnail::refresh_customized_icons(paths);
+    }
+
+    pub fn custom_icon(&self, path: &Path) -> Option<String> {
+        let preferences = self.preferences.borrow();
+        if preferences.custom_icons.is_empty() {
+            return None;
+        }
+        let key = path.to_string_lossy();
+        preferences
+            .custom_icons
+            .get(key.as_ref())
+            .filter(|name| crate::assets::icons::is_customization_choice(name))
+            .cloned()
+    }
+
+    pub fn set_custom_icon(&self, path: &Path, icon_name: Option<&str>) {
+        {
+            let mut preferences = self.preferences.borrow_mut();
+            let key = path.to_string_lossy().into_owned();
+            if let Some(name) =
+                icon_name.filter(|name| crate::assets::icons::is_customization_choice(name))
+            {
+                preferences.custom_icons.insert(key, name.to_owned());
+            } else {
+                preferences.custom_icons.remove(&key);
+            }
+        }
+        self.save_preferences();
+        super::thumbnail::refresh_customized_icons(&[path.to_path_buf()]);
+    }
+
+    pub fn clear_item_customization(&self, path: &Path) {
+        {
+            let mut preferences = self.preferences.borrow_mut();
+            let key = path.to_string_lossy();
+            preferences.folder_colors.remove(key.as_ref());
+            preferences.custom_icons.remove(key.as_ref());
+        }
+        self.save_preferences();
+        super::thumbnail::refresh_customized_icons(&[path.to_path_buf()]);
     }
 
     pub fn single_click_previews(&self) -> bool {
@@ -241,12 +511,106 @@ impl ThemeManager {
         self.save_preferences();
     }
 
+    pub fn hardware_accelerated_video_previews(&self) -> bool {
+        configured_hardware_acceleration(
+            &self.preferences.borrow(),
+            crate::sandbox::polaris_gpu_available(),
+        )
+    }
+
+    pub fn set_hardware_accelerated_video_previews(&self, enabled: bool) {
+        self.preferences
+            .borrow_mut()
+            .hardware_accelerated_video_previews = Some(enabled);
+        self.save_preferences();
+    }
+
+    pub fn video_preview_backend(&self) -> MediaPreviewBackend {
+        configured_video_preview_backend(&self.preferences.borrow())
+    }
+
+    pub fn set_video_preview_backend(&self, backend: MediaPreviewBackend) {
+        let backend = match backend {
+            MediaPreviewBackend::Automatic => "automatic",
+            MediaPreviewBackend::VaApi => "vaapi",
+            MediaPreviewBackend::Vulkan => "vulkan",
+            MediaPreviewBackend::Software => return,
+        };
+        self.preferences.borrow_mut().video_preview_backend = backend.to_owned();
+        self.save_preferences();
+    }
+
+    pub(crate) fn media_preview_backend(&self) -> MediaPreviewBackend {
+        if !self.hardware_accelerated_video_previews() {
+            MediaPreviewBackend::Software
+        } else {
+            self.video_preview_backend()
+        }
+    }
+
     pub fn search_open_files_directly(&self) -> bool {
         self.preferences.borrow().search_open_files_directly
     }
 
     pub fn set_search_open_files_directly(&self, enabled: bool) {
         self.preferences.borrow_mut().search_open_files_directly = enabled;
+        self.save_preferences();
+    }
+
+    pub fn filter_include_subfolders(&self) -> bool {
+        self.preferences.borrow().filter_include_subfolders
+    }
+
+    pub fn set_filter_include_subfolders(&self, enabled: bool) {
+        self.preferences.borrow_mut().filter_include_subfolders = enabled;
+        self.save_preferences();
+    }
+
+    pub fn type_to_search(&self) -> bool {
+        self.preferences.borrow().type_to_search
+    }
+
+    pub fn set_type_to_search(&self, enabled: bool) {
+        self.preferences.borrow_mut().type_to_search = enabled;
+        self.save_preferences();
+    }
+
+    pub fn arrow_navigation_scoped(&self) -> bool {
+        self.preferences.borrow().arrow_navigation_scoped
+    }
+
+    pub fn set_arrow_navigation_scoped(&self, scoped: bool) {
+        self.preferences.borrow_mut().arrow_navigation_scoped = scoped;
+        self.save_preferences();
+    }
+
+    pub fn show_keybinding_hints(&self) -> bool {
+        self.preferences.borrow().show_keybinding_hints
+    }
+
+    pub fn set_show_keybinding_hints(&self, enabled: bool) {
+        self.preferences.borrow_mut().show_keybinding_hints = enabled;
+        self.save_preferences();
+    }
+
+    pub fn on_keybinding_hints_changed(
+        &self,
+        anchor: &impl IsA<gtk::Widget>,
+        refresh: impl Fn(&gtk::Widget, bool) + 'static,
+    ) {
+        self.bind_preference(anchor, Self::show_keybinding_hints, refresh);
+    }
+
+    pub fn element_glow(&self) -> bool {
+        self.preferences.borrow().element_glow
+    }
+
+    pub fn set_element_glow(&self, enabled: bool) {
+        if self.element_glow() == enabled {
+            return;
+        }
+        self.preferences.borrow_mut().element_glow = enabled;
+        self.apply_selected();
         self.save_preferences();
     }
 
@@ -269,30 +633,118 @@ impl ThemeManager {
         self.save_preferences();
     }
 
+    pub fn preview_muted(&self) -> bool {
+        self.preferences.borrow().preview_muted
+    }
+
+    pub fn set_preview_muted(&self, muted: bool) {
+        self.preferences.borrow_mut().preview_muted = muted;
+        self.save_preferences();
+    }
+
+    pub fn preview_volume(&self) -> f64 {
+        self.preferences.borrow().preview_volume
+    }
+
+    pub fn set_preview_volume(&self, volume: f64) {
+        self.preferences.borrow_mut().preview_volume = normalized_volume(volume);
+        self.save_preferences();
+    }
+
+    pub fn preview_text_wrap(&self) -> bool {
+        self.preferences.borrow().preview_text_wrap
+    }
+
+    pub fn set_preview_text_wrap(&self, wrapped: bool) {
+        self.preferences.borrow_mut().preview_text_wrap = wrapped;
+        self.save_preferences();
+    }
+
+    pub fn set_preview_audio(&self, volume: f64, muted: bool) {
+        self.preferences.borrow_mut().preview_muted = muted;
+        if volume > 0.0 {
+            self.set_preview_volume(volume);
+        } else {
+            self.save_preferences();
+        }
+    }
+
+    pub fn auto_refresh_interval(&self) -> u32 {
+        self.preferences.borrow().auto_refresh_interval
+    }
+
+    pub fn set_auto_refresh_interval(&self, secs: u32) {
+        self.preferences.borrow_mut().auto_refresh_interval = secs;
+        self.save_preferences();
+    }
+
+    pub fn default_directory(&self) -> Option<PathBuf> {
+        self.preferences.borrow().default_directory.clone()
+    }
+
+    pub fn set_default_directory(&self, path: Option<PathBuf>) {
+        self.preferences.borrow_mut().default_directory = path;
+        self.save_preferences();
+    }
+
+    pub fn open_folder_after_drop(&self) -> bool {
+        self.preferences.borrow().open_folder_after_drop
+    }
+
+    pub fn set_open_folder_after_drop(&self, enabled: bool) {
+        self.preferences.borrow_mut().open_folder_after_drop = enabled;
+        self.save_preferences();
+    }
+
+    pub fn cross_volume_drop_strategy(&self) -> CrossVolumeDropStrategy {
+        CrossVolumeDropStrategy::parse(&self.preferences.borrow().cross_volume_drop_strategy)
+    }
+
+    pub fn set_cross_volume_drop_strategy(&self, strategy: CrossVolumeDropStrategy) {
+        if self.cross_volume_drop_strategy() == strategy {
+            return;
+        }
+        self.preferences.borrow_mut().cross_volume_drop_strategy = strategy.as_str().to_owned();
+        self.save_preferences();
+    }
+
     pub fn release_channel(&self) -> Channel {
-        Channel::parse(&self.preferences.borrow().release_channel)
+        crate::services::InstallSource::detect()
+            .managed()
+            .and_then(crate::services::ManagedInstall::tracked_channel)
+            .unwrap_or_else(|| Channel::parse(&self.preferences.borrow().release_channel))
     }
 
     pub fn set_release_channel(&self, channel: Channel) {
+        if crate::services::InstallSource::detect()
+            .managed()
+            .and_then(crate::services::ManagedInstall::tracked_channel)
+            .is_some()
+        {
+            return;
+        }
         self.preferences.borrow_mut().release_channel = channel.as_str().to_owned();
         self.save_preferences();
     }
 
+    pub fn on_release_channel_changed(
+        &self,
+        anchor: &impl IsA<gtk::Widget>,
+        refresh: Rc<dyn Fn()>,
+    ) {
+        let initial = Cell::new(true);
+        self.bind_preference(anchor, Self::release_channel, move |_, _| {
+            if !initial.replace(false) {
+                refresh();
+            }
+        });
+    }
     pub fn browser_mode(&self) -> super::browser_modes::BrowserMode {
-        match self.preferences.borrow().browser_mode.as_str() {
-            "grid" => super::browser_modes::BrowserMode::Grid,
-            "explorer" => super::browser_modes::BrowserMode::Explorer,
-            _ => super::browser_modes::BrowserMode::Columns,
-        }
+        browser_mode_from_stored(&self.preferences.borrow().browser_mode)
     }
 
     pub fn set_browser_mode(&self, mode: super::browser_modes::BrowserMode) {
-        self.preferences.borrow_mut().browser_mode = match mode {
-            super::browser_modes::BrowserMode::Columns => "columns",
-            super::browser_modes::BrowserMode::Grid => "grid",
-            super::browser_modes::BrowserMode::Explorer => "explorer",
-        }
-        .to_owned();
+        self.preferences.borrow_mut().browser_mode = stored_browser_mode(mode).to_owned();
         self.save_preferences();
     }
 
@@ -312,6 +764,208 @@ impl ThemeManager {
         self.save_preferences();
     }
 
+    pub fn text_size(&self) -> TextSize {
+        self.preferences.borrow().text_size
+    }
+
+    pub fn set_text_size(&self, size: TextSize) {
+        if self.text_size() == size {
+            self.save_preferences();
+            return;
+        }
+        self.preferences.borrow_mut().text_size = size;
+        self.apply_selected();
+        self.save_preferences();
+    }
+
+    pub fn interface_scale(&self) -> f64 {
+        snapped_root_font_px(self.text_size().root_font_px(), desktop_text_scale_factor()) / 13.0
+    }
+
+    pub fn bind_interface_scale(
+        self: &Rc<Self>,
+        anchor: &impl IsA<gtk::Widget>,
+        apply: impl Fn(&gtk::Widget, f64) + 'static,
+    ) {
+        let apply = Rc::new(apply);
+        let changed = apply.clone();
+        self.bind_preference(anchor, Self::interface_scale, move |widget, scale| {
+            changed(widget, scale)
+        });
+        if let Some(settings) = gtk::Settings::default() {
+            let widget = anchor.downgrade();
+            let manager = Rc::downgrade(self);
+            let handler = settings.connect_gtk_xft_dpi_notify(move |_| {
+                if let (Some(widget), Some(manager)) = (widget.upgrade(), manager.upgrade()) {
+                    apply(widget.upcast_ref(), manager.interface_scale());
+                }
+            });
+            let handler = RefCell::new(Some(handler));
+            anchor.connect_destroy(move |_| {
+                if let Some(handler) = handler.borrow_mut().take() {
+                    settings.disconnect(handler);
+                }
+            });
+        }
+    }
+
+    pub fn group_by_type(&self) -> bool {
+        self.preferences.borrow().group_by_type
+    }
+
+    pub fn set_group_by_type(&self, enabled: bool) {
+        self.preferences.borrow_mut().group_by_type = enabled;
+        self.save_preferences();
+    }
+
+    pub fn click_activation(
+        &self,
+        mode: super::browser_modes::BrowserMode,
+    ) -> super::browser_modes::ClickActivation {
+        use super::browser_modes::{BrowserMode, ClickActivation, ClickCount};
+
+        let preferences = self.preferences.borrow();
+        let (files, folders) = match mode {
+            BrowserMode::Columns => (
+                preferences.columns_file_clicks,
+                preferences.columns_folder_clicks,
+            ),
+            BrowserMode::Icons => (
+                preferences.icons_file_clicks,
+                preferences.icons_folder_clicks,
+            ),
+            BrowserMode::List => (preferences.list_file_clicks, preferences.list_folder_clicks),
+        };
+        let defaults = ClickActivation::default_for(mode);
+        ClickActivation {
+            files: ClickCount::from_stored(files).unwrap_or(defaults.files),
+            folders: ClickCount::from_stored(folders).unwrap_or(defaults.folders),
+        }
+    }
+
+    pub fn set_click_activation(
+        &self,
+        mode: super::browser_modes::BrowserMode,
+        activation: super::browser_modes::ClickActivation,
+    ) {
+        use super::browser_modes::BrowserMode;
+
+        let mut preferences = self.preferences.borrow_mut();
+        let files = activation.files.stored();
+        let folders = activation.folders.stored();
+        match mode {
+            BrowserMode::Columns => {
+                preferences.columns_file_clicks = files;
+                preferences.columns_folder_clicks = folders;
+            }
+            BrowserMode::Icons => {
+                preferences.icons_file_clicks = files;
+                preferences.icons_folder_clicks = folders;
+            }
+            BrowserMode::List => {
+                preferences.list_file_clicks = files;
+                preferences.list_folder_clicks = folders;
+            }
+        }
+        drop(preferences);
+        self.save_preferences();
+    }
+
+    pub fn sidebar_order(&self) -> Vec<String> {
+        self.preferences.borrow().sidebar_order.clone()
+    }
+
+    pub fn set_sidebar_order(&self, order: Vec<String>) {
+        self.preferences.borrow_mut().sidebar_order = order;
+        self.save_preferences();
+    }
+
+    pub fn sidebar_show_home(&self) -> bool {
+        self.preferences.borrow().sidebar_show_home
+    }
+
+    pub fn set_sidebar_show_home(&self, visible: bool) {
+        self.preferences.borrow_mut().sidebar_show_home = visible;
+        self.save_preferences();
+    }
+
+    pub fn sidebar_show_trash(&self) -> bool {
+        self.preferences.borrow().sidebar_show_trash
+    }
+
+    pub fn set_sidebar_show_trash(&self, visible: bool) {
+        self.preferences.borrow_mut().sidebar_show_trash = visible;
+        self.save_preferences();
+    }
+
+    pub fn sidebar_show_network(&self) -> bool {
+        self.preferences.borrow().sidebar_show_network
+    }
+
+    pub fn set_sidebar_show_network(&self, visible: bool) {
+        self.preferences.borrow_mut().sidebar_show_network = visible;
+        self.save_preferences();
+    }
+
+    pub fn sidebar_show_desktop(&self) -> bool {
+        self.preferences.borrow().sidebar_show_desktop
+    }
+
+    pub fn set_sidebar_show_desktop(&self, visible: bool) {
+        self.preferences.borrow_mut().sidebar_show_desktop = visible;
+        self.save_preferences();
+    }
+
+    pub fn sidebar_show_documents(&self) -> bool {
+        self.preferences.borrow().sidebar_show_documents
+    }
+
+    pub fn set_sidebar_show_documents(&self, visible: bool) {
+        self.preferences.borrow_mut().sidebar_show_documents = visible;
+        self.save_preferences();
+    }
+
+    pub fn sidebar_show_downloads(&self) -> bool {
+        self.preferences.borrow().sidebar_show_downloads
+    }
+
+    pub fn set_sidebar_show_downloads(&self, visible: bool) {
+        self.preferences.borrow_mut().sidebar_show_downloads = visible;
+        self.save_preferences();
+    }
+
+    pub fn sidebar_show_pictures(&self) -> bool {
+        self.preferences.borrow().sidebar_show_pictures
+    }
+
+    pub fn set_sidebar_show_pictures(&self, visible: bool) {
+        self.preferences.borrow_mut().sidebar_show_pictures = visible;
+        self.save_preferences();
+    }
+
+    pub fn sidebar_show_videos(&self) -> bool {
+        self.preferences.borrow().sidebar_show_videos
+    }
+
+    pub fn set_sidebar_show_videos(&self, visible: bool) {
+        self.preferences.borrow_mut().sidebar_show_videos = visible;
+        self.save_preferences();
+    }
+
+    pub fn sidebar_places_visibility(&self) -> [bool; 8] {
+        let preferences = self.preferences.borrow();
+        [
+            preferences.sidebar_show_home,
+            preferences.sidebar_show_trash,
+            preferences.sidebar_show_network,
+            preferences.sidebar_show_desktop,
+            preferences.sidebar_show_documents,
+            preferences.sidebar_show_downloads,
+            preferences.sidebar_show_pictures,
+            preferences.sidebar_show_videos,
+        ]
+    }
+
     pub fn sort_preferences(&self) -> ViewPreferences {
         sort_preferences(&self.preferences.borrow())
     }
@@ -320,18 +974,21 @@ impl ThemeManager {
         let mut stored = self.preferences.borrow_mut();
         stored.show_hidden = preferences.show_hidden;
         stored.folders_first = preferences.folders_first;
-        stored.sort_key = match preferences.sort_key {
-            SortKey::Name => "name",
-            SortKey::Size => "size",
-            SortKey::Modified => "modified",
-            SortKey::Type => "type",
+        let sort_key = match preferences.sort_key {
+            SortKey::DeviceOrder => None,
+            SortKey::Name => Some("name"),
+            SortKey::Size => Some("size"),
+            SortKey::Modified => Some("modified"),
+            SortKey::Type => Some("type"),
+        };
+        if let Some(sort_key) = sort_key {
+            stored.sort_key = sort_key.to_owned();
+            stored.sort_direction = match preferences.sort_direction {
+                SortDirection::Ascending => "ascending",
+                SortDirection::Descending => "descending",
+            }
+            .to_owned();
         }
-        .to_owned();
-        stored.sort_direction = match preferences.sort_direction {
-            SortDirection::Ascending => "ascending",
-            SortDirection::Descending => "descending",
-        }
-        .to_owned();
         drop(stored);
         self.save_preferences();
     }
@@ -351,7 +1008,7 @@ impl ThemeManager {
     }
 
     pub fn set_follow_omarchy(&self, enabled: bool) {
-        if enabled && !self.omarchy_available {
+        if enabled && !self.is_omarchy_available() {
             return;
         }
         self.preferences.borrow_mut().mode = if enabled {
@@ -417,6 +1074,15 @@ impl ThemeManager {
         Ok(id)
     }
 
+    pub fn appearance_tokens(&self) -> ThemeTokens {
+        if self.follows_omarchy()
+            && let Some(tokens) = load_omarchy_theme()
+        {
+            return tokens;
+        }
+        self.starter_tokens()
+    }
+
     pub fn starter_tokens(&self) -> ThemeTokens {
         self.current_tokens().unwrap_or_else(azure_tokens)
     }
@@ -454,15 +1120,39 @@ impl ThemeManager {
     }
 
     fn apply_tokens(&self, tokens: &ThemeTokens, source_palette: Option<&SourcePalette>) {
-        self.provider.load_from_string(&tokens_css(tokens));
+        let root_font_px =
+            snapped_root_font_px(self.text_size().root_font_px(), desktop_text_scale_factor());
+        let glow = if self.element_glow() {
+            "@theme_accent"
+        } else {
+            "transparent"
+        };
+        self.provider.load_from_string(&format!(
+            "{}\n@define-color theme_glow {glow};\n",
+            tokens_css(tokens, root_font_px)
+        ));
+        apply_interface_font(root_font_px);
+        crate::assets::set_interface_icon_scale(root_font_px / 13.0);
         crate::assets::set_primary_icon_color(&tokens.accent);
         crate::assets::set_danger_icon_color(&tokens.danger);
-        install_source_style_scheme(tokens, source_palette);
+        super::thumbnail::refresh_all_customized_icons();
+        stage_source_style_scheme(tokens, source_palette);
         style_document_buffers(tokens);
         style_document_views(tokens);
     }
 
     fn save_preferences(&self) {
+        let changed = self.changes.record(&self.preferences.borrow());
+        if !changed && !self.persistence_dirty.get() {
+            return;
+        }
+        if !self.persistence_enabled {
+            if changed {
+                self.changes.notify(self);
+            }
+            return;
+        }
+        self.persistence_dirty.set(true);
         let path = settings_path();
         let result = (|| -> io::Result<()> {
             if let Some(parent) = path.parent() {
@@ -472,57 +1162,101 @@ impl ThemeManager {
                 toml::to_string_pretty(&*self.preferences.borrow()).map_err(io::Error::other)?;
             crate::storage::atomic_write(&path, value.as_bytes())
         })();
-        if let Err(error) = result {
-            tracing::warn!(%error, "unable to save theme preference");
+        match result {
+            Ok(()) => self.persistence_dirty.set(false),
+            Err(error) => tracing::warn!(%error, "unable to save preference"),
+        }
+        if changed {
+            self.changes.notify(self);
         }
     }
 
-    fn monitor_omarchy(self: &Rc<Self>) {
-        if !self.omarchy_available {
-            return;
-        }
-        let file = gio::File::for_path(omarchy_state_dir());
-        let Ok(monitor) =
-            file.monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
-        else {
+    fn monitor_text_scaling(self: &Rc<Self>) {
+        let Some(settings) = gtk::Settings::default() else {
             return;
         };
         let weak = Rc::downgrade(self);
-        monitor.connect_changed(move |_, file, other_file, _| {
-            if !is_omarchy_theme_event(file)
-                && !other_file
-                    .as_ref()
-                    .is_some_and(|file| is_omarchy_theme_event(file))
-            {
-                return;
-            }
+        settings.connect_gtk_xft_dpi_notify(move |_| {
             let Some(manager) = weak.upgrade() else {
                 return;
             };
-            if let Some(pending) = manager.pending_omarchy_refresh.borrow_mut().take() {
-                pending.remove();
+            if !manager.previewing.get() {
+                manager.apply_selected();
             }
-            let weak = weak.clone();
-            let refresh = glib::timeout_add_local_once(Duration::from_millis(75), move || {
+        });
+    }
+
+    fn monitor_omarchy(self: &Rc<Self>) {
+        for monitor in self.omarchy_monitors.take() {
+            monitor.cancel();
+        }
+        let state = omarchy_state_dir();
+        let home = glib::home_dir();
+        // Ancestor watches survive moving away or replacing the current state tree.
+        for path in state.ancestors().take_while(|path| path.starts_with(&home)) {
+            if !path.is_dir() {
+                continue;
+            }
+            let file = gio::File::for_path(path);
+            let Ok(monitor) =
+                file.monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
+            else {
+                continue;
+            };
+            let weak = Rc::downgrade(self);
+            monitor.connect_changed(move |_, file, other_file, _| {
+                if !is_omarchy_theme_event(file)
+                    && !other_file
+                        .as_ref()
+                        .is_some_and(|file| is_omarchy_theme_event(file))
+                {
+                    return;
+                }
                 let Some(manager) = weak.upgrade() else {
                     return;
                 };
-                manager.pending_omarchy_refresh.borrow_mut().take();
-                if manager.follows_omarchy() && !manager.previewing.get() {
-                    manager.apply_selected();
+                if let Some(pending) = manager.pending_omarchy_refresh.borrow_mut().take() {
+                    pending.remove();
                 }
+                let weak = weak.clone();
+                let refresh = glib::timeout_add_local_once(Duration::from_millis(75), move || {
+                    let Some(manager) = weak.upgrade() else {
+                        return;
+                    };
+                    manager.pending_omarchy_refresh.borrow_mut().take();
+                    manager.monitor_omarchy();
+                    let available = load_omarchy_theme().is_some()
+                        || (manager.is_omarchy_available()
+                            && omarchy_state_dir().join("theme.name").is_file());
+                    let availability_changed =
+                        manager.omarchy_available.replace(available) != available;
+                    if !available && manager.follows_omarchy() {
+                        manager.preferences.borrow_mut().mode = "theme".to_owned();
+                        manager.apply_selected();
+                        manager.save_preferences();
+                        return;
+                    }
+                    if availability_changed {
+                        manager.changes.notify(&manager);
+                        return;
+                    }
+                    if manager.follows_omarchy() && !manager.previewing.get() {
+                        manager.apply_selected();
+                        manager.changes.notify(&manager);
+                    }
+                });
+                manager.pending_omarchy_refresh.replace(Some(refresh));
             });
-            manager.pending_omarchy_refresh.replace(Some(refresh));
-        });
-        self.omarchy_monitor.replace(Some(monitor));
+            self.omarchy_monitors.borrow_mut().push(monitor);
+        }
     }
 }
 
 fn is_omarchy_theme_event(file: &gio::File) -> bool {
-    file.path()
-        .as_deref()
-        .and_then(Path::file_name)
-        .is_some_and(|name| name == "theme" || name == "theme.name")
+    file.path().is_some_and(|path| {
+        let state = omarchy_state_dir();
+        state.starts_with(&path) || path == state.join("theme") || path == state.join("theme.name")
+    })
 }
 
 fn builtins() -> Vec<Theme> {
@@ -596,8 +1330,44 @@ fn load_custom_themes() -> Vec<Theme> {
     themes
 }
 
-fn read_preferences() -> Option<Preferences> {
-    toml::from_str(&fs::read_to_string(settings_path()).ok()?).ok()
+fn read_preferences() -> io::Result<Preferences> {
+    let contents = match fs::read_to_string(settings_path()) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Preferences::default()),
+        Err(error) => return Err(error),
+    };
+    let table: toml::Table = toml::from_str(&contents)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    match table.clone().try_into() {
+        Ok(preferences) => Ok(preferences),
+        Err(error) => {
+            tracing::warn!(%error, "settings file has invalid entries; keeping the valid ones");
+            Ok(salvage_preferences(table))
+        }
+    }
+}
+
+/// Rebuilds preferences from every entry that deserializes on its own, so one
+/// malformed value does not reset the rest (and, on the next save, overwrite
+/// them with defaults).
+fn salvage_preferences(saved: toml::Table) -> Preferences {
+    let Ok(mut merged) = toml::Table::try_from(Preferences::default()) else {
+        return Preferences::default();
+    };
+    for (key, value) in saved {
+        let previous = merged.insert(key.clone(), value);
+        if merged.clone().try_into::<Preferences>().is_err() {
+            match previous {
+                Some(previous) => {
+                    merged.insert(key, previous);
+                }
+                None => {
+                    merged.remove(&key);
+                }
+            }
+        }
+    }
+    merged.try_into().unwrap_or_default()
 }
 
 fn sort_preferences(preferences: &Preferences) -> ViewPreferences {
@@ -622,6 +1392,20 @@ fn sort_preferences(preferences: &Preferences) -> ViewPreferences {
         sort_key: sorting.0,
         sort_direction: sorting.1,
     }
+}
+
+fn configured_video_preview_backend(preferences: &Preferences) -> MediaPreviewBackend {
+    match preferences.video_preview_backend.as_str() {
+        "vaapi" => MediaPreviewBackend::VaApi,
+        "vulkan" => MediaPreviewBackend::Vulkan,
+        _ => MediaPreviewBackend::Automatic,
+    }
+}
+
+fn configured_hardware_acceleration(preferences: &Preferences, polaris_available: bool) -> bool {
+    preferences
+        .hardware_accelerated_video_previews
+        .unwrap_or(!polaris_available)
 }
 
 fn load_omarchy_theme() -> Option<ThemeTokens> {
@@ -706,6 +1490,7 @@ fn source_style_scheme() -> Option<sourceview5::StyleScheme> {
 }
 
 pub(super) fn register_source_buffer(buffer: &sourceview5::Buffer) {
+    ensure_source_style_scheme_installed();
     buffer.set_style_scheme(source_style_scheme().as_ref());
     SOURCE_BUFFERS.with(|buffers| {
         let mut buffers = buffers.borrow_mut();
@@ -823,10 +1608,33 @@ fn style_document_buffer(buffer: &gtk::TextBuffer, tokens: &ThemeTokens) {
     }
 }
 
-fn install_source_style_scheme(tokens: &ThemeTokens, palette: Option<&SourcePalette>) {
+fn stage_source_style_scheme(tokens: &ThemeTokens, source_palette: Option<&SourcePalette>) {
+    PENDING_STYLE_TOKENS
+        .with(|pending| pending.replace(Some((tokens.clone(), source_palette.cloned()))));
+    STYLE_SCHEME_DIRTY.with(|dirty| dirty.set(true));
+    let live = SOURCE_BUFFERS.with(|buffers| {
+        buffers
+            .borrow_mut()
+            .retain(|buffer| buffer.upgrade().is_some());
+        !buffers.borrow().is_empty()
+    });
+    if live {
+        ensure_source_style_scheme_installed();
+    }
+}
+
+/// Writes the staged scheme and rescans the style manager, once per staged token set.
+fn ensure_source_style_scheme_installed() {
+    if !STYLE_SCHEME_DIRTY.with(|dirty| dirty.get()) {
+        return;
+    }
+    let pending = PENDING_STYLE_TOKENS.with(|pending| pending.borrow().clone());
+    let Some((tokens, palette)) = pending else {
+        return;
+    };
     let directory = glib::user_cache_dir().join("strata").join("source-styles");
     if let Err(error) = fs::create_dir_all(&directory).and_then(|()| {
-        let value = source_style_scheme_xml(tokens, palette);
+        let value = source_style_scheme_xml(&tokens, palette.as_ref());
         crate::storage::atomic_write(&directory.join("strata-current.xml"), value.as_bytes())
     }) {
         tracing::warn!(%error, "unable to write preview syntax style");
@@ -840,6 +1648,7 @@ fn install_source_style_scheme(tokens: &ThemeTokens, palette: Option<&SourcePale
         }
     });
     manager.force_rescan();
+    STYLE_SCHEME_DIRTY.with(|dirty| dirty.set(false));
     let scheme = manager.scheme("strata-current");
     SOURCE_BUFFERS.with(|buffers| {
         buffers.borrow_mut().retain(|buffer| {
@@ -895,24 +1704,66 @@ fn source_style_scheme_xml(tokens: &ThemeTokens, palette: Option<&SourcePalette>
   <style name="def:error" foreground="background" background="danger" bold="true"/>
 </style-scheme>
 "#,
-        tokens.background,
-        tokens.surface,
-        tokens.text,
-        tokens.accent,
-        tokens.danger,
-        tokens.highlight,
-        tokens.dim_text,
-        palette.string,
-        palette.constant,
-        palette.type_color,
-        palette.statement,
-        palette.preprocessor,
+        color_to_hex(&tokens.background),
+        color_to_hex(&tokens.surface),
+        color_to_hex(&tokens.text),
+        color_to_hex(&tokens.accent),
+        color_to_hex(&tokens.danger),
+        color_to_hex(&tokens.highlight),
+        color_to_hex(&tokens.dim_text),
+        color_to_hex(&palette.string),
+        color_to_hex(&palette.constant),
+        color_to_hex(&palette.type_color),
+        color_to_hex(&palette.statement),
+        color_to_hex(&palette.preprocessor),
     )
 }
 
-fn tokens_css(tokens: &ThemeTokens) -> String {
-    format!(
-        "@define-color theme_bg {};\n@define-color theme_surface {};\n@define-color theme_text {};\n@define-color theme_accent {};\n@define-color theme_danger {};\n@define-color theme_muted {};\n@define-color theme_highlight {};\n@define-color theme_border {};\n@define-color theme_dim_text {};\n",
+const INTERFACE_FONT_FAMILY: &str = "JetBrains Mono";
+
+fn interface_font_name(root_font_px: f64) -> String {
+    format!("{INTERFACE_FONT_FAMILY} {root_font_px:.6}px")
+}
+
+fn apply_interface_font(root_font_px: f64) {
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_font_name(Some(&interface_font_name(root_font_px)));
+    }
+}
+
+fn desktop_text_scale_factor() -> f64 {
+    gtk::Settings::default()
+        .map(|settings| text_scale_factor_from_xft_dpi(settings.gtk_xft_dpi()))
+        .unwrap_or(1.0)
+}
+
+fn text_scale_factor_from_xft_dpi(xft_dpi: i32) -> f64 {
+    if xft_dpi <= 0 {
+        return 1.0;
+    }
+    f64::from(xft_dpi) / (GTK_DEFAULT_DPI * GTK_DPI_UNITS)
+}
+
+fn snapped_root_font_px(root_font_px: u32, scale_factor: f64) -> f64 {
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return f64::from(root_font_px);
+    }
+    // CSS px bypass Xft DPI. Apply desktop text scaling here, once; GTK applies
+    // the surface's monitor scale independently. Keep hinted glyph rows whole.
+    (f64::from(root_font_px) * scale_factor).round()
+}
+
+fn tokens_css(tokens: &ThemeTokens, root_font_px: f64) -> String {
+    let scale = root_font_px / 13.0;
+    let header = (40.0 * scale).round();
+    // Column headers add six pixels of padding and three extra border pixels.
+    let column_header = header - 9.0;
+    let control = (24.0 * scale).round();
+    let sizing = format!(
+        "headerbar, headerbar > windowhandle > box, .mode-pane-header, .preview-header {{ min-height: {header}px; }}\n.column-header {{ min-height: {column_header}px; }}\nheaderbar .sidebar-toggle, headerbar button.header-action, headerbar menubutton.header-action > button, .preview-header-action, button.column-header-action, menubutton.column-header-action > button {{ min-width: {control}px; min-height: {control}px; }}\n"
+    );
+    let colors = format!(
+        "@define-color theme_bg {};\n@define-color theme_surface {};\n@define-color theme_text {};\n@define-color theme_accent {};\n@define-color theme_danger {};\n@define-color theme_muted {};\n@define-color theme_highlight {};\n@define-color theme_border {};\n@define-color theme_dim_text {};\nwindow, popover, popover.background {{ font-size: {root_font_px:.6}px; }}\n",
         tokens.background,
         tokens.surface,
         tokens.text,
@@ -922,20 +1773,43 @@ fn tokens_css(tokens: &ThemeTokens) -> String {
         tokens.highlight,
         tokens.border,
         tokens.dim_text,
-    )
+    );
+    colors + &sizing
+}
+
+/// Parses colours GTK accepts (`#rgb`, `#rrggbb`, `rgb(...)`, names) into 8-bit
+/// channels. Strata emits these channels as `#rrggbb` in GtkSourceView schemes.
+pub(crate) fn parse_rgb_channels(value: &str) -> Option<[u8; 3]> {
+    let color = gdk::RGBA::parse(value).ok()?;
+    let channel = |component: f32| (f64::from(component).clamp(0.0, 1.0) * 255.0).round() as u8;
+    Some([
+        channel(color.red()),
+        channel(color.green()),
+        channel(color.blue()),
+    ])
+}
+
+fn hex_from_channels(channels: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", channels[0], channels[1], channels[2])
+}
+
+/// Canonicalizes a colour token to Strata's `#rrggbb` scheme representation.
+pub(crate) fn color_to_hex(value: &str) -> String {
+    parse_rgb_channels(value)
+        .map(hex_from_channels)
+        .unwrap_or_else(|| value.to_owned())
 }
 
 fn blend(left: &str, right: &str, amount: f64) -> String {
-    let parse = |value: &str| u32::from_str_radix(value.trim_start_matches('#'), 16).ok();
-    let (Some(left), Some(right)) = (parse(left), parse(right)) else {
+    let (Some(left), Some(right)) = (parse_rgb_channels(left), parse_rgb_channels(right)) else {
         return right.to_owned();
     };
-    let channel = |shift| {
-        let a = f64::from((left >> shift) & 0xff_u32);
-        let b = f64::from((right >> shift) & 0xff_u32);
+    let channel = |index: usize| {
+        let a = f64::from(left[index]);
+        let b = f64::from(right[index]);
         (a + (b - a) * amount).round() as u32
     };
-    format!("#{:02x}{:02x}{:02x}", channel(16), channel(8), channel(0))
+    format!("#{:02x}{:02x}{:02x}", channel(0), channel(1), channel(2))
 }
 
 fn slugify(name: &str) -> String {

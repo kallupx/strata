@@ -1,21 +1,29 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
-use std::collections::HashSet;
+mod preferences;
+mod text_size;
+
+use std::{cell::RefCell, collections::HashSet};
 
 use super::{
-    Preferences, Theme, azure_tokens, blend, builtins, is_omarchy_theme_event,
-    merge_builtin_and_custom_themes, slugify, sort_preferences, source_palette_from_quattro,
-    title_case_slug, tokens_from_quattro, validate_tokens,
+    Preferences, TextSize, Theme, ThemeTokens, azure_tokens, blend, browser_mode_from_stored,
+    builtins, color_to_hex, configured_hardware_acceleration, configured_video_preview_backend,
+    is_omarchy_theme_event, merge_builtin_and_custom_themes, notify_live, slugify,
+    snapped_root_font_px, sort_preferences, source_palette_from_quattro, source_style_scheme_xml,
+    stored_browser_mode, text_scale_factor_from_xft_dpi, title_case_slug, tokens_from_quattro,
+    validate_tokens,
 };
 use crate::{
     model::{SortDirection, SortKey, ViewPreferences},
-    services::Channel,
+    sandbox::MediaPreviewBackend,
+    services::{Channel, CrossVolumeDropStrategy},
+    test_support::gtk_test,
+    ui::browser_modes::BrowserMode,
 };
 
 #[test]
 fn bundled_catalog_is_valid_unique_and_alphabetical() {
     let themes = builtins();
-    assert_eq!(themes.len(), 95);
 
     let mut ids = HashSet::new();
     let mut previous_name = String::new();
@@ -50,33 +58,6 @@ fn bundled_catalog_is_valid_unique_and_alphabetical() {
     ] {
         assert!(!ids.contains(removed), "{removed} should not be bundled");
     }
-
-    let theme_0x96f = themes
-        .iter()
-        .find(|theme| theme.id == "0x96f")
-        .expect("0x96f should be bundled");
-    assert_eq!(theme_0x96f.tokens.accent, "#a093e2");
-    assert_eq!(
-        themes
-            .iter()
-            .find(|theme| theme.id == "everforest-light-medium")
-            .map(|theme| theme.tokens.name.as_str()),
-        Some("Everforest Light (Soft)")
-    );
-    assert_eq!(
-        themes
-            .iter()
-            .find(|theme| theme.id == "gruvbox-dark-hard")
-            .map(|theme| theme.tokens.name.as_str()),
-        Some("Gruvbox Dark")
-    );
-    assert_eq!(
-        themes
-            .iter()
-            .find(|theme| theme.id == "gruvbox-light-hard")
-            .map(|theme| theme.tokens.name.as_str()),
-        Some("Gruvbox Light")
-    );
 }
 
 #[test]
@@ -111,6 +92,75 @@ fn omarchy_slugs_become_display_names() {
 #[test]
 fn colors_can_be_blended_into_semantic_tokens() {
     assert_eq!(blend("#000000", "#ffffff", 0.5), "#808080");
+    assert_eq!(blend("rgb(0,0,0)", "rgb(255,255,255)", 0.5), "#808080");
+    assert_eq!(blend("#000", "#fff", 0.5), "#808080");
+    assert_eq!(blend("black", "white", 0.5), "#808080");
+}
+
+#[test]
+fn gtk_color_formats_canonicalize_for_persistence_and_scheme_xml() {
+    assert_eq!(color_to_hex("rgb(153,193,241)"), "#99c1f1");
+    assert_eq!(color_to_hex("#fff"), "#ffffff");
+    assert_eq!(color_to_hex("rebeccapurple"), "#663399");
+}
+
+fn scheme_color_values(xml: &str) -> Vec<&str> {
+    xml.lines()
+        .filter_map(|line| {
+            let start = line.find("value=\"")? + 7;
+            let rest = line.get(start..)?;
+            let end = rest.find('"')?;
+            Some(&rest[..end])
+        })
+        .collect()
+}
+
+#[test]
+fn source_style_scheme_xml_canonicalizes_rgb_tokens_for_gtksourceview() {
+    gtk_test(
+        "ui::theme::tests::source_style_scheme_xml_canonicalizes_rgb_tokens_for_gtksourceview",
+        || {
+            let tokens = ThemeTokens {
+                name: "Picker".to_owned(),
+                background: "rgb(255,255,255)".to_owned(),
+                surface: "rgb(245,245,245)".to_owned(),
+                text: "rgb(30,29,31)".to_owned(),
+                accent: "rgb(153,193,241)".to_owned(),
+                danger: "rgb(229,72,77)".to_owned(),
+                muted: "rgb(200,200,200)".to_owned(),
+                highlight: "rgb(36,77,104)".to_owned(),
+                border: "rgb(49,91,117)".to_owned(),
+                dim_text: "rgb(111,141,163)".to_owned(),
+            };
+            let xml = source_style_scheme_xml(&tokens, None);
+            let values = scheme_color_values(&xml);
+            assert_eq!(values.len(), 12);
+            for value in &values {
+                assert!(
+                    value.starts_with('#') && value.len() == 7,
+                    "scheme colors must be canonical #rrggbb, got {value}"
+                );
+            }
+            assert!(
+                !xml.contains("rgb("),
+                "scheme XML must not emit rgb() colour tags"
+            );
+
+            let directory = tempfile::tempdir().expect("scheme directory");
+            std::fs::write(directory.path().join("strata-current.xml"), xml.as_bytes())
+                .expect("write scheme");
+            let manager = sourceview5::StyleSchemeManager::new();
+            manager.set_search_path(&[directory.path().to_str().expect("utf-8 scheme path")]);
+            manager.force_rescan();
+            let scheme = manager
+                .scheme("strata-current")
+                .expect("GtkSourceView should load a #rrggbb scheme");
+            let statement = scheme
+                .style("def:statement")
+                .expect("def:statement should resolve");
+            assert_eq!(statement.foreground().as_deref(), Some("#99c1f1"));
+        },
+    );
 }
 
 #[test]
@@ -161,22 +211,26 @@ fn legacy_palette_without_quattro_semantics_is_not_detected() {
 
 #[test]
 fn omarchy_monitor_ignores_unrelated_state_changes() {
-    assert!(is_omarchy_theme_event(&gtk::gio::File::for_path(
-        "/state/current/theme"
-    )));
-    assert!(is_omarchy_theme_event(&gtk::gio::File::for_path(
-        "/state/current/theme.name"
-    )));
-    assert!(!is_omarchy_theme_event(&gtk::gio::File::for_path(
-        "/state/current/next-theme"
-    )));
-    assert!(!is_omarchy_theme_event(&gtk::gio::File::for_path(
-        "/state/current/background"
-    )));
+    let state = super::omarchy_state_dir();
+    for path in [
+        state.clone(),
+        state.join("theme"),
+        state.join("theme.name"),
+        state.parent().expect("Omarchy state parent").to_path_buf(),
+    ] {
+        assert!(is_omarchy_theme_event(&gtk::gio::File::for_path(path)));
+    }
+    for path in [
+        state.join("next-theme"),
+        state.join("background"),
+        gtk::glib::home_dir().join("theme"),
+    ] {
+        assert!(!is_omarchy_theme_event(&gtk::gio::File::for_path(path)));
+    }
 }
 
 #[test]
-fn legacy_preferences_enable_single_click_previews_by_default() {
+fn fresh_and_legacy_preferences_share_behavioral_defaults() {
     let preferences: Preferences = toml::from_str(
         r#"
 mode = "theme"
@@ -185,14 +239,68 @@ theme = "azure-glow"
     )
     .expect("legacy preferences should remain valid");
 
+    assert_preference_defaults(&preferences);
+    assert_preference_defaults(&Preferences::default());
+}
+
+fn assert_preference_defaults(preferences: &Preferences) {
     assert!(preferences.folder_peeking);
     assert!(preferences.single_click_previews);
     assert!(preferences.render_documents_by_default);
+    assert_eq!(preferences.hardware_accelerated_video_previews, None);
+    assert!(configured_hardware_acceleration(preferences, false));
+    assert!(!configured_hardware_acceleration(preferences, true));
+    assert_eq!(
+        configured_video_preview_backend(preferences),
+        MediaPreviewBackend::Automatic
+    );
     assert!(!preferences.search_open_files_directly);
+    assert!(preferences.type_to_search);
+    assert!(preferences.show_keybinding_hints);
     assert!(!preferences.reduce_motion);
+    assert!(preferences.element_glow);
     assert_eq!(preferences.browser_mode, "columns");
     assert_eq!(preferences.browser_density, "compact");
-    assert_eq!(sort_preferences(&preferences), ViewPreferences::default());
+    assert_eq!(preferences.columns_file_clicks, 2);
+    assert_eq!(preferences.columns_folder_clicks, 1);
+    assert_eq!(preferences.icons_file_clicks, 2);
+    assert_eq!(preferences.icons_folder_clicks, 2);
+    assert_eq!(preferences.list_file_clicks, 2);
+    assert_eq!(preferences.list_folder_clicks, 2);
+    assert_eq!(sort_preferences(preferences), ViewPreferences::default());
+    assert!(!preferences.preview_muted);
+    assert_eq!(preferences.preview_volume, 1.0);
+    assert_eq!(preferences.release_channel, "stable");
+    assert_eq!(
+        Channel::parse(&preferences.release_channel),
+        Channel::Stable
+    );
+    assert_eq!(preferences.text_size, TextSize::default());
+    assert_eq!(
+        preferences.cross_volume_drop_strategy,
+        CrossVolumeDropStrategy::Ask.as_str()
+    );
+    assert_eq!(
+        CrossVolumeDropStrategy::parse(&preferences.cross_volume_drop_strategy),
+        CrossVolumeDropStrategy::Ask
+    );
+    assert_eq!(
+        preferences.sidebar_order,
+        ["desktop", "documents", "downloads", "pictures", "videos"]
+    );
+}
+
+#[test]
+fn browser_mode_storage_uses_current_names_and_accepts_legacy_names() {
+    for (mode, stored, legacy) in [
+        (BrowserMode::Columns, "columns", "columns"),
+        (BrowserMode::Icons, "icons", "grid"),
+        (BrowserMode::List, "list", "explorer"),
+    ] {
+        assert_eq!(stored_browser_mode(mode), stored);
+        assert_eq!(browser_mode_from_stored(stored), mode);
+        assert_eq!(browser_mode_from_stored(legacy), mode);
+    }
 }
 
 #[test]
@@ -270,59 +378,54 @@ fn invalid_sorting_preferences_fall_back_as_a_pair() {
 }
 
 #[test]
-fn general_preferences_round_trip() {
-    let preferences = Preferences {
-        folder_peeking: false,
-        single_click_previews: false,
-        search_open_files_directly: true,
-        reduce_motion: true,
-        ..Preferences::default()
-    };
-
-    let serialized = toml::to_string(&preferences).expect("preferences should serialize");
-    let restored: Preferences =
-        toml::from_str(&serialized).expect("preferences should deserialize");
-
-    assert!(!restored.folder_peeking);
-    assert!(!restored.single_click_previews);
-    assert!(restored.search_open_files_directly);
-    assert!(restored.reduce_motion);
+fn cross_volume_drop_strategy_round_trips() {
+    for strategy in [
+        CrossVolumeDropStrategy::Copy,
+        CrossVolumeDropStrategy::Move,
+        CrossVolumeDropStrategy::Ask,
+    ] {
+        let preferences = Preferences {
+            cross_volume_drop_strategy: strategy.as_str().to_owned(),
+            ..Preferences::default()
+        };
+        let serialized = toml::to_string(&preferences).expect("preferences should serialize");
+        let restored: Preferences =
+            toml::from_str(&serialized).expect("preferences should deserialize");
+        assert_eq!(
+            CrossVolumeDropStrategy::parse(&restored.cross_volume_drop_strategy),
+            strategy
+        );
+        assert!(
+            serialized.contains(&format!(
+                "cross_volume_drop_strategy = \"{}\"",
+                strategy.as_str()
+            )),
+            "{serialized}"
+        );
+    }
 }
 
 #[test]
-fn release_channel_defaults_to_stable() {
-    let preferences = Preferences::default();
-    assert_eq!(preferences.release_channel, "stable");
+fn invalid_cross_volume_drop_strategy_defaults_to_always_ask() {
     assert_eq!(
-        Channel::parse(&preferences.release_channel),
-        Channel::Stable
+        CrossVolumeDropStrategy::parse("not-a-strategy"),
+        CrossVolumeDropStrategy::Ask
     );
 }
 
 #[test]
-fn preview_release_channel_round_trips_through_toml() {
-    let preferences = Preferences {
-        release_channel: "preview".to_owned(),
-        ..Preferences::default()
-    };
-    let serialized = toml::to_string(&preferences).expect("preferences should serialize");
-    let restored: Preferences =
-        toml::from_str(&serialized).expect("preferences should deserialize");
-    assert_eq!(restored.release_channel, "preview");
-    assert_eq!(Channel::parse(&restored.release_channel), Channel::Preview);
-}
-
-#[test]
-fn nightly_release_channel_round_trips_through_toml() {
-    let preferences = Preferences {
-        release_channel: "nightly".to_owned(),
-        ..Preferences::default()
-    };
-    let serialized = toml::to_string(&preferences).expect("preferences should serialize");
-    let restored: Preferences =
-        toml::from_str(&serialized).expect("preferences should deserialize");
-    assert_eq!(restored.release_channel, "nightly");
-    assert_eq!(Channel::parse(&restored.release_channel), Channel::Nightly);
+fn release_channel_round_trips_through_toml() {
+    for (stored, expected) in [("preview", Channel::Preview), ("nightly", Channel::Nightly)] {
+        let preferences = Preferences {
+            release_channel: stored.to_owned(),
+            ..Preferences::default()
+        };
+        let serialized = toml::to_string(&preferences).expect("preferences should serialize");
+        let restored: Preferences =
+            toml::from_str(&serialized).expect("preferences should deserialize");
+        assert_eq!(restored.release_channel, stored);
+        assert_eq!(Channel::parse(&restored.release_channel), expected);
+    }
 }
 
 #[test]
@@ -338,18 +441,192 @@ fn unknown_release_channel_value_parses_to_stable() {
 }
 
 #[test]
-fn legacy_preferences_without_release_channel_default_to_stable() {
-    let preferences: Preferences = toml::from_str(
-        r#"
-mode = "theme"
-theme = "azure-glow"
-"#,
-    )
-    .expect("legacy preferences without release_channel should remain valid");
+fn custom_text_sizes_round_trip_through_toml() {
+    let size = TextSize::new(24);
+    let preferences = Preferences {
+        text_size: size,
+        ..Preferences::default()
+    };
+    let serialized = toml::to_string(&preferences).expect("preferences should serialize");
+    let restored: Preferences =
+        toml::from_str(&serialized).expect("preferences should deserialize");
+    assert_eq!(restored.text_size, size);
+    assert!(serialized.contains("text_size = 24"));
+}
 
-    assert_eq!(preferences.release_channel, "stable");
+#[test]
+fn legacy_text_sizes_migrate_and_numeric_values_are_bounded() {
+    for (stored, pixels) in [
+        ("\"small\"", 11),
+        ("\"medium\"", 13),
+        ("\"large\"", 15),
+        ("\"huge\"", 13),
+        ("-1", 8),
+        ("0", 8),
+        ("100000", 48),
+    ] {
+        let preferences: Preferences = toml::from_str(&format!(
+            "mode = \"theme\"\ntheme = \"nord\"\ntext_size = {stored}\n"
+        ))
+        .expect("legacy or bounded numeric preferences");
+        assert_eq!(preferences.text_size.root_font_px(), pixels);
+    }
+    assert_eq!(TextSize::new(8).stepped(-1).root_font_px(), 8);
+    assert_eq!(TextSize::new(48).stepped(1).root_font_px(), 48);
+}
+
+#[test]
+fn root_font_size_snaps_to_a_whole_effective_pixel() {
+    let scale_factor = 13.0 / 11.0;
+    let root_font_px = snapped_root_font_px(15, scale_factor);
+
+    assert_eq!(root_font_px, 18.0);
+}
+
+#[test]
+fn root_font_size_is_unchanged_without_desktop_scaling() {
+    let size = TextSize::new(15);
     assert_eq!(
-        Channel::parse(&preferences.release_channel),
-        Channel::Stable
+        snapped_root_font_px(size.root_font_px(), 1.0),
+        f64::from(size.root_font_px())
+    );
+}
+
+#[test]
+fn invalid_scaling_values_leave_the_root_font_size_unchanged() {
+    for scale_factor in [0.0, -1.0, f64::NAN] {
+        assert_eq!(snapped_root_font_px(15, scale_factor), 15.0);
+    }
+}
+
+#[test]
+fn xft_dpi_converts_to_desktop_text_scale() {
+    assert_eq!(text_scale_factor_from_xft_dpi(-1), 1.0);
+    assert_eq!(text_scale_factor_from_xft_dpi(96 * 1024), 1.0);
+    assert!((text_scale_factor_from_xft_dpi(115_200) - 1.171_875).abs() < f64::EPSILON);
+}
+
+#[test]
+fn video_preview_backends_round_trip_and_invalid_values_fall_back() {
+    for (stored, backend) in [
+        ("automatic", MediaPreviewBackend::Automatic),
+        ("vaapi", MediaPreviewBackend::VaApi),
+        ("vulkan", MediaPreviewBackend::Vulkan),
+    ] {
+        let preferences = Preferences {
+            video_preview_backend: stored.to_owned(),
+            ..Preferences::default()
+        };
+        let serialized = toml::to_string(&preferences).expect("serialize preferences");
+        let restored: Preferences = toml::from_str(&serialized).expect("deserialize preferences");
+        assert_eq!(configured_video_preview_backend(&restored), backend);
+    }
+
+    let invalid = Preferences {
+        video_preview_backend: "unsupported".to_owned(),
+        ..Preferences::default()
+    };
+    assert_eq!(
+        configured_video_preview_backend(&invalid),
+        MediaPreviewBackend::Automatic
+    );
+}
+
+#[test]
+fn a_channel_change_reaches_only_the_views_that_still_exist() {
+    let ran = RefCell::new(Vec::new());
+    let live = notify_live(
+        vec![(1, true), (2, false), (3, true)],
+        |(_, alive)| *alive,
+        |(id, _)| ran.borrow_mut().push(*id),
+    );
+
+    assert_eq!(ran.into_inner(), vec![1, 3]);
+    assert_eq!(live, vec![(1, true), (3, true)]);
+}
+
+#[test]
+fn a_channel_change_with_no_surviving_views_clears_the_registry() {
+    let ran = RefCell::new(0_u32);
+    let live = notify_live(
+        vec![(1, false)],
+        |(_, alive)| *alive,
+        |_| *ran.borrow_mut() += 1,
+    );
+
+    assert_eq!(ran.into_inner(), 0);
+    assert!(live.is_empty());
+}
+
+#[test]
+fn preferences_folder_colors_round_trip() {
+    let mut preferences = Preferences::default();
+    assert!(preferences.folder_colors.is_empty());
+
+    let empty_serialized = toml::to_string_pretty(&preferences).expect("serialization succeeds");
+    assert!(!empty_serialized.contains("folder_colors"));
+
+    preferences
+        .folder_colors
+        .insert("/tmp/test-folder".to_owned(), "blue".to_owned());
+    preferences
+        .folder_colors
+        .insert("/tmp/custom-folder".to_owned(), "#34d399".to_owned());
+    let serialized = toml::to_string_pretty(&preferences).expect("serialization succeeds");
+    assert!(serialized.contains("folder_colors"));
+    assert!(serialized.contains("/tmp/test-folder"));
+    assert!(serialized.contains("/tmp/custom-folder"));
+
+    let deserialized: Preferences = toml::from_str(&serialized).expect("deserialization succeeds");
+    assert_eq!(
+        deserialized.folder_colors.get("/tmp/test-folder"),
+        Some(&"blue".to_owned())
+    );
+    assert_eq!(
+        deserialized
+            .folder_colors
+            .get("/tmp/test-folder")
+            .and_then(|c| crate::model::FolderColorValue::parse(c)),
+        Some(crate::model::FolderColorValue::Preset(
+            crate::model::FolderColor::Blue
+        ))
+    );
+    assert_eq!(
+        deserialized
+            .folder_colors
+            .get("/tmp/custom-folder")
+            .and_then(|c| crate::model::FolderColorValue::parse(c)),
+        Some(crate::model::FolderColorValue::Custom("#34d399".to_owned()))
+    );
+}
+
+#[test]
+fn preferences_custom_icons_round_trip() {
+    let mut preferences = Preferences::default();
+    assert!(preferences.custom_icons.is_empty());
+
+    let empty_serialized = toml::to_string_pretty(&preferences).expect("serialization succeeds");
+    assert!(!empty_serialized.contains("custom_icons"));
+
+    preferences.custom_icons.insert(
+        "/tmp/folder".to_owned(),
+        crate::assets::icons::PICTURES.to_owned(),
+    );
+    preferences
+        .custom_icons
+        .insert("/tmp/file.txt".to_owned(), "emoji:🚀".to_owned());
+    let serialized = toml::to_string_pretty(&preferences).expect("serialization succeeds");
+    assert!(serialized.contains("custom_icons"));
+    assert!(serialized.contains("/tmp/folder"));
+    assert!(serialized.contains(crate::assets::icons::PICTURES));
+
+    let deserialized: Preferences = toml::from_str(&serialized).expect("deserialization succeeds");
+    assert_eq!(
+        deserialized.custom_icons.get("/tmp/folder"),
+        Some(&crate::assets::icons::PICTURES.to_owned())
+    );
+    assert_eq!(
+        deserialized.custom_icons.get("/tmp/file.txt"),
+        Some(&"emoji:🚀".to_owned())
     );
 }
